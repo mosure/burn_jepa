@@ -19,8 +19,7 @@ use burn::{
 };
 use burn_autogaze::{
     AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeInferenceMode, AutoGazePipeline,
-    ConnectorConfig, FrameFixationTrace, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel,
-    VisionModelConfig,
+    ConnectorConfig, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
 };
 use burn_jepa::{
     SparseImageTokenGrid, SparsePatchifyPlan, SparsePredictorPlan, SparseTokenMask,
@@ -65,7 +64,68 @@ const RESOLUTIONS: &[Resolution] = &[
 
 #[derive(Clone, Copy, Debug)]
 struct BenchConfig {
-    emit_traces: bool,
+    trace: BenchTraceConfig,
+}
+
+impl BenchConfig {
+    fn from_env() -> Self {
+        Self {
+            trace: BenchTraceConfig::from_env(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BenchTraceConfig {
+    mode: BenchTraceMode,
+}
+
+impl BenchTraceConfig {
+    fn from_env() -> Self {
+        let enabled = env_bool("BURN_JEPA_PIPELINE_BENCH_TRACE", false);
+        Self {
+            mode: if enabled {
+                BenchTraceMode::DecodedFixations
+            } else {
+                BenchTraceMode::Disabled
+            },
+        }
+    }
+
+    fn measure_autogaze_trace_ms<B>(
+        self,
+        autogaze: &AutoGazePipeline<B>,
+        video: Tensor<B, 5>,
+        top_k: usize,
+        device: &B::Device,
+        warmups: usize,
+        reps: usize,
+    ) -> f64
+    where
+        B: Backend,
+    {
+        if self.mode == BenchTraceMode::Disabled {
+            return 0.0;
+        }
+
+        measure_ms(warmups, reps, || {
+            let traces = autogaze.trace_video_with_mode(
+                video.clone(),
+                top_k,
+                AutoGazeInferenceMode::ResizeToModelInput,
+            );
+            black_box(trace_point_count(&traces));
+            <B as Backend>::sync(device).expect("autogaze trace sync");
+            traces.len()
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BenchTraceMode {
+    #[default]
+    Disabled,
+    DecodedFixations,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,9 +170,7 @@ fn main() {
     let reps = env_usize("BURN_JEPA_PIPELINE_BENCH_REPS", 3);
     let warmups = env_usize("BURN_JEPA_PIPELINE_BENCH_WARMUPS", 1);
     let include_1080 = env_bool("BURN_JEPA_PIPELINE_BENCH_1080P", true);
-    let bench_config = BenchConfig {
-        emit_traces: env_bool("BURN_JEPA_PIPELINE_BENCH_TRACE", false),
-    };
+    let bench_config = BenchConfig::from_env();
     let backend_filter = backend_filter();
     let resolutions = RESOLUTIONS
         .iter()
@@ -285,20 +343,14 @@ where
                 <B as Backend>::sync(&autogaze_device).expect("autogaze generate sync");
                 generated.num_gazing_each_frame.len()
             });
-            let autogaze_trace_ms = if bench_config.emit_traces {
-                measure_ms(warmups, reps, || {
-                    let traces = autogaze.trace_video_with_mode(
-                        ag_video.clone(),
-                        autogaze_top_k,
-                        AutoGazeInferenceMode::ResizeToModelInput,
-                    );
-                    black_box(trace_point_count(&traces));
-                    <B as Backend>::sync(&autogaze_device).expect("autogaze trace sync");
-                    traces.len()
-                })
-            } else {
-                0.0
-            };
+            let autogaze_trace_ms = bench_config.trace.measure_autogaze_trace_ms(
+                &autogaze,
+                ag_video.clone(),
+                autogaze_top_k,
+                &autogaze_device,
+                warmups,
+                reps,
+            );
             let sparse_project_plan_ms = measure_ms(warmups, reps, || {
                 let context_mask = context_mask_from_autogaze_generated(
                     &generated,
@@ -833,7 +885,7 @@ fn pixel_value(frame: usize, channel: usize, y: usize, x: usize) -> f32 {
     (value as f32 / 125.0) - 1.0
 }
 
-fn trace_point_count(traces: &[FrameFixationTrace]) -> usize {
+fn trace_point_count(traces: &[burn_autogaze::FrameFixationTrace]) -> usize {
     traces
         .iter()
         .flat_map(|trace| trace.frames.iter())

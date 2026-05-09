@@ -127,8 +127,11 @@ that reuses `SparsePredictorPlan`. On the local ndarray backend, a short run wit
 - `temporal_sparse_stream_hot_path_ndarray/cached_plan_32_sequence_tokens`: 8.7408 ms to 8.7889 ms
 
 The AutoGaze -> sparse V-JEPA pipeline bench projects sparse masks directly from
-AutoGaze generated token ids. Decoded fixation traces are opt-in for diagnostics:
-set `BURN_JEPA_PIPELINE_BENCH_TRACE=1` to include the extra trace path timing.
+AutoGaze generated token ids. Trace collection is disabled in the benchmark
+config by default; set `BURN_JEPA_PIPELINE_BENCH_TRACE=1` to opt into decoded
+fixation traces and include the extra trace path timing. With tracing disabled,
+the bench returns `autogaze_trace_ms=0.000` before allocating trace samples or
+calling AutoGaze's trace decoder.
 The CSV includes both one-shot sparse pipeline timing and cached
 `TemporalSparseJepaStream` timing (`temporal_stream_ms`,
 `temporal_e2e_pipeline_ms`, and temporal FPS columns) so next-frame sparse
