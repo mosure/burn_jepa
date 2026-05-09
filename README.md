@@ -150,7 +150,8 @@ The checked-in parity fixture validates the sparse Burn implementation against
 an independent PyTorch implementation with synthetic tiny weights. Real Meta
 V-JEPA 2.1 checkpoint parity should be run with a local checkpoint fixture before
 claiming production weight parity. `tests/numerical_parity.rs` includes an
-env-gated loader smoke for that fixture:
+env-gated loader smoke for that fixture. The loader maps Transformers-style
+VJEPA2 configs and fuses HF query/key/value tensors into the Burn `qkv` layout:
 
 ```sh
 BURN_JEPA_VJEPA21_CHECKPOINT_DIR=/path/to/vjepa2_1 \

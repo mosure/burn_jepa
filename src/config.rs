@@ -79,7 +79,16 @@ impl VJepaConfig {
         let path = path.as_ref();
         let bytes =
             fs::read(path).with_context(|| format!("read config from {}", path.display()))?;
-        serde_json::from_slice(&bytes).with_context(|| format!("parse config {}", path.display()))
+        Self::from_json_bytes(&bytes).with_context(|| format!("parse config {}", path.display()))
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        if is_hf_vjepa_config(&value) {
+            Ok(Self::from_hf_vjepa_config(&value))
+        } else {
+            serde_json::from_value(value).map_err(Into::into)
+        }
     }
 
     pub fn tiny_for_tests() -> Self {
@@ -143,6 +152,99 @@ impl VJepaConfig {
 
     pub const fn token_grid(&self) -> crate::TokenGridShape {
         crate::TokenGridShape::new(self.grid_depth(), self.grid_height(), self.grid_width())
+    }
+
+    fn from_hf_vjepa_config(value: &serde_json::Value) -> Self {
+        let hidden_size = value_usize(value, "hidden_size", 768);
+        let depth = value_usize(value, "num_hidden_layers", 12);
+        let heads = value_usize(value, "num_attention_heads", 12);
+        let pred_dim = value_usize(value, "pred_hidden_size", 384);
+        let pred_depth = value_usize(value, "pred_num_hidden_layers", 12);
+        let pred_heads = value_usize(value, "pred_num_attention_heads", 12);
+        let variant = variant_from_encoder_shape(hidden_size, depth, heads);
+        Self {
+            model_type: value
+                .get("model_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("vjepa2")
+                .to_string(),
+            variant,
+            image_size: value_usize(value, "image_size", 384),
+            patch_size: value_usize(value, "patch_size", 16),
+            num_frames: value_usize(value, "frames_per_clip", 64),
+            tubelet_size: value_usize(value, "tubelet_size", 2),
+            in_channels: value_usize(value, "in_chans", 3),
+            encoder: VJepaEncoderConfig {
+                embed_dim: hidden_size,
+                depth,
+                num_heads: heads,
+                mlp_ratio: value_f32(value, "mlp_ratio", 4.0),
+                layer_norm_eps: value_f64(value, "layer_norm_eps", 1.0e-6),
+                use_rope: true,
+                interpolate_rope: true,
+                // HF VJEPA2 checkpoints do not carry the extra Burn modality embeddings.
+                modality_embedding: false,
+                n_output_distillation: 1,
+            },
+            predictor: VJepaPredictorConfig {
+                embed_dim: pred_dim,
+                depth: pred_depth,
+                num_heads: pred_heads,
+                mlp_ratio: value_f32(value, "pred_mlp_ratio", 4.0),
+                num_mask_tokens: value_usize(value, "pred_num_mask_tokens", 1),
+                output_dim: Some(hidden_size),
+                return_all_tokens: false,
+                layer_norm_eps: value_f64(value, "layer_norm_eps", 1.0e-6),
+                use_rope: true,
+            },
+            preprocess: VJepaPreprocessConfig::default(),
+        }
+    }
+}
+
+fn is_hf_vjepa_config(value: &serde_json::Value) -> bool {
+    value
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str() == Some("VJEPA2Model"))
+        })
+        || value.get("hidden_size").is_some()
+            && value.get("num_hidden_layers").is_some()
+            && value.get("pred_hidden_size").is_some()
+}
+
+fn value_usize(value: &serde_json::Value, key: &str, default: usize) -> usize {
+    value
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .unwrap_or(default)
+}
+
+fn value_f32(value: &serde_json::Value, key: &str, default: f32) -> f32 {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32)
+        .unwrap_or(default)
+}
+
+fn value_f64(value: &serde_json::Value, key: &str, default: f64) -> f64 {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(default)
+}
+
+fn variant_from_encoder_shape(width: usize, depth: usize, heads: usize) -> VJepaModelVariant {
+    match (width, depth, heads) {
+        (1024, 24, 16) => VJepaModelVariant::VitLarge384,
+        (1408, 40, 16) => VJepaModelVariant::VitGiant384,
+        (1664, 48, 16) => VJepaModelVariant::VitGigantic384,
+        _ => VJepaModelVariant::VitBase384,
     }
 }
 
@@ -269,5 +371,45 @@ mod tests {
         let config = VJepaConfig::tiny_for_tests();
         assert_eq!(config.num_patches(), 8);
         assert_eq!(config.encoder.hierarchical_layers(), vec![1]);
+    }
+
+    #[test]
+    fn hf_vjepa2_config_maps_transformers_fields() {
+        let config = VJepaConfig::from_json_bytes(
+            br#"{
+                "architectures": ["VJEPA2Model"],
+                "model_type": "vjepa2",
+                "image_size": 256,
+                "frames_per_clip": 64,
+                "patch_size": 16,
+                "tubelet_size": 2,
+                "in_chans": 3,
+                "hidden_size": 1024,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+                "mlp_ratio": 4,
+                "layer_norm_eps": 1e-6,
+                "pred_hidden_size": 384,
+                "pred_num_hidden_layers": 12,
+                "pred_num_attention_heads": 12,
+                "pred_mlp_ratio": 4.0,
+                "pred_num_mask_tokens": 10
+            }"#,
+        )
+        .expect("hf config");
+
+        assert_eq!(config.model_type, "vjepa2");
+        assert_eq!(config.variant, VJepaModelVariant::VitLarge384);
+        assert_eq!(config.image_size, 256);
+        assert_eq!(config.num_frames, 64);
+        assert_eq!(config.encoder.embed_dim, 1024);
+        assert_eq!(config.encoder.depth, 24);
+        assert_eq!(config.encoder.num_heads, 16);
+        assert!(!config.encoder.modality_embedding);
+        assert_eq!(config.predictor.embed_dim, 384);
+        assert_eq!(config.predictor.depth, 12);
+        assert_eq!(config.predictor.num_heads, 12);
+        assert_eq!(config.predictor.num_mask_tokens, 10);
+        assert_eq!(config.predictor.output_dim, Some(1024));
     }
 }

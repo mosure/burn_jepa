@@ -191,7 +191,26 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
     .load_model::<B>(&checkpoint_dir, &device)
     .expect("load real V-JEPA checkpoint fixture");
 
+    eprintln!(
+        "real V-JEPA load report: applied={} missing={} skipped={} errors={}",
+        report.applied.len(),
+        report.missing.len(),
+        report.skipped.len(),
+        report.errors.len()
+    );
     assert!(report.errors.is_empty(), "load errors: {:?}", report.errors);
+    assert!(
+        !report.applied.is_empty(),
+        "real checkpoint smoke did not apply any tensors; missing={:?} skipped={:?}",
+        report.missing,
+        report.skipped
+    );
+    assert!(
+        config.encoder.embed_dim >= 768 && config.predictor.embed_dim >= 384,
+        "checkpoint config was not mapped to a production V-JEPA shape: encoder={} predictor={}",
+        config.encoder.embed_dim,
+        config.predictor.embed_dim
+    );
     if !allow_partial {
         assert!(
             report.missing.is_empty(),
