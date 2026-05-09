@@ -1582,12 +1582,13 @@ dependencies = [
 [[package]]
 name = "burn_autogaze"
 version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86cd5d1c493053a38fd217dd4e8befc8eb59542e5b54cf1ce21422a075e22b78"
 dependencies = [
  "anyhow",
  "burn",
  "burn-store",
  "half",
- "image",
  "safetensors 0.7.0",
  "serde",
  "serde_json",

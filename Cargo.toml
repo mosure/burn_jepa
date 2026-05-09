@@ -61,7 +61,7 @@ optional = true
 features = ["console"]
 
 [dev-dependencies]
-burn_autogaze = { version = "0.21.2", path = "../burn_autogaze", default-features = false, features = ["ndarray"] }
+burn_autogaze = { version = "0.21.2", default-features = false, features = ["ndarray"] }
 criterion = "0.8.2"
 tempfile = "3"
 
