@@ -1,7 +1,7 @@
 use burn::tensor::{Tensor, TensorData};
 use burn_jepa::{
     SparseTokenMask, VJepa2_1Model, VJepaConfig, VJepaEncoderConfig, VJepaLoadOptions,
-    VJepaModelVariant, VJepaPredictorConfig, VJepaPreprocessConfig,
+    VJepaModelVariant, VJepaPredictorConfig, VJepaPreprocessConfig, apply_token_mask,
 };
 use burn_store::{ModuleSnapshot, SafetensorsStore};
 use serde::Deserialize;
@@ -172,6 +172,86 @@ fn tiny_safetensors_loader_round_trips_burn_weights() {
 }
 
 #[test]
+fn tiny_hf_vjepa2_fixture_matches_burn_loader_and_forward() {
+    if Command::new("python3")
+        .arg("-c")
+        .arg("import torch, transformers, safetensors")
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "skipping HF V-JEPA2 parity fixture because python3 torch/transformers/safetensors are unavailable"
+        );
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let model_dir = tempdir.path().join("hf-vjepa2-tiny");
+    let torch_output_path = tempdir.path().join("hf-output.json");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/vjepa_hf_tiny_parity.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .arg(&model_dir)
+        .arg(&torch_output_path)
+        .output()
+        .expect("run HF V-JEPA2 fixture");
+    assert!(
+        output.status.success(),
+        "HF V-JEPA2 fixture failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let torch_output: TorchParityOutput =
+        serde_json::from_slice(&std::fs::read(&torch_output_path).expect("read HF fixture output"))
+            .expect("parse HF fixture output");
+
+    let device = Default::default();
+    let (model, config, report) = VJepaLoadOptions {
+        allow_partial: false,
+        ..VJepaLoadOptions::default()
+    }
+    .load_model::<B>(&model_dir, &device)
+    .expect("load HF tiny V-JEPA2 fixture");
+    assert!(
+        report.missing.is_empty(),
+        "missing tensors: {:?}",
+        report.missing
+    );
+    assert!(report.errors.is_empty(), "load errors: {:?}", report.errors);
+    assert_eq!(config.model_type, "vjepa2");
+    assert_eq!(config.num_patches(), 8);
+
+    let context = SparseTokenMask::new((0..config.num_patches()).collect(), config.num_patches())
+        .expect("dense context mask");
+    let target = SparseTokenMask::new(vec![1, 3, 4, 6], config.num_patches()).expect("target");
+    let video = hf_parity_video(&config);
+    let dense = model.encode_video(video, None);
+    let predictor = model
+        .predictor
+        .forward_sparse(dense.tokens.clone(), &context, &target, dense.grid, 1)
+        .expect("Burn predictor on HF fixture");
+    let burn_predictions = predictor
+        .target_predictions
+        .to_data()
+        .to_vec::<f32>()
+        .expect("burn HF prediction values");
+    let burn_targets = apply_token_mask(dense.tokens, target.to_tensor(1, &device))
+        .to_data()
+        .to_vec::<f32>()
+        .expect("burn HF target values");
+
+    let prediction_diff = max_abs_diff(&burn_predictions, &torch_output.predictions);
+    let target_diff = max_abs_diff(&burn_targets, &torch_output.targets);
+    eprintln!("HF tiny parity prediction_diff={prediction_diff:e} target_diff={target_diff:e}");
+    assert!(
+        prediction_diff <= 5.0e-4 && target_diff <= 5.0e-4,
+        "HF tiny parity exceeded tolerance: prediction_diff={prediction_diff:e}, target_diff={target_diff:e}"
+    );
+}
+
+#[test]
 #[ignore = "requires a local Meta V-JEPA 2.1 checkpoint fixture"]
 fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
     let Some(checkpoint_dir) = env::var_os("BURN_JEPA_VJEPA21_CHECKPOINT_DIR") else {
@@ -301,6 +381,41 @@ fn parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
 fn deterministic_video_values() -> Vec<f32> {
     let len = 3 * 2 * 16 * 16;
     (0..len).map(|i| ((i % 29) as f32 - 14.0) / 31.0).collect()
+}
+
+fn hf_parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
+    let device = Default::default();
+    let len = config.num_frames * config.in_channels * config.image_size * config.image_size;
+    let values = (0..len)
+        .map(|i| ((i % 31) as f32 - 15.0) / 23.0)
+        .collect::<Vec<_>>();
+    let mut burn_values = Vec::with_capacity(len);
+    for channel in 0..config.in_channels {
+        for frame in 0..config.num_frames {
+            for row in 0..config.image_size {
+                for col in 0..config.image_size {
+                    let hf_index = (((frame * config.in_channels + channel) * config.image_size
+                        + row)
+                        * config.image_size)
+                        + col;
+                    burn_values.push(values[hf_index]);
+                }
+            }
+        }
+    }
+    Tensor::<B, 5>::from_data(
+        TensorData::new(
+            burn_values,
+            [
+                1,
+                config.in_channels,
+                config.num_frames,
+                config.image_size,
+                config.image_size,
+            ],
+        ),
+        &device,
+    )
 }
 
 fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {

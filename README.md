@@ -146,8 +146,11 @@ safetensors, executes the Burn sparse target path, executes an independent
 PyTorch fixture from those saved weights, and compares predictor and target
 encoder outputs within `5e-4` max absolute error. The same test module also
 round-trips the tiny model through `VJepaLoadOptions::load_model` with strict
-missing-tensor checks. The PyTorch fixture is skipped only when `python3` cannot
-import `torch` and `safetensors`.
+missing-tensor checks. A second fixture creates a tiny Hugging Face
+`VJEPA2Model`, saves Transformers-style safetensors, loads them through the Burn
+loader, and compares dense-encoder predictor outputs against the installed
+Transformers implementation. The Python fixtures are skipped only when the
+required Python packages are unavailable.
 
 The checked-in parity fixture validates the sparse Burn implementation against
 an independent PyTorch implementation with synthetic tiny weights. Real Meta
