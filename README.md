@@ -138,6 +138,8 @@ The CSV includes both one-shot sparse pipeline timing and cached
 updates are visible separately from first-use plan construction.
 See [docs/e2e-benchmark-results.md](docs/e2e-benchmark-results.md) for the
 latest checked-in ndarray/WebGPU E2E throughput table and CUDA runtime status.
+See [docs/completion-audit.md](docs/completion-audit.md) for the current
+prompt-to-artifact checklist and remaining CUDA runtime blocker.
 
 ## Correctness
 
