@@ -134,8 +134,18 @@ import `torch` and `safetensors`.
 The checked-in parity fixture validates the sparse Burn implementation against
 an independent PyTorch implementation with synthetic tiny weights. Real Meta
 V-JEPA 2.1 checkpoint parity should be run with a local checkpoint fixture before
-claiming production weight parity. CUDA pipeline throughput is exposed by the
-benchmark harness, but it requires a CUDA-capable device at runtime.
+claiming production weight parity. `tests/numerical_parity.rs` includes an
+env-gated loader smoke for that fixture:
+
+```sh
+BURN_JEPA_VJEPA21_CHECKPOINT_DIR=/path/to/vjepa2_1 \
+BURN_JEPA_VJEPA21_WEIGHTS=model.safetensors \
+cargo test --test numerical_parity real_vjepa_checkpoint_loads_when_fixture_is_set -- --ignored
+```
+
+Set `BURN_JEPA_VJEPA21_FORWARD_SMOKE=1` to also run a sparse forward smoke after
+loading. CUDA pipeline throughput is exposed by the benchmark harness, but it
+requires a CUDA-capable device at runtime.
 
 ## Bevy Example
 

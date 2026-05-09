@@ -5,7 +5,7 @@ use burn_jepa::{
 };
 use burn_store::{ModuleSnapshot, SafetensorsStore};
 use serde::Deserialize;
-use std::process::Command;
+use std::{collections::BTreeSet, env, process::Command};
 
 type B = burn::backend::NdArray<f32>;
 
@@ -171,6 +171,62 @@ fn tiny_safetensors_loader_round_trips_burn_weights() {
     assert!(diff <= 1.0e-6, "loader round-trip diff={diff:e}");
 }
 
+#[test]
+#[ignore = "requires a local Meta V-JEPA 2.1 checkpoint fixture"]
+fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
+    let Some(checkpoint_dir) = env::var_os("BURN_JEPA_VJEPA21_CHECKPOINT_DIR") else {
+        eprintln!("skipping real V-JEPA checkpoint smoke; set BURN_JEPA_VJEPA21_CHECKPOINT_DIR");
+        return;
+    };
+    let device = Default::default();
+    let allow_partial = env_bool("BURN_JEPA_VJEPA21_ALLOW_PARTIAL");
+    let (model, config, report) = VJepaLoadOptions {
+        config_name: env::var("BURN_JEPA_VJEPA21_CONFIG")
+            .unwrap_or_else(|_| "config.json".to_string()),
+        weights_name: env::var("BURN_JEPA_VJEPA21_WEIGHTS")
+            .unwrap_or_else(|_| "model.safetensors".to_string()),
+        allow_partial,
+        ..VJepaLoadOptions::default()
+    }
+    .load_model::<B>(&checkpoint_dir, &device)
+    .expect("load real V-JEPA checkpoint fixture");
+
+    assert!(report.errors.is_empty(), "load errors: {:?}", report.errors);
+    if !allow_partial {
+        assert!(
+            report.missing.is_empty(),
+            "missing tensors: {:?}",
+            report.missing
+        );
+    }
+
+    if env_bool("BURN_JEPA_VJEPA21_FORWARD_SMOKE") {
+        let context = SparseTokenMask::evenly_spaced(
+            config.num_patches(),
+            env_usize("BURN_JEPA_VJEPA21_CONTEXT_TOKENS", 64),
+        );
+        let target = test_target_mask_for_context(
+            &context,
+            env_usize("BURN_JEPA_VJEPA21_TARGET_TOKENS", 16),
+        );
+        let video = Tensor::<B, 5>::zeros(
+            [
+                1,
+                config.in_channels,
+                config.num_frames,
+                config.image_size,
+                config.image_size,
+            ],
+            &device,
+        );
+        let output = model
+            .predict_dense_targets(video, &context, &target)
+            .expect("real checkpoint sparse forward smoke");
+        assert_eq!(output.predictions.shape().dims::<3>()[1], target.len());
+        assert_eq!(output.targets.shape().dims::<3>()[1], target.len());
+    }
+}
+
 fn parity_config() -> VJepaConfig {
     VJepaConfig {
         model_type: "vjepa2_1_tiny_parity".to_string(),
@@ -234,4 +290,29 @@ fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
         .zip(right)
         .map(|(left, right)| (left - right).abs())
         .fold(0.0, f32::max)
+}
+
+fn test_target_mask_for_context(
+    context: &SparseTokenMask,
+    target_tokens: usize,
+) -> SparseTokenMask {
+    let context_set = context.indices().iter().copied().collect::<BTreeSet<_>>();
+    let target = (0..context.dense_len())
+        .filter(|index| !context_set.contains(index))
+        .take(target_tokens.max(1))
+        .collect::<Vec<_>>();
+    SparseTokenMask::new(target, context.dense_len()).expect("target mask")
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
