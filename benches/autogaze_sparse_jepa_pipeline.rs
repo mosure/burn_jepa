@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "webgpu")]
+#[cfg(feature = "cuda")]
+use std::{path::Path, process::Command};
+
+#[cfg(any(feature = "cuda", feature = "webgpu"))]
 use std::sync::OnceLock;
 
 use burn::{
@@ -218,19 +221,23 @@ fn main() {
 
     #[cfg(feature = "cuda")]
     if backend_enabled(&backend_filter, "cuda") {
-        append_backend_rows(
-            &mut rows,
-            run_optional("autogaze-cuda", || {
-                run_autogaze_backend::<burn::backend::Cuda<f32, i32>>(
-                    "autogaze-cuda",
-                    burn::backend::cuda::CudaDevice::default(),
-                    &resolutions,
-                    bench_config,
-                    warmups,
-                    reps,
-                )
-            }),
-        );
+        if let Err(reason) = cuda_runtime_preflight() {
+            eprintln!("skipping autogaze-cuda benchmark: {reason}");
+        } else {
+            append_backend_rows(
+                &mut rows,
+                run_optional("autogaze-cuda", || {
+                    run_autogaze_backend::<burn::backend::Cuda<f32, i32>>(
+                        "autogaze-cuda",
+                        burn::backend::cuda::CudaDevice::default(),
+                        &resolutions,
+                        bench_config,
+                        warmups,
+                        reps,
+                    )
+                }),
+            );
+        }
     }
 
     let out = bench_output_path();
@@ -930,6 +937,50 @@ fn backend_enabled(filter: &[String], backend: &str) -> bool {
     filter
         .iter()
         .any(|value| value == "all" || value == backend)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_runtime_preflight() -> Result<(), String> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        if env_bool("BURN_JEPA_PIPELINE_CUDA_FORCE", false) {
+            return Ok(());
+        }
+        if env::var("CUDA_VISIBLE_DEVICES")
+            .ok()
+            .is_some_and(|value| {
+                let value = value.trim();
+                value.is_empty() || matches!(value, "-1" | "none" | "None" | "NONE")
+            })
+        {
+            return Err(
+                "CUDA_VISIBLE_DEVICES disables CUDA; set BURN_JEPA_PIPELINE_CUDA_FORCE=1 to try anyway"
+                    .to_string(),
+            );
+        }
+        if cfg!(target_os = "linux")
+            && !Path::new("/dev/nvidiactl").exists()
+            && !Path::new("/dev/nvidia0").exists()
+        {
+            return Err(
+                "no /dev/nvidia* device nodes; set BURN_JEPA_PIPELINE_CUDA_FORCE=1 to try anyway"
+                    .to_string(),
+            );
+        }
+        match Command::new("nvidia-smi").arg("-L").output() {
+            Ok(output) if output.status.success() && !output.stdout.is_empty() => Ok(()),
+            Ok(output) if output.status.success() => {
+                Err("nvidia-smi -L returned no CUDA devices".to_string())
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("nvidia-smi -L failed: {}", stderr.trim()))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("failed to run nvidia-smi -L: {err}")),
+        }
+    })
+    .clone()
 }
 
 fn bench_output_path() -> PathBuf {
