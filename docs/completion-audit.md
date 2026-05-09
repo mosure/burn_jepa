@@ -22,6 +22,7 @@ evidence, and clear backend/runtime status.
 | Transformers-style Hugging Face V-JEPA2 loader and forward path are checked. | `tests/fixtures/vjepa_hf_tiny_parity.py`, `tests/numerical_parity.rs` | HF tiny parity passed with prediction diff `1.49e-8` and target diff `7.45e-8`. | Covered |
 | Real V-JEPA 2.1 checkpoint loading is strict and real-weight forward parity is available. | `VJepaLoadOptions`, `tests/fixtures/vjepa_hf_real_micro_forward.py` | Local HF checkpoint strict load passed with `applied=456 missing=0 skipped=0 errors=0`; micro parity passed with prediction diff `2.00e-5`, target diff `4.17e-5`. | Covered |
 | E2E throughput is measured across image resolutions and sparsity densities. | `benches/autogaze_sparse_jepa_pipeline.rs`, `docs/e2e-benchmark-results.md` | Checked-in table covers ndarray and WebGPU for 224x224, 384x384, 720p and densities 1%, 5%, 10%, 25%. | Covered |
+| Checked-in benchmark evidence has regression coverage. | `tests/benchmark_report.rs` | The integration test parses the E2E report, asserts the ndarray/WebGPU resolution-density matrix, verifies trace-off rows, and checks the CUDA runbook/template reject header-only CSV output. | Covered |
 | WebGPU and ndarray performance behavior is explained. | `docs/e2e-benchmark-results.md` | Report notes sparse V-JEPA stream is similar, but WebGPU E2E is slower because AutoGaze WebGPU generation dominates. | Covered |
 | CUDA feature support compiles. | Cargo features and benchmark target | `cargo check --no-default-features --features cuda` and CUDA E2E bench target check passed. | Covered |
 | CUDA E2E FPS is measured. | `docs/e2e-benchmark-results.md`, `docs/cuda-benchmark.md`, `docs/workflows/cuda-benchmark.yml` | This host has no usable CUDA runtime: no `/dev/nvidia*`, `nvidia-smi` cannot communicate with the driver, and the benchmark preflight skips CUDA. A manual self-hosted CUDA benchmark workflow template now fails if the emitted CSV has no data rows; publishing it under `.github/workflows/` requires workflow-file write permission. | Blocked |
@@ -42,6 +43,7 @@ cargo check --bench autogaze_sparse_jepa_pipeline \
   --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
 cargo bench --bench autogaze_sparse_jepa_pipeline \
   --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
+cargo test --test benchmark_report --no-default-features --features ndarray
 cargo package --allow-dirty
 ```
 
