@@ -1587,6 +1587,7 @@ dependencies = [
  "burn",
  "burn-store",
  "half",
+ "image",
  "safetensors 0.7.0",
  "serde",
  "serde_json",

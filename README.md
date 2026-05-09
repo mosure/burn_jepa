@@ -129,6 +129,10 @@ that reuses `SparsePredictorPlan`. On the local ndarray backend, a short run wit
 The AutoGaze -> sparse V-JEPA pipeline bench projects sparse masks directly from
 AutoGaze generated token ids. Decoded fixation traces are opt-in for diagnostics:
 set `BURN_JEPA_PIPELINE_BENCH_TRACE=1` to include the extra trace path timing.
+The CSV includes both one-shot sparse pipeline timing and cached
+`TemporalSparseJepaStream` timing (`temporal_stream_ms`,
+`temporal_e2e_pipeline_ms`, and temporal FPS columns) so next-frame sparse
+updates are visible separately from first-use plan construction.
 
 ## Correctness
 

@@ -23,8 +23,9 @@ use burn_autogaze::{
     VisionModelConfig,
 };
 use burn_jepa::{
-    SparseImageTokenGrid, SparsePatchifyPlan, SparsePredictorPlan, SparseTokenMask, TokenGridShape,
-    VJepa2_1Model, VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig,
+    SparseImageTokenGrid, SparsePatchifyPlan, SparsePredictorPlan, SparseTokenMask,
+    TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TokenGridShape, VJepa2_1Model,
+    VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig,
     sparse_mask_from_frame_token_indices,
 };
 
@@ -96,9 +97,13 @@ struct BenchRow {
     sparse_encoder_ms: f64,
     predictor_ms: f64,
     sparse_jepa_ms: f64,
+    temporal_stream_ms: f64,
     e2e_pipeline_ms: f64,
+    temporal_e2e_pipeline_ms: f64,
     clips_per_sec: f64,
     frames_per_sec: f64,
+    temporal_clips_per_sec: f64,
+    temporal_frames_per_sec: f64,
 }
 
 fn main() {
@@ -245,6 +250,7 @@ where
                 .max(autogaze_top_k.max(1));
 
             let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+            let frame_tokens = generated_frame_tokens(&generated, FRAMES, autogaze_top_k);
             let context_mask = context_mask_from_autogaze_generated(
                 &generated,
                 grid,
@@ -381,6 +387,35 @@ where
                 .expect("sparse jepa");
                 <JepaBackend as Backend>::sync(&jepa_device).expect("sparse jepa sync");
             });
+            let stream_config = TemporalSparseJepaStreamConfig::new(
+                target_context_tokens,
+                TARGET_TOKENS.min(dense_tokens),
+                autogaze_image_token_grid(),
+            )
+            .with_keyframe_interval(16);
+            let mut temporal_stream = TemporalSparseJepaStream::<JepaBackend>::new(stream_config);
+            temporal_stream
+                .forward_frame_tokens_sparse_patchify_wgpu(
+                    &jepa,
+                    jepa_video.clone(),
+                    &frame_tokens,
+                    0,
+                )
+                .expect("prime temporal stream");
+            <JepaBackend as Backend>::sync(&jepa_device).expect("prime temporal stream sync");
+            let temporal_stream_ms = measure_ms(warmups, reps, || {
+                let output = temporal_stream
+                    .forward_frame_tokens_sparse_patchify_wgpu(
+                        &jepa,
+                        jepa_video.clone(),
+                        &frame_tokens,
+                        0,
+                    )
+                    .expect("temporal stream");
+                black_box(output.reused_patchify_plan);
+                black_box(output.temporal.reused_predictor_plan);
+                <JepaBackend as Backend>::sync(&jepa_device).expect("temporal stream sync");
+            });
             let e2e_pipeline_ms = measure_ms(warmups, reps, || {
                 let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
                 let context_mask = context_mask_from_autogaze_generated(
@@ -419,8 +454,37 @@ where
                 <B as Backend>::sync(&autogaze_device).expect("e2e autogaze sync");
                 <JepaBackend as Backend>::sync(&jepa_device).expect("e2e jepa sync");
             });
+            let mut temporal_e2e_stream =
+                TemporalSparseJepaStream::<JepaBackend>::new(stream_config);
+            temporal_e2e_stream
+                .forward_frame_tokens_sparse_patchify_wgpu(
+                    &jepa,
+                    jepa_video.clone(),
+                    &frame_tokens,
+                    0,
+                )
+                .expect("prime e2e temporal stream");
+            <JepaBackend as Backend>::sync(&jepa_device).expect("prime e2e temporal stream sync");
+            let temporal_e2e_pipeline_ms = measure_ms(warmups, reps, || {
+                let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+                let frame_tokens = generated_frame_tokens(&generated, FRAMES, autogaze_top_k);
+                let output = temporal_e2e_stream
+                    .forward_frame_tokens_sparse_patchify_wgpu(
+                        &jepa,
+                        jepa_video.clone(),
+                        &frame_tokens,
+                        0,
+                    )
+                    .expect("e2e temporal stream");
+                black_box(output.reused_patchify_plan);
+                black_box(output.temporal.reused_predictor_plan);
+                <B as Backend>::sync(&autogaze_device).expect("temporal e2e autogaze sync");
+                <JepaBackend as Backend>::sync(&jepa_device).expect("temporal e2e jepa sync");
+            });
             let clips_per_sec = 1000.0 / e2e_pipeline_ms.max(f64::EPSILON);
             let frames_per_sec = clips_per_sec * FRAMES as f64;
+            let temporal_clips_per_sec = 1000.0 / temporal_e2e_pipeline_ms.max(f64::EPSILON);
+            let temporal_frames_per_sec = temporal_clips_per_sec * FRAMES as f64;
 
             let row = BenchRow {
                 autogaze_backend,
@@ -443,9 +507,13 @@ where
                 sparse_encoder_ms,
                 predictor_ms,
                 sparse_jepa_ms,
+                temporal_stream_ms,
                 e2e_pipeline_ms,
+                temporal_e2e_pipeline_ms,
                 clips_per_sec,
                 frames_per_sec,
+                temporal_clips_per_sec,
+                temporal_frames_per_sec,
             };
             println!("{}", row.to_csv());
             rows.push(row);
@@ -830,12 +898,12 @@ fn csv_string(rows: &[BenchRow]) -> String {
 
 impl BenchRow {
     fn csv_header() -> &'static str {
-        "autogaze_backend,jepa_backend,resolution,width,height,frames,dense_tokens,target_density,actual_density,autogaze_top_k,context_tokens,target_tokens,autogaze_generate_ms,autogaze_trace_ms,sparse_project_plan_ms,dense_patchify_ms,sparse_patchify_ms,sparse_encoder_ms,predictor_ms,sparse_jepa_ms,e2e_pipeline_ms,clips_per_sec,frames_per_sec"
+        "autogaze_backend,jepa_backend,resolution,width,height,frames,dense_tokens,target_density,actual_density,autogaze_top_k,context_tokens,target_tokens,autogaze_generate_ms,autogaze_trace_ms,sparse_project_plan_ms,dense_patchify_ms,sparse_patchify_ms,sparse_encoder_ms,predictor_ms,sparse_jepa_ms,temporal_stream_ms,e2e_pipeline_ms,temporal_e2e_pipeline_ms,clips_per_sec,frames_per_sec,temporal_clips_per_sec,temporal_frames_per_sec"
     }
 
     fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2}",
+            "{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.2},{:.2}",
             self.autogaze_backend,
             self.jepa_backend,
             self.resolution,
@@ -856,9 +924,13 @@ impl BenchRow {
             self.sparse_encoder_ms,
             self.predictor_ms,
             self.sparse_jepa_ms,
+            self.temporal_stream_ms,
             self.e2e_pipeline_ms,
+            self.temporal_e2e_pipeline_ms,
             self.clips_per_sec,
-            self.frames_per_sec
+            self.frames_per_sec,
+            self.temporal_clips_per_sec,
+            self.temporal_frames_per_sec
         )
     }
 }
