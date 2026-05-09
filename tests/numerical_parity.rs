@@ -101,10 +101,16 @@ fn tiny_sparse_forward_matches_independent_torch_fixture() {
 #[test]
 fn sparse_forward_hot_path_has_no_backend_readbacks() {
     let model_source = include_str!("../src/model.rs");
-    let production_source = model_source
+    let temporal_source = include_str!("../src/temporal.rs");
+    let model_source = model_source
         .split("#[cfg(test)]")
         .next()
         .unwrap_or(model_source);
+    let temporal_source = temporal_source
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or(temporal_source);
+    let production_source = format!("{model_source}\n{temporal_source}");
     for marker in ["into_data(", ".to_data("] {
         assert!(
             !production_source.contains(marker),

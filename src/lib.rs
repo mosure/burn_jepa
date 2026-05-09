@@ -6,6 +6,7 @@ mod positional;
 mod quantization;
 mod safetensors_io;
 mod sparse_patchify;
+mod temporal;
 mod tokens;
 mod training;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
@@ -40,7 +41,12 @@ pub use safetensors_io::{
     load_config_from_hf_dir,
 };
 pub use sparse_patchify::{
-    SparsePatchRect, SparsePatchifyPlan, sparse_mask_from_frame_rects, video_token_grid,
+    SparseImageTokenGrid, SparsePatchRect, SparsePatchifyPlan, sparse_mask_from_frame_rects,
+    sparse_mask_from_frame_token_indices, video_token_grid,
+};
+pub use temporal::{
+    TemporalSparseJepaConfig, TemporalSparseJepaOutput, TemporalSparseJepaState,
+    TemporalSparseMaskConfig, TemporalSparseMaskOutput, TemporalSparseMaskState,
 };
 pub use tokens::{
     SparseTokenMask, SparseVideoTokens, TokenGridShape, apply_token_mask, complement_indices,

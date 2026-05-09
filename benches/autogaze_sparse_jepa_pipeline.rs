@@ -18,12 +18,14 @@ use burn::{
     },
 };
 use burn_autogaze::{
-    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, ConnectorConfig, FixationBounds,
-    FrameFixationTrace, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
+    AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeInferenceMode, AutoGazePipeline,
+    ConnectorConfig, FrameFixationTrace, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel,
+    VisionModelConfig,
 };
 use burn_jepa::{
-    SparsePatchRect, SparsePatchifyPlan, SparsePredictorPlan, SparseTokenMask, TokenGridShape,
+    SparseImageTokenGrid, SparsePatchifyPlan, SparsePredictorPlan, SparseTokenMask, TokenGridShape,
     VJepa2_1Model, VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig,
+    sparse_mask_from_frame_token_indices,
 };
 
 type JepaBackend = burn_flex_gmm::wgpu::DefaultWgpuBackend;
@@ -61,6 +63,11 @@ const RESOLUTIONS: &[Resolution] = &[
 ];
 
 #[derive(Clone, Copy, Debug)]
+struct BenchConfig {
+    emit_traces: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Resolution {
     name: &'static str,
     width: usize,
@@ -81,6 +88,7 @@ struct BenchRow {
     autogaze_top_k: usize,
     context_tokens: usize,
     target_tokens: usize,
+    autogaze_generate_ms: f64,
     autogaze_trace_ms: f64,
     sparse_project_plan_ms: f64,
     dense_patchify_ms: f64,
@@ -97,6 +105,9 @@ fn main() {
     let reps = env_usize("BURN_JEPA_PIPELINE_BENCH_REPS", 3);
     let warmups = env_usize("BURN_JEPA_PIPELINE_BENCH_WARMUPS", 1);
     let include_1080 = env_bool("BURN_JEPA_PIPELINE_BENCH_1080P", true);
+    let bench_config = BenchConfig {
+        emit_traces: env_bool("BURN_JEPA_PIPELINE_BENCH_TRACE", false),
+    };
     let backend_filter = backend_filter();
     let resolutions = RESOLUTIONS
         .iter()
@@ -115,6 +126,7 @@ fn main() {
                     "autogaze-ndarray",
                     <burn::backend::NdArray<f32> as BackendTypes>::Device::default(),
                     &resolutions,
+                    bench_config,
                     warmups,
                     reps,
                 )
@@ -133,6 +145,7 @@ fn main() {
                     "autogaze-webgpu",
                     device,
                     &resolutions,
+                    bench_config,
                     warmups,
                     reps,
                 )
@@ -149,6 +162,7 @@ fn main() {
                     "autogaze-cuda",
                     burn::backend::cuda::CudaDevice::default(),
                     &resolutions,
+                    bench_config,
                     warmups,
                     reps,
                 )
@@ -175,6 +189,7 @@ fn run_autogaze_backend<B>(
     autogaze_backend: &'static str,
     autogaze_device: B::Device,
     resolutions: &[Resolution],
+    bench_config: BenchConfig,
     warmups: usize,
     reps: usize,
 ) -> Vec<BenchRow>
@@ -225,14 +240,18 @@ where
             let target_context_tokens = ((dense_tokens as f32) * target_density).ceil() as usize;
             let target_context_tokens = target_context_tokens.max(1).min(dense_tokens);
             let autogaze_top_k = density_top_k(grid, target_density);
+            let autogaze_budget = autogaze
+                .max_gaze_tokens_each_frame()
+                .max(autogaze_top_k.max(1));
 
-            let traces = autogaze.trace_video_with_mode(
-                ag_video.clone(),
+            let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+            let context_mask = context_mask_from_autogaze_generated(
+                &generated,
+                grid,
+                target_context_tokens,
                 autogaze_top_k,
-                AutoGazeInferenceMode::ResizeToModelInput,
-            );
-            let context_mask = context_mask_from_autogaze(&traces, grid, target_context_tokens)
-                .expect("autogaze sparse context mask");
+            )
+            .expect("autogaze sparse context mask");
             let target_mask =
                 target_mask_for_context(&context_mask, TARGET_TOKENS.min(dense_tokens));
             let context_plan = SparsePatchifyPlan::<JepaBackend>::new(
@@ -254,19 +273,34 @@ where
             <B as Backend>::sync(&autogaze_device).expect("autogaze sync");
             <JepaBackend as Backend>::sync(&jepa_device).expect("plan sync");
 
-            let autogaze_trace_ms = measure_ms(warmups, reps, || {
-                let traces = autogaze.trace_video_with_mode(
-                    ag_video.clone(),
-                    autogaze_top_k,
-                    AutoGazeInferenceMode::ResizeToModelInput,
-                );
-                black_box(trace_point_count(&traces));
-                <B as Backend>::sync(&autogaze_device).expect("autogaze trace sync");
-                traces.len()
+            let autogaze_generate_ms = measure_ms(warmups, reps, || {
+                let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+                black_box(generated_token_count(&generated));
+                <B as Backend>::sync(&autogaze_device).expect("autogaze generate sync");
+                generated.num_gazing_each_frame.len()
             });
+            let autogaze_trace_ms = if bench_config.emit_traces {
+                measure_ms(warmups, reps, || {
+                    let traces = autogaze.trace_video_with_mode(
+                        ag_video.clone(),
+                        autogaze_top_k,
+                        AutoGazeInferenceMode::ResizeToModelInput,
+                    );
+                    black_box(trace_point_count(&traces));
+                    <B as Backend>::sync(&autogaze_device).expect("autogaze trace sync");
+                    traces.len()
+                })
+            } else {
+                0.0
+            };
             let sparse_project_plan_ms = measure_ms(warmups, reps, || {
-                let context_mask = context_mask_from_autogaze(&traces, grid, target_context_tokens)
-                    .expect("project context mask");
+                let context_mask = context_mask_from_autogaze_generated(
+                    &generated,
+                    grid,
+                    target_context_tokens,
+                    autogaze_top_k,
+                )
+                .expect("project context mask");
                 let target_mask =
                     target_mask_for_context(&context_mask, TARGET_TOKENS.min(dense_tokens));
                 let context_plan = SparsePatchifyPlan::<JepaBackend>::new(
@@ -348,13 +382,14 @@ where
                 <JepaBackend as Backend>::sync(&jepa_device).expect("sparse jepa sync");
             });
             let e2e_pipeline_ms = measure_ms(warmups, reps, || {
-                let traces = autogaze.trace_video_with_mode(
-                    ag_video.clone(),
+                let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+                let context_mask = context_mask_from_autogaze_generated(
+                    &generated,
+                    grid,
+                    target_context_tokens,
                     autogaze_top_k,
-                    AutoGazeInferenceMode::ResizeToModelInput,
-                );
-                let context_mask = context_mask_from_autogaze(&traces, grid, target_context_tokens)
-                    .expect("e2e context mask");
+                )
+                .expect("e2e context mask");
                 let target_mask =
                     target_mask_for_context(&context_mask, TARGET_TOKENS.min(dense_tokens));
                 let context_plan = SparsePatchifyPlan::<JepaBackend>::new(
@@ -400,6 +435,7 @@ where
                 autogaze_top_k,
                 context_tokens: context_mask.len(),
                 target_tokens: target_mask.len(),
+                autogaze_generate_ms,
                 autogaze_trace_ms,
                 sparse_project_plan_ms,
                 dense_patchify_ms,
@@ -465,119 +501,80 @@ fn density_top_k(grid: TokenGridShape, density: f32) -> usize {
     ((per_tubelet as f32) * density).ceil().clamp(1.0, 32.0) as usize
 }
 
-fn context_mask_from_autogaze(
-    traces: &[FrameFixationTrace],
+fn context_mask_from_autogaze_generated(
+    generated: &AutoGazeGenerateOutput,
     grid: TokenGridShape,
     min_keep_tokens: usize,
+    top_k: usize,
 ) -> anyhow::Result<SparseTokenMask> {
     let target = min_keep_tokens.max(1).min(grid.len());
-    let rects = trace_rects(traces, FRAMES);
-    let mut selected = Vec::with_capacity(target);
-    let mut keep = vec![false; grid.len()];
-
-    for tubelet in 0..grid.depth {
-        let start = tubelet * TUBELET_SIZE;
-        let end = ((tubelet + 1) * TUBELET_SIZE).min(rects.len());
-        for frame_rects in &rects[start..end] {
-            for rect in frame_rects {
-                push_rect_tokens(*rect, tubelet, grid, target, &mut keep, &mut selected);
-                if selected.len() >= target {
-                    return SparseTokenMask::new(selected, grid.len());
-                }
-            }
-        }
-    }
-
-    for index in SparseTokenMask::evenly_spaced(grid.len(), target)
-        .indices()
-        .iter()
-        .copied()
-    {
-        push_sparse_index(index, target, &mut keep, &mut selected);
-        if selected.len() >= target {
-            return SparseTokenMask::new(selected, grid.len());
-        }
-    }
-    for index in 0..grid.len() {
-        push_sparse_index(index, target, &mut keep, &mut selected);
-        if selected.len() >= target {
-            break;
-        }
-    }
-    SparseTokenMask::new(selected, grid.len())
+    let frame_tokens = generated_frame_tokens(generated, FRAMES, top_k);
+    sparse_mask_from_frame_token_indices(
+        grid,
+        TUBELET_SIZE,
+        autogaze_image_token_grid(),
+        &frame_tokens,
+        0,
+        target,
+    )
 }
 
-fn trace_rects(traces: &[FrameFixationTrace], frames: usize) -> Vec<Vec<SparsePatchRect>> {
-    let trace = traces.first();
+fn generated_frame_tokens(
+    generated: &AutoGazeGenerateOutput,
+    frames: usize,
+    top_k: usize,
+) -> Vec<Vec<usize>> {
+    let tokens = generated.gazing_pos.first();
+    let padded = generated.if_padded_gazing.first();
+    let mut cursor = 0usize;
     (0..frames)
         .map(|frame_idx| {
-            trace
-                .and_then(|trace| trace.frames.get(frame_idx))
-                .map(|set| {
-                    set.points
-                        .iter()
-                        .map(|point| bounds_to_rect(point.bounds()))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let frame_len = generated
+                .num_gazing_each_frame
+                .get(frame_idx)
+                .copied()
+                .unwrap_or(0);
+            let frame_offset = (frame_idx * AUTOGAZE_CONNECTOR_TOKENS) as i64;
+            let mut frame_tokens = Vec::with_capacity(top_k.min(frame_len));
+            for local_idx in 0..frame_len {
+                if frame_tokens.len() >= top_k {
+                    break;
+                }
+                let token_index = cursor + local_idx;
+                if padded
+                    .and_then(|flags| flags.get(token_index))
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                let Some(raw_token) = tokens.and_then(|tokens| tokens.get(token_index)).copied()
+                else {
+                    continue;
+                };
+                let token = raw_token - frame_offset;
+                if token < 0 {
+                    continue;
+                }
+                let token = token as usize;
+                if token < AUTOGAZE_CONNECTOR_TOKENS {
+                    frame_tokens.push(token);
+                }
+            }
+            cursor += frame_len;
+            frame_tokens
         })
         .collect()
 }
 
-fn bounds_to_rect(bounds: FixationBounds) -> SparsePatchRect {
-    SparsePatchRect::new(bounds.x_min, bounds.y_min, bounds.x_max, bounds.y_max)
-}
-
-fn push_rect_tokens(
-    rect: SparsePatchRect,
-    tubelet: usize,
-    grid: TokenGridShape,
-    target: usize,
-    keep: &mut [bool],
-    selected: &mut Vec<usize>,
-) {
-    let Some((row_start, row_end, col_start, col_end)) = rect_patch_bounds(rect, grid) else {
-        return;
-    };
-    for row in row_start..=row_end {
-        for col in col_start..=col_end {
-            let index = tubelet * grid.tokens_per_frame() + row * grid.width + col;
-            push_sparse_index(index, target, keep, selected);
-            if selected.len() >= target {
-                return;
-            }
-        }
-    }
-}
-
-fn push_sparse_index(index: usize, target: usize, keep: &mut [bool], selected: &mut Vec<usize>) {
-    if selected.len() >= target || index >= keep.len() || keep[index] {
-        return;
-    }
-    keep[index] = true;
-    selected.push(index);
-}
-
-fn rect_patch_bounds(
-    rect: SparsePatchRect,
-    grid: TokenGridShape,
-) -> Option<(usize, usize, usize, usize)> {
-    let x0 = rect.x0.min(rect.x1).clamp(0.0, 1.0);
-    let y0 = rect.y0.min(rect.y1).clamp(0.0, 1.0);
-    let x1 = rect.x0.max(rect.x1).clamp(0.0, 1.0);
-    let y1 = rect.y0.max(rect.y1).clamp(0.0, 1.0);
-    if x1 <= x0 || y1 <= y0 || grid.height == 0 || grid.width == 0 {
-        return None;
-    }
-    let col_start = ((x0 * grid.width as f32).floor() as usize).min(grid.width - 1);
-    let row_start = ((y0 * grid.height as f32).floor() as usize).min(grid.height - 1);
-    let col_end = ((x1 * grid.width as f32).ceil() as usize)
-        .saturating_sub(1)
-        .min(grid.width - 1);
-    let row_end = ((y1 * grid.height as f32).ceil() as usize)
-        .saturating_sub(1)
-        .min(grid.height - 1);
-    Some((row_start, row_end, col_start, col_end))
+fn autogaze_image_token_grid() -> SparseImageTokenGrid {
+    let grid = (AUTOGAZE_CONNECTOR_TOKENS as f32).sqrt() as usize;
+    assert_eq!(
+        grid * grid,
+        AUTOGAZE_CONNECTOR_TOKENS,
+        "benchmark AutoGaze connector token grid must be square"
+    );
+    SparseImageTokenGrid::new(grid, grid)
 }
 
 fn target_mask_for_context(context: &SparseTokenMask, target_keep: usize) -> SparseTokenMask {
@@ -776,6 +773,15 @@ fn trace_point_count(traces: &[FrameFixationTrace]) -> usize {
         .sum()
 }
 
+fn generated_token_count(generated: &AutoGazeGenerateOutput) -> usize {
+    generated
+        .if_padded_gazing
+        .iter()
+        .flat_map(|flags| flags.iter())
+        .filter(|&&padded| !padded)
+        .count()
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
@@ -824,12 +830,12 @@ fn csv_string(rows: &[BenchRow]) -> String {
 
 impl BenchRow {
     fn csv_header() -> &'static str {
-        "autogaze_backend,jepa_backend,resolution,width,height,frames,dense_tokens,target_density,actual_density,autogaze_top_k,context_tokens,target_tokens,autogaze_trace_ms,sparse_project_plan_ms,dense_patchify_ms,sparse_patchify_ms,sparse_encoder_ms,predictor_ms,sparse_jepa_ms,e2e_pipeline_ms,clips_per_sec,frames_per_sec"
+        "autogaze_backend,jepa_backend,resolution,width,height,frames,dense_tokens,target_density,actual_density,autogaze_top_k,context_tokens,target_tokens,autogaze_generate_ms,autogaze_trace_ms,sparse_project_plan_ms,dense_patchify_ms,sparse_patchify_ms,sparse_encoder_ms,predictor_ms,sparse_jepa_ms,e2e_pipeline_ms,clips_per_sec,frames_per_sec"
     }
 
     fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2}",
+            "{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2}",
             self.autogaze_backend,
             self.jepa_backend,
             self.resolution,
@@ -842,6 +848,7 @@ impl BenchRow {
             self.autogaze_top_k,
             self.context_tokens,
             self.target_tokens,
+            self.autogaze_generate_ms,
             self.autogaze_trace_ms,
             self.sparse_project_plan_ms,
             self.dense_patchify_ms,
@@ -892,7 +899,9 @@ fn run_optional<T>(name: &str, test: impl FnOnce() -> T) -> Option<T> {
         Ok(value) => Some(value),
         Err(payload) => {
             let reason = panic_payload_to_string(payload);
-            if is_unavailable_backend_reason(&reason) {
+            if is_unavailable_backend_reason(&reason)
+                || is_optional_backend_channel_failure(name, &reason)
+            {
                 eprintln!("skipping {name} benchmark: {reason}");
                 None
             } else {
@@ -932,6 +941,10 @@ fn is_unavailable_backend_reason(reason: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn is_optional_backend_channel_failure(name: &str, reason: &str) -> bool {
+    name.contains("cuda") && reason.to_ascii_lowercase().contains("recverror")
 }
 
 #[derive(Default)]

@@ -11,6 +11,7 @@ Meta V-JEPA 2.1 encoder/predictor recipe:
 - dense RGB video or image grid to patch/tubelet tokens
 - sparse context and target token masks without expanding work back to the full grid
 - sparse 3D positional encoding for `[frame, row, col]` token coordinates
+- sparse image-token to V-JEPA tubelet-token projection for AutoGaze-style masks
 - ViT encoder, predictor, dense predictive loss, and backend-neutral Burn modules
 - safetensors loading path with PyTorch-to-Burn weight layout adaptation
 - simple symmetric int8 quantization helpers for checkpoint/tooling experiments
@@ -58,6 +59,22 @@ tensors, sequence indices, sorted sparse positions, and RoPE sin/cos tensors, so
 the predictor hot path does not reconstruct masks or read tensors back to the
 CPU.
 
+For video streams, `TemporalSparseJepaState` adds a small runtime cache around
+the sparse predictor. It reuses the predictor plan while sparse context/target
+masks are stable and can optionally blend sparse context features between
+keyframes for temporally stable outputs. The default `feature_blend = 1.0`
+preserves exact per-frame sparse features; lower values opt into EMA-style
+stability without adding backend-to-host reads. `next_is_keyframe` lets callers
+run a dense/keyframe path at a fixed interval and sparse next-frame updates
+between keyframes. This is deliberately a predictor/feature cache rather than a
+transformer KV cache: V-JEPA attention is bidirectional, so causal KV reuse would
+not be numerically equivalent to the full model.
+
+For AutoGaze-style sparse inputs, use `sparse_mask_from_frame_token_indices` with
+the source `SparseImageTokenGrid` to project per-frame sparse image tokens into
+the V-JEPA tubelet grid. This keeps the sparse-patch path independent of decoded
+fixation traces.
+
 Checkpoint loading expects a directory with `config.json` and `model.safetensors`:
 
 ```rust,no_run
@@ -84,10 +101,16 @@ The benchmark includes an end-to-end sparse forward and a predictor-only hot pat
 that reuses `SparsePredictorPlan`. On the local ndarray backend, a short run with
 10 Criterion samples measured:
 
-- `sparse_vjepa_tiny_forward_ndarray`: 16.25 ms to 16.46 ms
-- `sparse_predictor_hot_path_ndarray/16_sequence_tokens`: 170.63 us to 171.96 us
-- `sparse_predictor_hot_path_ndarray/24_sequence_tokens`: 216.15 us to 217.89 us
-- `sparse_predictor_hot_path_ndarray/32_sequence_tokens`: 265.98 us to 270.69 us
+- `sparse_vjepa_tiny_forward_ndarray`: 17.043 ms to 17.062 ms
+- `sparse_predictor_hot_path_ndarray/16_sequence_tokens`: 172.03 us to 172.86 us
+- `sparse_predictor_hot_path_ndarray/24_sequence_tokens`: 223.40 us to 223.95 us
+- `sparse_predictor_hot_path_ndarray/32_sequence_tokens`: 271.37 us to 273.84 us
+- `temporal_sparse_predictor_hot_path_ndarray/cached_plan_32_sequence_tokens`: 273.75 us to 274.55 us
+- `temporal_sparse_mask_projection_720p`: 8.6548 us to 8.9288 us
+
+The AutoGaze -> sparse V-JEPA pipeline bench projects sparse masks directly from
+AutoGaze generated token ids. Decoded fixation traces are opt-in for diagnostics:
+set `BURN_JEPA_PIPELINE_BENCH_TRACE=1` to include the extra trace path timing.
 
 ## Correctness
 
@@ -100,6 +123,12 @@ encoder outputs within `5e-4` max absolute error. The same test module also
 round-trips the tiny model through `VJepaLoadOptions::load_model` with strict
 missing-tensor checks. The PyTorch fixture is skipped only when `python3` cannot
 import `torch` and `safetensors`.
+
+The checked-in parity fixture validates the sparse Burn implementation against
+an independent PyTorch implementation with synthetic tiny weights. Real Meta
+V-JEPA 2.1 checkpoint parity should be run with a local checkpoint fixture before
+claiming production weight parity. CUDA pipeline throughput is exposed by the
+benchmark harness, but it requires a CUDA-capable device at runtime.
 
 ## Bevy Example
 
