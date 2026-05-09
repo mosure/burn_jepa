@@ -5,6 +5,7 @@ mod pipeline;
 mod positional;
 mod quantization;
 mod safetensors_io;
+mod sparse_patchify;
 mod tokens;
 mod training;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
@@ -38,6 +39,9 @@ pub use safetensors_io::{
     LoadReport, VJepaLoadOptions, checkpoint_tensor_prefixes, default_hf_snapshot_dir,
     load_config_from_hf_dir,
 };
+pub use sparse_patchify::{
+    SparsePatchRect, SparsePatchifyPlan, sparse_mask_from_frame_rects, video_token_grid,
+};
 pub use tokens::{
     SparseTokenMask, SparseVideoTokens, TokenGridShape, apply_token_mask, complement_indices,
     dense_token_indices, make_context_target_masks, repeat_token_indices,
@@ -63,6 +67,12 @@ pub type WgpuVJepaModel = VJepa2_1Model<burn::backend::Wgpu<f32, i32>>;
 
 #[cfg(any(feature = "wgpu", feature = "webgpu"))]
 pub type WgpuVJepaPipeline = VJepaPipeline<burn::backend::Wgpu<f32, i32>>;
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+pub type SparsePatchifyWgpuVJepaModel = VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend>;
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+pub type SparsePatchifyWgpuVJepaPipeline = VJepaPipeline<burn_flex_gmm::wgpu::DefaultWgpuBackend>;
 
 #[cfg(feature = "webgpu")]
 pub type WebGpuVJepaModel = VJepa2_1Model<burn::backend::WebGpu<f32, i32>>;

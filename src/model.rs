@@ -1,5 +1,7 @@
 use crate::config::VJepaConfig;
 use crate::positional::sparse_3d_sincos_pos_embed;
+#[cfg(feature = "sparse-patchify-wgpu")]
+use crate::sparse_patchify::SparsePatchifyPlan;
 use crate::tokens::{SparseTokenMask, TokenGridShape, apply_token_mask, repeat_token_indices};
 use anyhow::{Result, ensure};
 use burn::module::{Module, Param};
@@ -330,20 +332,37 @@ impl<B: Backend> VJepaEncoder<B> {
 
     fn forward_tokens(
         &self,
-        mut tokens: Tensor<B, 3>,
+        tokens: Tensor<B, 3>,
         batch: usize,
         grid: TokenGridShape,
         mask: Option<&SparseTokenMask>,
         video: bool,
     ) -> VJepaEncoderOutput<B> {
         let device = tokens.device();
-        let dense_indices: Vec<usize> = (0..grid.len()).collect();
         let active_indices = mask
             .map(|mask| mask.indices().to_vec())
-            .unwrap_or_else(|| dense_indices.clone());
+            .unwrap_or_else(|| (0..grid.len()).collect());
+        let tokens = if let Some(mask) = mask {
+            apply_token_mask(tokens, mask.to_tensor(batch, &device))
+        } else {
+            tokens
+        };
+        self.forward_sparse_tokens(tokens, batch, grid, &active_indices, video)
+    }
+
+    pub fn forward_sparse_tokens(
+        &self,
+        mut tokens: Tensor<B, 3>,
+        batch: usize,
+        grid: TokenGridShape,
+        active_indices: &[usize],
+        video: bool,
+    ) -> VJepaEncoderOutput<B> {
+        let device = tokens.device();
         let dim = tokens.shape().dims::<3>()[2];
+        debug_assert_eq!(tokens.shape().dims::<3>()[1], active_indices.len());
         if !self.config.encoder.use_rope {
-            tokens = tokens + position_tensor::<B>(&dense_indices, grid, dim, batch, &device);
+            tokens = tokens + position_tensor::<B>(active_indices, grid, dim, batch, &device);
         }
         if self.config.encoder.modality_embedding {
             let embed = if video {
@@ -353,15 +372,12 @@ impl<B: Backend> VJepaEncoder<B> {
             }
             .reshape([1, 1, dim])
             .repeat_dim(0, batch)
-            .repeat_dim(1, grid.len());
+            .repeat_dim(1, active_indices.len());
             tokens = tokens + embed;
         }
 
-        if let Some(mask) = mask {
-            tokens = apply_token_mask(tokens, mask.to_tensor(batch, &device));
-        }
         let positions = token_sequence_position::<B>(
-            &active_indices,
+            active_indices,
             grid,
             self.config.encoder.embed_dim / self.config.encoder.num_heads.max(1),
             batch,
@@ -392,6 +408,67 @@ impl<B: Backend> VJepaEncoder<B> {
             token_indices: positions.indices,
             grid,
         }
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl VJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
+    pub fn forward_video_sparse_patchify_wgpu(
+        &self,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        let [batch, channels, frames, height, width] = video.shape().dims::<5>();
+        ensure!(
+            batch == plan.batch,
+            "video batch does not match sparse patchify plan"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "video channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            frames / self.config.tubelet_size.max(1),
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            grid == plan.grid,
+            "video token grid does not match sparse patchify plan"
+        );
+        let device = video.device();
+        let patchify_config = burn_flex_gmm::SparsePatchify3dConfig {
+            in_channels: channels,
+            out_channels: self.config.encoder.embed_dim,
+            frames,
+            height,
+            width,
+            tubelet_size: self.config.tubelet_size,
+            patch_h: self.config.patch_size,
+            patch_w: self.config.patch_size,
+        };
+        let bias = self
+            .patch_embed
+            .proj
+            .bias
+            .as_ref()
+            .map(|bias| bias.val())
+            .unwrap_or_else(|| {
+                Tensor::<burn_flex_gmm::wgpu::DefaultWgpuBackend, 1>::zeros(
+                    [self.config.encoder.embed_dim],
+                    &device,
+                )
+            });
+        let tokens = burn_flex_gmm::wgpu::sparse_patchify3d_forward_wgpu(
+            &patchify_config,
+            video,
+            plan.coords.clone(),
+            self.patch_embed.proj.weight.val(),
+            bias,
+        )
+        .map_err(anyhow::Error::msg)?
+        .reshape([batch, plan.token_count(), self.config.encoder.embed_dim]);
+        Ok(self.forward_sparse_tokens(tokens, batch, plan.grid, plan.mask.indices(), true))
     }
 }
 
@@ -679,6 +756,51 @@ impl<B: Backend> VJepa2_1Model<B> {
             predictions: out.predictor.target_predictions,
             targets: out.target.tokens,
             target_indices: out.target.token_indices,
+        })
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
+    pub fn encode_video_sparse_patchify_wgpu(
+        &self,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.encoder.forward_video_sparse_patchify_wgpu(video, plan)
+    }
+
+    pub fn forward_sparse_patchify_wgpu(
+        &self,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        context_plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        target_plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<SparseVJepaForwardOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        ensure!(
+            context_plan.grid == target_plan.grid,
+            "context and target sparse patchify plans must share a grid"
+        );
+        ensure!(
+            context_plan.batch == target_plan.batch,
+            "context and target sparse patchify plans must share a batch"
+        );
+        let context = self
+            .encoder
+            .forward_video_sparse_patchify_wgpu(video.clone(), context_plan)?;
+        let target = self
+            .encoder
+            .forward_video_sparse_patchify_wgpu(video, target_plan)?;
+        let predictor = self.predictor.forward_sparse(
+            context.tokens.clone(),
+            &context_plan.mask,
+            &target_plan.mask,
+            context.grid,
+            0,
+        )?;
+        Ok(SparseVJepaForwardOutput {
+            context,
+            target,
+            predictor,
         })
     }
 }

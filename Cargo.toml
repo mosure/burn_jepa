@@ -37,11 +37,13 @@ wasm = [
   "dep:web-sys",
 ]
 bevy-web-demo = ["wasm"]
+sparse-patchify-wgpu = ["dep:burn_flex_gmm", "burn_flex_gmm/wgpu-kernel"]
 
 [dependencies]
 anyhow = "1"
 burn = { version = "0.21.0", default-features = false, features = ["fusion", "std"] }
 burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
+burn_flex_gmm = { version = "0.21.0", default-features = false, optional = true }
 half = "2"
 safetensors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
