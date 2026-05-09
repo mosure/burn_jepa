@@ -136,6 +136,8 @@ The CSV includes both one-shot sparse pipeline timing and cached
 `TemporalSparseJepaStream` timing (`temporal_stream_ms`,
 `temporal_e2e_pipeline_ms`, and temporal FPS columns) so next-frame sparse
 updates are visible separately from first-use plan construction.
+See [docs/e2e-benchmark-results.md](docs/e2e-benchmark-results.md) for the
+latest checked-in ndarray/WebGPU E2E throughput table and CUDA runtime status.
 
 ## Correctness
 
