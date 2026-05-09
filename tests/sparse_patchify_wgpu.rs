@@ -76,8 +76,11 @@ fn wgpu_temporal_stream_sparse_patchify_matches_dense_masked_stream() {
         .forward_frame_tokens(&model, video.clone(), &frame_tokens, 0)
         .expect("dense masked stream");
     let sparse = sparse_stream
-        .forward_frame_tokens_sparse_patchify_wgpu(&model, video, &frame_tokens, 0)
+        .forward_frame_tokens_sparse_patchify_wgpu(&model, video.clone(), &frame_tokens, 0)
         .expect("sparse patchify stream");
+    let sparse_reused = sparse_stream
+        .forward_frame_tokens_sparse_patchify_wgpu(&model, video, &frame_tokens, 0)
+        .expect("sparse patchify stream reused");
 
     assert_eq!(
         dense.masks.context_mask.indices(),
@@ -97,6 +100,9 @@ fn wgpu_temporal_stream_sparse_patchify_matches_dense_masked_stream() {
         &sparse.temporal.predictor.target_predictions.to_data(),
         "predictor",
     );
+    assert!(!sparse.reused_patchify_plan);
+    assert!(sparse_reused.reused_patchify_plan);
+    assert!(sparse_reused.temporal.reused_predictor_plan);
 }
 
 fn assert_close(left: &burn::tensor::TensorData, right: &burn::tensor::TensorData, label: &str) {

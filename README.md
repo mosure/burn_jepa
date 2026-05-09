@@ -82,8 +82,10 @@ inter-frame updates do not pay for dense patchification.
 On the `sparse-patchify-wgpu` backend,
 `forward_frame_tokens_sparse_patchify_wgpu` routes the stream context path
 through `burn_flex_gmm` sparse patchification, so masked-out patches are not
-patchified before the encoder. The generic `forward_frame_tokens` method remains
-backend-neutral and uses the dense patch embed followed by token masking.
+patchified before the encoder. The stream caches the sparse patchify plan while
+the context mask/grid/batch stay stable, avoiding repeated backend index tensor
+creation. The generic `forward_frame_tokens` method remains backend-neutral and
+uses the dense patch embed followed by token masking.
 
 For AutoGaze-style sparse inputs, use `sparse_mask_from_frame_token_indices` with
 the source `SparseImageTokenGrid` to project per-frame sparse image tokens into

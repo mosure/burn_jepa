@@ -131,6 +131,7 @@ pub struct TemporalSparseJepaStreamOutput<B: Backend> {
     pub context: VJepaEncoderOutput<B>,
     pub temporal: TemporalSparseJepaOutput<B>,
     pub dense_keyframe: Option<VJepaEncoderOutput<B>>,
+    pub reused_patchify_plan: bool,
 }
 
 #[derive(Debug)]
@@ -138,6 +139,8 @@ pub struct TemporalSparseJepaStream<B: Backend> {
     config: TemporalSparseJepaStreamConfig,
     mask_state: TemporalSparseMaskState,
     jepa_state: TemporalSparseJepaState<B>,
+    #[cfg(feature = "sparse-patchify-wgpu")]
+    cached_patchify_plan: Option<CachedSparsePatchifyPlan<B>>,
 }
 
 impl<B: Backend> TemporalSparseJepaStream<B> {
@@ -146,6 +149,8 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
         Self {
             mask_state: TemporalSparseMaskState::new(config.mask_config()),
             jepa_state: TemporalSparseJepaState::new(config.jepa_config()),
+            #[cfg(feature = "sparse-patchify-wgpu")]
+            cached_patchify_plan: None,
             config,
         }
     }
@@ -165,6 +170,7 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
     pub fn reset(&mut self) {
         self.mask_state.reset();
         self.jepa_state.reset();
+        self.reset_patchify_plan();
     }
 
     pub fn forward_frame_tokens(
@@ -238,7 +244,56 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
             context,
             temporal,
             dense_keyframe,
+            reused_patchify_plan: false,
         })
+    }
+
+    #[cfg(feature = "sparse-patchify-wgpu")]
+    fn ensure_patchify_plan(
+        &mut self,
+        context_mask: &SparseTokenMask,
+        grid: TokenGridShape,
+        batch: usize,
+        device: &B::Device,
+    ) -> Result<bool> {
+        if self
+            .cached_patchify_plan
+            .as_ref()
+            .is_some_and(|cached| cached.matches(context_mask, grid, batch))
+        {
+            return Ok(true);
+        }
+        self.cached_patchify_plan = Some(CachedSparsePatchifyPlan {
+            plan: SparsePatchifyPlan::new(context_mask.clone(), grid, batch, device)?,
+            context_mask: context_mask.clone(),
+            grid,
+            batch,
+        });
+        Ok(false)
+    }
+
+    #[cfg(feature = "sparse-patchify-wgpu")]
+    fn reset_patchify_plan(&mut self) {
+        self.cached_patchify_plan = None;
+    }
+
+    #[cfg(not(feature = "sparse-patchify-wgpu"))]
+    fn reset_patchify_plan(&mut self) {}
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+#[derive(Debug)]
+struct CachedSparsePatchifyPlan<B: Backend> {
+    plan: SparsePatchifyPlan<B>,
+    context_mask: SparseTokenMask,
+    grid: TokenGridShape,
+    batch: usize,
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl<B: Backend> CachedSparsePatchifyPlan<B> {
+    fn matches(&self, mask: &SparseTokenMask, grid: TokenGridShape, batch: usize) -> bool {
+        self.context_mask == *mask && self.grid == grid && self.batch == batch
     }
 }
 
@@ -288,8 +343,14 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         } else {
             None
         };
-        let plan = SparsePatchifyPlan::new(masks.context_mask.clone(), grid, batch, &device)?;
-        let context = model.encode_video_sparse_patchify_wgpu(video, &plan)?;
+        let reused_patchify_plan =
+            self.ensure_patchify_plan(&masks.context_mask, grid, batch, &device)?;
+        let plan = &self
+            .cached_patchify_plan
+            .as_ref()
+            .expect("sparse patchify plan should be cached")
+            .plan;
+        let context = model.encode_video_sparse_patchify_wgpu(video, plan)?;
         ensure!(
             context.grid == grid,
             "temporal stream sparse patchify grid changed during encode"
@@ -317,6 +378,7 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             context,
             temporal,
             dense_keyframe,
+            reused_patchify_plan,
         })
     }
 }
