@@ -2,8 +2,6 @@
 
 Date: 2026-05-09
 
-Current remote head: `25a0c95404f8cbba9725e71396f19459a1b6ae54`
-
 Objective: support an efficient and numerically checked
 `burn_autogaze` -> sparse image token projection -> sparse V-JEPA 2.1 temporal
 pipeline with stable next-frame updates, optional dense keyframes, benchmark
@@ -26,7 +24,7 @@ evidence, and clear backend/runtime status.
 | E2E throughput is measured across image resolutions and sparsity densities. | `benches/autogaze_sparse_jepa_pipeline.rs`, `docs/e2e-benchmark-results.md` | Checked-in table covers ndarray and WebGPU for 224x224, 384x384, 720p and densities 1%, 5%, 10%, 25%. | Covered |
 | WebGPU and ndarray performance behavior is explained. | `docs/e2e-benchmark-results.md` | Report notes sparse V-JEPA stream is similar, but WebGPU E2E is slower because AutoGaze WebGPU generation dominates. | Covered |
 | CUDA feature support compiles. | Cargo features and benchmark target | `cargo check --no-default-features --features cuda` and CUDA E2E bench target check passed. | Covered |
-| CUDA E2E FPS is measured. | `docs/e2e-benchmark-results.md` | This host has no usable CUDA runtime: no `/dev/nvidia*`, `nvidia-smi` cannot communicate with the driver, and the benchmark preflight skips CUDA. | Blocked |
+| CUDA E2E FPS is measured. | `docs/e2e-benchmark-results.md`, `docs/cuda-benchmark.md`, `docs/workflows/cuda-benchmark.yml` | This host has no usable CUDA runtime: no `/dev/nvidia*`, `nvidia-smi` cannot communicate with the driver, and the benchmark preflight skips CUDA. A manual self-hosted CUDA benchmark workflow template now fails if the emitted CSV has no data rows; publishing it under `.github/workflows/` requires workflow-file write permission. | Blocked |
 | Package remains publishable. | Cargo package manifest | `cargo package --allow-dirty` passed with docs included. | Covered |
 
 ## Verification Commands
@@ -53,4 +51,6 @@ The implementation, tests, parity fixtures, packaging, and ndarray/WebGPU E2E
 benchmarks are aligned with the objective. The only incomplete item is real CUDA
 runtime throughput. The code now preflights CUDA and reports a clean skip when
 the runtime is unavailable; actual CUDA FPS needs a machine with a visible CUDA
-driver and device nodes.
+driver and device nodes. Use `docs/cuda-benchmark.md` locally, or install the
+`docs/workflows/cuda-benchmark.yml` template as a manual `cuda benchmark`
+workflow, to produce the missing CUDA FPS artifact on that host.

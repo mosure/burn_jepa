@@ -1,0 +1,114 @@
+name: cuda benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: JSON array of self-hosted runner labels with CUDA access
+        required: true
+        default: '["self-hosted","linux","x64","cuda"]'
+      reps:
+        description: Timed repetitions per benchmark row
+        required: true
+        default: "3"
+      warmups:
+        description: Warmup repetitions per benchmark row
+        required: true
+        default: "1"
+      include_1080p:
+        description: Include the padded 1080p case
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      trace:
+        description: Decode AutoGaze fixation traces during the benchmark
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      force_cuda:
+        description: Bypass CUDA preflight checks
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BURN_JEPA_PIPELINE_AUTOGAZE_BACKENDS: cuda
+  BURN_JEPA_PIPELINE_BENCH_OUT: target/cuda-benchmark/autogaze_sparse_jepa_cuda.csv
+
+jobs:
+  cuda-benchmark:
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v5
+
+      - name: setup rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: show cuda devices
+        run: |
+          test -e /dev/nvidiactl || test -e /dev/nvidia0
+          nvidia-smi -L
+
+      - name: compile cuda feature set
+        run: cargo check --no-default-features --features cuda
+
+      - name: run e2e cuda benchmark
+        env:
+          BURN_JEPA_PIPELINE_BENCH_REPS: ${{ inputs.reps }}
+          BURN_JEPA_PIPELINE_BENCH_WARMUPS: ${{ inputs.warmups }}
+          BURN_JEPA_PIPELINE_BENCH_1080P: ${{ inputs.include_1080p }}
+          BURN_JEPA_PIPELINE_BENCH_TRACE: ${{ inputs.trace }}
+          BURN_JEPA_PIPELINE_CUDA_FORCE: ${{ inputs.force_cuda }}
+        run: |
+          cargo bench --bench autogaze_sparse_jepa_pipeline \
+            --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
+          rows="$(awk 'END { print NR }' "$BURN_JEPA_PIPELINE_BENCH_OUT")"
+          if [ "$rows" -le 1 ]; then
+            echo "CUDA benchmark produced no data rows" >&2
+            exit 1
+          fi
+
+      - name: summarize fps
+        run: |
+          awk -F, '
+            NR == 1 {
+              for (i = 1; i <= NF; i++) {
+                idx[$i] = i
+              }
+              next
+            }
+            {
+              printf "%s density=%s temporal_e2e_ms=%s temporal_fps=%s trace_ms=%s\n",
+                $idx["resolution"],
+                $idx["target_density"],
+                $idx["temporal_e2e_pipeline_ms"],
+                $idx["temporal_frames_per_sec"],
+                $idx["autogaze_trace_ms"]
+            }
+          ' "$BURN_JEPA_PIPELINE_BENCH_OUT" | tee "$GITHUB_STEP_SUMMARY"
+
+      - name: upload benchmark csv
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-e2e-benchmark
+          path: target/cuda-benchmark/autogaze_sparse_jepa_cuda.csv
+          if-no-files-found: error
