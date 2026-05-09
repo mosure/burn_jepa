@@ -1,0 +1,821 @@
+use crate::config::VJepaConfig;
+use crate::positional::sparse_3d_sincos_pos_embed;
+use crate::tokens::{SparseTokenMask, TokenGridShape, apply_token_mask, repeat_token_indices};
+use anyhow::{Result, ensure};
+use burn::module::{Module, Param};
+use burn::nn::conv::{Conv2d, Conv2dConfig, Conv3d, Conv3dConfig};
+use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::tensor::activation;
+use burn::tensor::backend::Backend;
+use burn::tensor::{Distribution, Int, Tensor, TensorData};
+
+#[derive(Clone, Debug)]
+pub struct TokenSequencePosition<B: Backend> {
+    pub indices: Tensor<B, 2, Int>,
+    pub rope_sin: Option<Tensor<B, 3>>,
+    pub rope_cos: Option<Tensor<B, 3>>,
+}
+
+#[derive(Module, Debug)]
+pub struct PatchEmbed2d<B: Backend> {
+    pub proj: Conv2d<B>,
+    #[module(skip)]
+    pub patch_size: usize,
+}
+
+impl<B: Backend> PatchEmbed2d<B> {
+    pub fn new(
+        in_channels: usize,
+        embed_dim: usize,
+        patch_size: usize,
+        device: &B::Device,
+    ) -> Self {
+        let patch_size = patch_size.max(1);
+        Self {
+            proj: Conv2dConfig::new(
+                [in_channels.max(1), embed_dim.max(1)],
+                [patch_size, patch_size],
+            )
+            .with_stride([patch_size, patch_size])
+            .init(device),
+            patch_size,
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        let x = self.proj.forward(x);
+        let [batch, dim, height, width] = x.shape().dims::<4>();
+        x.reshape([batch, dim, height * width]).swap_dims(1, 2)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct PatchEmbed3d<B: Backend> {
+    pub proj: Conv3d<B>,
+    #[module(skip)]
+    pub patch_size: usize,
+    #[module(skip)]
+    pub tubelet_size: usize,
+}
+
+impl<B: Backend> PatchEmbed3d<B> {
+    pub fn new(
+        in_channels: usize,
+        embed_dim: usize,
+        patch_size: usize,
+        tubelet_size: usize,
+        device: &B::Device,
+    ) -> Self {
+        let patch_size = patch_size.max(1);
+        let tubelet_size = tubelet_size.max(1);
+        Self {
+            proj: Conv3dConfig::new(
+                [in_channels.max(1), embed_dim.max(1)],
+                [tubelet_size, patch_size, patch_size],
+            )
+            .with_stride([tubelet_size, patch_size, patch_size])
+            .init(device),
+            patch_size,
+            tubelet_size,
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 5>) -> Tensor<B, 3> {
+        let x = self.proj.forward(x);
+        let [batch, dim, depth, height, width] = x.shape().dims::<5>();
+        x.reshape([batch, dim, depth * height * width])
+            .swap_dims(1, 2)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct VJepaSelfAttention<B: Backend> {
+    pub qkv: Linear<B>,
+    pub proj: Linear<B>,
+    #[module(skip)]
+    num_heads: usize,
+    #[module(skip)]
+    head_dim: usize,
+    #[module(skip)]
+    scale: f32,
+    #[module(skip)]
+    use_rope: bool,
+}
+
+impl<B: Backend> VJepaSelfAttention<B> {
+    pub fn new(embed_dim: usize, num_heads: usize, use_rope: bool, device: &B::Device) -> Self {
+        let embed_dim = embed_dim.max(1);
+        let num_heads = num_heads.max(1);
+        let head_dim = (embed_dim / num_heads).max(1);
+        Self {
+            qkv: LinearConfig::new(embed_dim, embed_dim * 3).init(device),
+            proj: LinearConfig::new(embed_dim, embed_dim).init(device),
+            num_heads,
+            head_dim,
+            scale: (head_dim as f32).powf(-0.5),
+            use_rope,
+        }
+    }
+
+    pub fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        positions: Option<&TokenSequencePosition<B>>,
+    ) -> Tensor<B, 3> {
+        let [batch, tokens, dim] = x.shape().dims::<3>();
+        let qkv = self.qkv.forward(x);
+        let mut q = qkv
+            .clone()
+            .slice_dim(2, 0..dim)
+            .reshape([batch, tokens, self.num_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let mut k = qkv
+            .clone()
+            .slice_dim(2, dim..dim * 2)
+            .reshape([batch, tokens, self.num_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let v = qkv
+            .slice_dim(2, dim * 2..dim * 3)
+            .reshape([batch, tokens, self.num_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+
+        if self.use_rope
+            && let Some(positions) = positions
+            && let (Some(sin), Some(cos)) = (&positions.rope_sin, &positions.rope_cos)
+        {
+            q = apply_rotary(q, sin.clone(), cos.clone());
+            k = apply_rotary(k, sin.clone(), cos.clone());
+        }
+
+        let attn = q.matmul(k.swap_dims(2, 3)).mul_scalar(self.scale);
+        let attn = activation::softmax(attn, 3);
+        let out = attn
+            .matmul(v)
+            .permute([0, 2, 1, 3])
+            .reshape([batch, tokens, dim]);
+        self.proj.forward(out)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct VJepaMlp<B: Backend> {
+    pub fc1: Linear<B>,
+    pub fc2: Linear<B>,
+}
+
+impl<B: Backend> VJepaMlp<B> {
+    pub fn new(embed_dim: usize, mlp_ratio: f32, device: &B::Device) -> Self {
+        let hidden = ((embed_dim as f32) * mlp_ratio.max(1.0)).round() as usize;
+        Self {
+            fc1: LinearConfig::new(embed_dim.max(1), hidden.max(1)).init(device),
+            fc2: LinearConfig::new(hidden.max(1), embed_dim.max(1)).init(device),
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.fc2.forward(activation::gelu(self.fc1.forward(x)))
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct TransformerBlock<B: Backend> {
+    pub norm1: LayerNorm<B>,
+    pub attn: VJepaSelfAttention<B>,
+    pub norm2: LayerNorm<B>,
+    pub mlp: VJepaMlp<B>,
+}
+
+impl<B: Backend> TransformerBlock<B> {
+    pub fn new(
+        embed_dim: usize,
+        num_heads: usize,
+        mlp_ratio: f32,
+        norm_eps: f64,
+        use_rope: bool,
+        device: &B::Device,
+    ) -> Self {
+        Self {
+            norm1: LayerNormConfig::new(embed_dim)
+                .with_epsilon(norm_eps)
+                .init(device),
+            attn: VJepaSelfAttention::new(embed_dim, num_heads, use_rope, device),
+            norm2: LayerNormConfig::new(embed_dim)
+                .with_epsilon(norm_eps)
+                .init(device),
+            mlp: VJepaMlp::new(embed_dim, mlp_ratio, device),
+        }
+    }
+
+    pub fn forward(
+        &self,
+        x: Tensor<B, 3>,
+        positions: Option<&TokenSequencePosition<B>>,
+    ) -> Tensor<B, 3> {
+        let y = self.attn.forward(self.norm1.forward(x.clone()), positions);
+        let x = x + y;
+        x.clone() + self.mlp.forward(self.norm2.forward(x))
+    }
+}
+
+#[derive(Debug)]
+pub struct VJepaEncoderOutput<B: Backend> {
+    pub tokens: Tensor<B, 3>,
+    pub hierarchical: Vec<Tensor<B, 3>>,
+    pub token_indices: Tensor<B, 2, Int>,
+    pub grid: TokenGridShape,
+}
+
+#[derive(Module, Debug)]
+pub struct VJepaEncoder<B: Backend> {
+    pub patch_embed: PatchEmbed3d<B>,
+    pub image_patch_embed: PatchEmbed3d<B>,
+    pub blocks: Vec<TransformerBlock<B>>,
+    pub norms_block: Vec<LayerNorm<B>>,
+    pub video_mod_embed: Param<Tensor<B, 2>>,
+    pub image_mod_embed: Param<Tensor<B, 2>>,
+    #[module(skip)]
+    config: VJepaConfig,
+    #[module(skip)]
+    hierarchical_layers: Vec<usize>,
+}
+
+impl<B: Backend> VJepaEncoder<B> {
+    pub fn new(config: &VJepaConfig, device: &B::Device) -> Self {
+        let encoder = &config.encoder;
+        let patch_embed = PatchEmbed3d::new(
+            config.in_channels,
+            encoder.embed_dim,
+            config.patch_size,
+            config.tubelet_size,
+            device,
+        );
+        let image_patch_embed = PatchEmbed3d::new(
+            config.in_channels,
+            encoder.embed_dim,
+            config.patch_size,
+            1,
+            device,
+        );
+        let blocks = (0..encoder.depth.max(1))
+            .map(|_| {
+                TransformerBlock::new(
+                    encoder.embed_dim,
+                    encoder.num_heads,
+                    encoder.mlp_ratio,
+                    encoder.layer_norm_eps,
+                    encoder.use_rope,
+                    device,
+                )
+            })
+            .collect();
+        let hierarchical_layers = encoder.hierarchical_layers();
+        let norms_block = hierarchical_layers
+            .iter()
+            .map(|_| {
+                LayerNormConfig::new(encoder.embed_dim)
+                    .with_epsilon(encoder.layer_norm_eps)
+                    .init(device)
+            })
+            .collect();
+        Self {
+            patch_embed,
+            image_patch_embed,
+            blocks,
+            norms_block,
+            video_mod_embed: Param::from_tensor(Tensor::<B, 2>::random(
+                [1, encoder.embed_dim],
+                Distribution::Normal(0.0, 1.0e-6),
+                device,
+            )),
+            image_mod_embed: Param::from_tensor(Tensor::<B, 2>::random(
+                [1, encoder.embed_dim],
+                Distribution::Normal(0.0, 1.0e-6),
+                device,
+            )),
+            config: config.clone(),
+            hierarchical_layers,
+        }
+    }
+
+    pub fn forward_video(
+        &self,
+        video: Tensor<B, 5>,
+        mask: Option<&SparseTokenMask>,
+    ) -> VJepaEncoderOutput<B> {
+        let [batch, _channels, frames, height, width] = video.shape().dims::<5>();
+        let grid = TokenGridShape::new(
+            frames / self.config.tubelet_size.max(1),
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        let tokens = self.patch_embed.forward(video);
+        self.forward_tokens(tokens, batch, grid, mask, true)
+    }
+
+    pub fn forward_image(
+        &self,
+        image: Tensor<B, 4>,
+        mask: Option<&SparseTokenMask>,
+    ) -> VJepaEncoderOutput<B> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        let image = image.reshape([batch, channels, 1, height, width]);
+        let tokens = self.image_patch_embed.forward(image);
+        self.forward_tokens(tokens, batch, grid, mask, false)
+    }
+
+    fn forward_tokens(
+        &self,
+        mut tokens: Tensor<B, 3>,
+        batch: usize,
+        grid: TokenGridShape,
+        mask: Option<&SparseTokenMask>,
+        video: bool,
+    ) -> VJepaEncoderOutput<B> {
+        let device = tokens.device();
+        let dense_indices: Vec<usize> = (0..grid.len()).collect();
+        let active_indices = mask
+            .map(|mask| mask.indices().to_vec())
+            .unwrap_or_else(|| dense_indices.clone());
+        let dim = tokens.shape().dims::<3>()[2];
+        if !self.config.encoder.use_rope {
+            tokens = tokens + position_tensor::<B>(&dense_indices, grid, dim, batch, &device);
+        }
+        if self.config.encoder.modality_embedding {
+            let embed = if video {
+                self.video_mod_embed.val()
+            } else {
+                self.image_mod_embed.val()
+            }
+            .reshape([1, 1, dim])
+            .repeat_dim(0, batch)
+            .repeat_dim(1, grid.len());
+            tokens = tokens + embed;
+        }
+
+        if let Some(mask) = mask {
+            tokens = apply_token_mask(tokens, mask.to_tensor(batch, &device));
+        }
+        let positions = token_sequence_position::<B>(
+            &active_indices,
+            grid,
+            self.config.encoder.embed_dim / self.config.encoder.num_heads.max(1),
+            batch,
+            &device,
+            self.config.encoder.use_rope,
+        );
+
+        let mut hierarchical = Vec::with_capacity(self.norms_block.len());
+        let mut x = tokens;
+        for (layer_index, block) in self.blocks.iter().enumerate() {
+            x = block.forward(x, Some(&positions));
+            if let Some(norm_index) = self
+                .hierarchical_layers
+                .iter()
+                .position(|&index| index == layer_index)
+            {
+                hierarchical.push(self.norms_block[norm_index].forward(x.clone()));
+            }
+        }
+        let tokens = if let Some(norm) = self.norms_block.last() {
+            norm.forward(x)
+        } else {
+            x
+        };
+        VJepaEncoderOutput {
+            tokens,
+            hierarchical,
+            token_indices: positions.indices,
+            grid,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct VJepaPredictorOutput<B: Backend> {
+    pub target_predictions: Tensor<B, 3>,
+    pub context_predictions: Option<Tensor<B, 3>>,
+    pub sequence_tokens: Tensor<B, 3>,
+    pub sequence_indices: Tensor<B, 2, Int>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SparsePredictorPlan<B: Backend> {
+    pub context_mask: SparseTokenMask,
+    pub target_mask: SparseTokenMask,
+    pub grid: TokenGridShape,
+    pub batch: usize,
+    pub sort_order: Tensor<B, 2, Int>,
+    pub reverse_order: Tensor<B, 2, Int>,
+    pub sequence_indices: Tensor<B, 2, Int>,
+    pub positions: TokenSequencePosition<B>,
+}
+
+impl<B: Backend> SparsePredictorPlan<B> {
+    pub fn new(
+        config: &VJepaConfig,
+        context_mask: SparseTokenMask,
+        target_mask: SparseTokenMask,
+        grid: TokenGridShape,
+        batch: usize,
+        device: &B::Device,
+    ) -> Result<Self> {
+        ensure!(
+            context_mask.dense_len() == target_mask.dense_len(),
+            "context and target masks must share a dense token range"
+        );
+        ensure!(
+            context_mask.dense_len() == grid.len(),
+            "mask dense token count must match predictor token grid"
+        );
+        let merged_indices = context_mask
+            .indices()
+            .iter()
+            .chain(target_mask.indices().iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let sort_order = argsort(&merged_indices);
+        let reverse_order = inverse_permutation(&sort_order);
+        let sorted_indices = sort_order
+            .iter()
+            .map(|&index| merged_indices[index])
+            .collect::<Vec<_>>();
+        let positions = token_sequence_position::<B>(
+            &sorted_indices,
+            grid,
+            config.predictor.embed_dim / config.predictor.num_heads.max(1),
+            batch,
+            device,
+            config.predictor.use_rope,
+        );
+        Ok(Self {
+            context_mask,
+            target_mask,
+            grid,
+            batch,
+            sort_order: repeat_token_indices::<B>(&sort_order, batch, device),
+            reverse_order: repeat_token_indices::<B>(&reverse_order, batch, device),
+            sequence_indices: repeat_token_indices::<B>(&merged_indices, batch, device),
+            positions,
+        })
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct VJepaPredictor<B: Backend> {
+    pub predictor_embed: Linear<B>,
+    pub mask_tokens: Vec<Param<Tensor<B, 2>>>,
+    pub blocks: Vec<TransformerBlock<B>>,
+    pub norm: LayerNorm<B>,
+    pub target_proj: Linear<B>,
+    pub context_proj: Option<Linear<B>>,
+    #[module(skip)]
+    config: VJepaConfig,
+    #[module(skip)]
+    return_all_tokens: bool,
+}
+
+impl<B: Backend> VJepaPredictor<B> {
+    pub fn new(config: &VJepaConfig, device: &B::Device) -> Self {
+        let predictor = &config.predictor;
+        let encoder_dim = config.encoder.embed_dim;
+        let pred_dim = predictor.embed_dim;
+        let output_dim = predictor.output_dim.unwrap_or(encoder_dim);
+        Self {
+            predictor_embed: LinearConfig::new(encoder_dim, pred_dim).init(device),
+            mask_tokens: (0..predictor.num_mask_tokens.max(1))
+                .map(|_| Param::from_tensor(Tensor::<B, 2>::zeros([1, pred_dim], device)))
+                .collect(),
+            blocks: (0..predictor.depth.max(1))
+                .map(|_| {
+                    TransformerBlock::new(
+                        pred_dim,
+                        predictor.num_heads,
+                        predictor.mlp_ratio,
+                        predictor.layer_norm_eps,
+                        predictor.use_rope,
+                        device,
+                    )
+                })
+                .collect(),
+            norm: LayerNormConfig::new(pred_dim)
+                .with_epsilon(predictor.layer_norm_eps)
+                .init(device),
+            target_proj: LinearConfig::new(pred_dim, output_dim).init(device),
+            context_proj: predictor
+                .return_all_tokens
+                .then(|| LinearConfig::new(pred_dim, output_dim).init(device)),
+            config: config.clone(),
+            return_all_tokens: predictor.return_all_tokens,
+        }
+    }
+
+    pub fn forward_sparse(
+        &self,
+        context_tokens: Tensor<B, 3>,
+        context_mask: &SparseTokenMask,
+        target_mask: &SparseTokenMask,
+        grid: TokenGridShape,
+        mask_index: usize,
+    ) -> Result<VJepaPredictorOutput<B>> {
+        let batch = context_tokens.shape().dims::<3>()[0];
+        let device = context_tokens.device();
+        let plan = SparsePredictorPlan::new(
+            &self.config,
+            context_mask.clone(),
+            target_mask.clone(),
+            grid,
+            batch,
+            &device,
+        )?;
+        self.forward_sparse_with_plan(context_tokens, &plan, mask_index)
+    }
+
+    pub fn forward_sparse_with_plan(
+        &self,
+        context_tokens: Tensor<B, 3>,
+        plan: &SparsePredictorPlan<B>,
+        mask_index: usize,
+    ) -> Result<VJepaPredictorOutput<B>> {
+        let context_mask = &plan.context_mask;
+        let target_mask = &plan.target_mask;
+        let [batch, context_len, _encoder_dim] = context_tokens.shape().dims::<3>();
+        ensure!(
+            batch == plan.batch,
+            "context token batch does not match sparse predictor plan"
+        );
+        ensure!(
+            context_len == context_mask.len(),
+            "context token shape does not match context mask"
+        );
+        let device = context_tokens.device();
+        let pred_dim = self.config.predictor.embed_dim;
+
+        let mut context = self.predictor_embed.forward(context_tokens);
+        if !self.config.predictor.use_rope {
+            context = context
+                + position_tensor::<B>(context_mask.indices(), plan.grid, pred_dim, batch, &device);
+        }
+
+        let target_len = target_mask.len();
+        let token = self.mask_tokens[mask_index % self.mask_tokens.len()]
+            .val()
+            .reshape([1, 1, pred_dim])
+            .repeat_dim(0, batch)
+            .repeat_dim(1, target_len);
+        let target = if self.config.predictor.use_rope {
+            token
+        } else {
+            token + position_tensor::<B>(target_mask.indices(), plan.grid, pred_dim, batch, &device)
+        };
+        let mut sequence = Tensor::cat(vec![context, target], 1);
+        sequence = gather_with_indices(sequence, plan.sort_order.clone());
+
+        for block in &self.blocks {
+            sequence = block.forward(sequence, Some(&plan.positions));
+        }
+        sequence = self.norm.forward(sequence);
+        sequence = gather_with_indices(sequence, plan.reverse_order.clone());
+        let context_predictions = self.return_all_tokens.then(|| {
+            let context = sequence.clone().slice_dim(1, 0..context_len);
+            self.context_proj
+                .as_ref()
+                .expect("context projection")
+                .forward(context)
+        });
+        let target_predictions = self.target_proj.forward(
+            sequence
+                .clone()
+                .slice_dim(1, context_len..context_len + target_len),
+        );
+        Ok(VJepaPredictorOutput {
+            target_predictions,
+            context_predictions,
+            sequence_tokens: sequence,
+            sequence_indices: plan.sequence_indices.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct DensePredictionOutput<B: Backend> {
+    pub predictions: Tensor<B, 3>,
+    pub targets: Tensor<B, 3>,
+    pub target_indices: Tensor<B, 2, Int>,
+}
+
+#[derive(Debug)]
+pub struct SparseVJepaForwardOutput<B: Backend> {
+    pub context: VJepaEncoderOutput<B>,
+    pub target: VJepaEncoderOutput<B>,
+    pub predictor: VJepaPredictorOutput<B>,
+}
+
+#[derive(Module, Debug)]
+pub struct VJepa2_1Model<B: Backend> {
+    pub encoder: VJepaEncoder<B>,
+    pub predictor: VJepaPredictor<B>,
+    #[module(skip)]
+    config: VJepaConfig,
+}
+
+impl<B: Backend> VJepa2_1Model<B> {
+    pub fn new(config: &VJepaConfig, device: &B::Device) -> Self {
+        Self {
+            encoder: VJepaEncoder::new(config, device),
+            predictor: VJepaPredictor::new(config, device),
+            config: config.clone(),
+        }
+    }
+
+    pub fn config(&self) -> &VJepaConfig {
+        &self.config
+    }
+
+    pub fn encode_video(
+        &self,
+        video: Tensor<B, 5>,
+        mask: Option<&SparseTokenMask>,
+    ) -> VJepaEncoderOutput<B> {
+        self.encoder.forward_video(video, mask)
+    }
+
+    pub fn forward_sparse(
+        &self,
+        video: Tensor<B, 5>,
+        context_mask: &SparseTokenMask,
+        target_mask: &SparseTokenMask,
+    ) -> Result<SparseVJepaForwardOutput<B>> {
+        let context = self
+            .encoder
+            .forward_video(video.clone(), Some(context_mask));
+        let target = self.encoder.forward_video(video, Some(target_mask));
+        let predictor = self.predictor.forward_sparse(
+            context.tokens.clone(),
+            context_mask,
+            target_mask,
+            context.grid,
+            0,
+        )?;
+        Ok(SparseVJepaForwardOutput {
+            context,
+            target,
+            predictor,
+        })
+    }
+
+    pub fn predict_dense_targets(
+        &self,
+        video: Tensor<B, 5>,
+        context_mask: &SparseTokenMask,
+        target_mask: &SparseTokenMask,
+    ) -> Result<DensePredictionOutput<B>> {
+        let out = self.forward_sparse(video, context_mask, target_mask)?;
+        Ok(DensePredictionOutput {
+            predictions: out.predictor.target_predictions,
+            targets: out.target.tokens,
+            target_indices: out.target.token_indices,
+        })
+    }
+}
+
+fn position_tensor<B: Backend>(
+    indices: &[usize],
+    grid: TokenGridShape,
+    dim: usize,
+    batch: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    let values = sparse_3d_sincos_pos_embed(dim, grid, indices);
+    Tensor::<B, 3>::from_data(TensorData::new(values, [1, indices.len(), dim]), device)
+        .repeat_dim(0, batch)
+}
+
+fn token_sequence_position<B: Backend>(
+    indices: &[usize],
+    grid: TokenGridShape,
+    head_dim: usize,
+    batch: usize,
+    device: &B::Device,
+    use_rope: bool,
+) -> TokenSequencePosition<B> {
+    let (rope_sin, rope_cos) = if use_rope {
+        let (sin, cos) = rotary_sin_cos_tensors::<B>(indices, grid, head_dim, batch, device);
+        (Some(sin), Some(cos))
+    } else {
+        (None, None)
+    };
+    TokenSequencePosition {
+        indices: repeat_token_indices::<B>(indices, batch, device),
+        rope_sin,
+        rope_cos,
+    }
+}
+
+fn rotary_sin_cos_tensors<B: Backend>(
+    indices: &[usize],
+    grid: TokenGridShape,
+    head_dim: usize,
+    batch: usize,
+    device: &B::Device,
+) -> (Tensor<B, 3>, Tensor<B, 3>) {
+    let axis_dim = 2 * ((head_dim / 3) / 2);
+    let mut sin = Vec::with_capacity(indices.len() * head_dim);
+    let mut cos = Vec::with_capacity(indices.len() * head_dim);
+    for &index in indices {
+        let (frame, row, col) = crate::token_index_to_coords(index, grid);
+        append_rotary_axis(&mut sin, &mut cos, axis_dim, frame as f32);
+        append_rotary_axis(&mut sin, &mut cos, axis_dim, row as f32);
+        append_rotary_axis(&mut sin, &mut cos, axis_dim, col as f32);
+        let used = axis_dim * 3;
+        for _ in used..head_dim {
+            sin.push(0.0);
+            cos.push(1.0);
+        }
+    }
+    let sin = Tensor::<B, 3>::from_data(TensorData::new(sin, [1, indices.len(), head_dim]), device)
+        .repeat_dim(0, batch);
+    let cos = Tensor::<B, 3>::from_data(TensorData::new(cos, [1, indices.len(), head_dim]), device)
+        .repeat_dim(0, batch);
+    (sin, cos)
+}
+
+fn append_rotary_axis(sin: &mut Vec<f32>, cos: &mut Vec<f32>, dim: usize, pos: f32) {
+    let half = dim / 2;
+    for i in 0..half {
+        let omega = 1.0 / 10000_f32.powf(i as f32 / half.max(1) as f32);
+        let angle = pos * omega;
+        let s = angle.sin();
+        let c = angle.cos();
+        sin.push(s);
+        sin.push(s);
+        cos.push(c);
+        cos.push(c);
+    }
+}
+
+fn apply_rotary<B: Backend>(x: Tensor<B, 4>, sin: Tensor<B, 3>, cos: Tensor<B, 3>) -> Tensor<B, 4> {
+    let sin = sin.unsqueeze_dim::<4>(1);
+    let cos = cos.unsqueeze_dim::<4>(1);
+    x.clone() * cos + rotate_half_pairs(x) * sin
+}
+
+fn rotate_half_pairs<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [batch, heads, tokens, dim] = x.shape().dims::<4>();
+    debug_assert!(dim.is_multiple_of(2));
+    let paired = x.reshape([batch, heads, tokens, dim / 2, 2]);
+    let first = paired.clone().slice_dim(4, 0..1);
+    let second = paired.slice_dim(4, 1..2);
+    Tensor::cat(vec![second.neg(), first], 4).reshape([batch, heads, tokens, dim])
+}
+
+fn gather_with_indices<B: Backend>(
+    tokens: Tensor<B, 3>,
+    indices: Tensor<B, 2, Int>,
+) -> Tensor<B, 3> {
+    apply_token_mask(tokens, indices)
+}
+
+fn argsort(values: &[usize]) -> Vec<usize> {
+    let mut order = (0..values.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&index| values[index]);
+    order
+}
+
+fn inverse_permutation(order: &[usize]) -> Vec<usize> {
+    let mut inverse = vec![0; order.len()];
+    for (sorted_pos, &original_pos) in order.iter().enumerate() {
+        inverse[original_pos] = sorted_pos;
+    }
+    inverse
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::make_context_target_masks;
+
+    type B = burn::backend::NdArray<f32>;
+
+    #[test]
+    fn tiny_model_sparse_forward_shapes() {
+        let device = Default::default();
+        let config = VJepaConfig::tiny_for_tests();
+        let model = VJepa2_1Model::<B>::new(&config, &device);
+        let video = Tensor::<B, 5>::zeros([1, 3, 4, 32, 32], &device);
+        let (context, target) = make_context_target_masks(config.token_grid(), 0.5);
+        let out = model
+            .forward_sparse(video, &context, &target)
+            .expect("sparse forward");
+        assert_eq!(out.context.tokens.shape().dims::<3>(), [1, 4, 32]);
+        assert_eq!(out.target.tokens.shape().dims::<3>(), [1, 4, 32]);
+        assert_eq!(
+            out.predictor.target_predictions.shape().dims::<3>(),
+            [1, 4, 32]
+        );
+    }
+}

@@ -1,0 +1,59 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v5
+
+      - name: setup nightly rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: test root crate
+        run: cargo test --workspace
+
+      - name: test ndarray-only feature set
+        run: cargo test --workspace --no-default-features --features ndarray
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: clippy ndarray-only feature set
+        run: cargo clippy --workspace --all-targets --no-default-features --features ndarray -- -D warnings
+
+      - name: package
+        run: cargo package -p burn_jepa
+
+      - name: benchmark smoke
+        run: cargo bench --bench sparse_pipeline --no-default-features --features ndarray -- --test
+
+      - name: check wasm api
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+
+      - name: check bevy
+        run: cargo check -p bevy_burn_jepa
+
+      - name: check bevy static page
+        run: cd crates/bevy_burn_jepa && node tests/static-source.spec.mjs

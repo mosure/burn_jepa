@@ -1,0 +1,38 @@
+[package]
+name = "bevy_burn_jepa"
+version = "0.1.0"
+edition = "2024"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+description = "Bevy example shell for burn_jepa"
+homepage = "https://github.com/mosure/burn_jepa"
+repository = "https://github.com/mosure/burn_jepa"
+readme = "README.md"
+publish = false
+
+[features]
+default = []
+native = []
+web = []
+
+[dependencies]
+anyhow = "1"
+burn = { version = "0.21.0", default-features = false, features = ["fusion", "std", "ndarray"] }
+burn_jepa = { path = "../..", default-features = false, features = ["ndarray"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dependencies.bevy]
+version = "0.17"
+default-features = false
+features = [
+  "bevy_log",
+  "std",
+]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bevy_burn_jepa"
+path = "src/main.rs"
