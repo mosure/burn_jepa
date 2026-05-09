@@ -166,8 +166,11 @@ cargo test --test numerical_parity real_vjepa_checkpoint_loads_when_fixture_is_s
 ```
 
 Set `BURN_JEPA_VJEPA21_FORWARD_SMOKE=1` to also run a sparse forward smoke after
-loading. CUDA pipeline throughput is exposed by the benchmark harness, but it
-requires a CUDA-capable device at runtime.
+loading. Set `BURN_JEPA_VJEPA21_FORWARD_PARITY=1` to compare a one-token
+real-checkpoint micro forward against the installed Hugging Face `VJEPA2Model`;
+this keeps the real-weight parity check small enough for CPU-only machines.
+CUDA pipeline throughput is exposed by the benchmark harness, but it requires a
+CUDA-capable device at runtime.
 
 ## Bevy Example
 

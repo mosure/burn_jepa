@@ -258,6 +258,7 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
         eprintln!("skipping real V-JEPA checkpoint smoke; set BURN_JEPA_VJEPA21_CHECKPOINT_DIR");
         return;
     };
+    let checkpoint_dir = std::path::PathBuf::from(checkpoint_dir);
     let device = Default::default();
     let allow_partial = env_bool("BURN_JEPA_VJEPA21_ALLOW_PARTIAL");
     let (model, config, report) = VJepaLoadOptions {
@@ -299,7 +300,40 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
         );
     }
 
-    if env_bool("BURN_JEPA_VJEPA21_FORWARD_SMOKE") {
+    if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY") {
+        let torch_output = real_hf_micro_forward(&checkpoint_dir);
+        let context = SparseTokenMask::new(vec![0], 1).expect("micro context");
+        let target = SparseTokenMask::new(vec![0], 1).expect("micro target");
+        let dense = model.encode_video(real_micro_parity_video(&config), None);
+        let predictor = model
+            .predictor
+            .forward_sparse(
+                dense.tokens.clone(),
+                &context,
+                &target,
+                dense.grid,
+                env_usize("BURN_JEPA_VJEPA21_MASK_INDEX", 1),
+            )
+            .expect("real checkpoint micro predictor parity");
+        let burn_predictions = predictor
+            .target_predictions
+            .to_data()
+            .to_vec::<f32>()
+            .expect("real burn prediction values");
+        let burn_targets = apply_token_mask(dense.tokens, target.to_tensor(1, &device))
+            .to_data()
+            .to_vec::<f32>()
+            .expect("real burn target values");
+        let prediction_diff = max_abs_diff(&burn_predictions, &torch_output.predictions);
+        let target_diff = max_abs_diff(&burn_targets, &torch_output.targets);
+        eprintln!(
+            "real V-JEPA micro parity prediction_diff={prediction_diff:e} target_diff={target_diff:e}"
+        );
+        assert!(
+            prediction_diff <= 5.0e-4 && target_diff <= 5.0e-4,
+            "real V-JEPA micro parity exceeded tolerance: prediction_diff={prediction_diff:e}, target_diff={target_diff:e}"
+        );
+    } else if env_bool("BURN_JEPA_VJEPA21_FORWARD_SMOKE") {
         let context = SparseTokenMask::evenly_spaced(
             config.num_patches(),
             env_usize("BURN_JEPA_VJEPA21_CONTEXT_TOKENS", 64),
@@ -416,6 +450,63 @@ fn hf_parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
         ),
         &device,
     )
+}
+
+fn real_micro_parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
+    let device = Default::default();
+    let frames = config.tubelet_size.max(1);
+    let height = config.patch_size.max(1);
+    let width = config.patch_size.max(1);
+    let len = frames * config.in_channels * height * width;
+    let values = (0..len)
+        .map(|i| ((i % 31) as f32 - 15.0) / 23.0)
+        .collect::<Vec<_>>();
+    let mut burn_values = Vec::with_capacity(len);
+    for channel in 0..config.in_channels {
+        for frame in 0..frames {
+            for row in 0..height {
+                for col in 0..width {
+                    let hf_index =
+                        (((frame * config.in_channels + channel) * height + row) * width) + col;
+                    burn_values.push(values[hf_index]);
+                }
+            }
+        }
+    }
+    Tensor::<B, 5>::from_data(
+        TensorData::new(burn_values, [1, config.in_channels, frames, height, width]),
+        &device,
+    )
+}
+
+fn real_hf_micro_forward(checkpoint_dir: &std::path::Path) -> TorchParityOutput {
+    if Command::new("python3")
+        .arg("-c")
+        .arg("import torch, transformers")
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
+    {
+        panic!("BURN_JEPA_VJEPA21_FORWARD_PARITY requires python3 torch and transformers");
+    }
+    let tempdir = tempfile::tempdir().expect("real parity tempdir");
+    let output_path = tempdir.path().join("real-hf-output.json");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/vjepa_hf_real_micro_forward.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .arg(checkpoint_dir)
+        .arg(&output_path)
+        .output()
+        .expect("run real HF V-JEPA micro fixture");
+    assert!(
+        output.status.success(),
+        "real HF V-JEPA micro fixture failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&std::fs::read(&output_path).expect("read real HF fixture output"))
+        .expect("parse real HF fixture output")
 }
 
 fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
