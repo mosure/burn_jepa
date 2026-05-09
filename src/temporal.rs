@@ -1,6 +1,7 @@
 use crate::{
-    SparseImageTokenGrid, SparsePredictorPlan, SparseTokenMask, TokenGridShape, VJepaConfig,
-    VJepaPredictor, VJepaPredictorOutput, sparse_mask_from_frame_token_indices,
+    SparseImageTokenGrid, SparsePredictorPlan, SparseTokenMask, TokenGridShape, VJepa2_1Model,
+    VJepaConfig, VJepaEncoderOutput, VJepaPredictor, VJepaPredictorOutput,
+    sparse_mask_from_frame_token_indices,
 };
 use anyhow::{Result, ensure};
 use burn::tensor::Tensor;
@@ -47,6 +48,176 @@ pub struct TemporalSparseJepaOutput<B: Backend> {
     pub predictor: VJepaPredictorOutput<B>,
     pub keyframe: bool,
     pub reused_predictor_plan: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TemporalSparseJepaStreamConfig {
+    pub keyframe_interval: usize,
+    pub context_tokens: usize,
+    pub target_tokens: usize,
+    pub dilation: usize,
+    pub feature_blend: f32,
+    pub image_grid: SparseImageTokenGrid,
+}
+
+impl TemporalSparseJepaStreamConfig {
+    pub fn new(
+        context_tokens: usize,
+        target_tokens: usize,
+        image_grid: SparseImageTokenGrid,
+    ) -> Self {
+        Self {
+            keyframe_interval: 16,
+            context_tokens,
+            target_tokens,
+            dilation: 0,
+            feature_blend: 1.0,
+            image_grid,
+        }
+    }
+
+    pub fn with_keyframe_interval(mut self, keyframe_interval: usize) -> Self {
+        self.keyframe_interval = keyframe_interval.max(1);
+        self
+    }
+
+    pub fn with_dilation(mut self, dilation: usize) -> Self {
+        self.dilation = dilation;
+        self
+    }
+
+    pub fn with_feature_blend(mut self, feature_blend: f32) -> Self {
+        self.feature_blend = feature_blend.clamp(0.0, 1.0);
+        self
+    }
+
+    fn normalized(self) -> Self {
+        Self {
+            keyframe_interval: self.keyframe_interval.max(1),
+            context_tokens: self.context_tokens.max(1),
+            target_tokens: self.target_tokens.max(1),
+            dilation: self.dilation,
+            feature_blend: self.feature_blend.clamp(0.0, 1.0),
+            image_grid: self.image_grid,
+        }
+    }
+
+    fn mask_config(self) -> TemporalSparseMaskConfig {
+        TemporalSparseMaskConfig::new(self.context_tokens, self.target_tokens)
+            .with_keyframe_interval(self.keyframe_interval)
+            .with_dilation(self.dilation)
+    }
+
+    fn jepa_config(self) -> TemporalSparseJepaConfig {
+        TemporalSparseJepaConfig::default()
+            .with_keyframe_interval(self.keyframe_interval)
+            .with_feature_blend(self.feature_blend)
+    }
+}
+
+#[derive(Debug)]
+pub struct TemporalSparseJepaStreamOutput<B: Backend> {
+    pub masks: TemporalSparseMaskOutput,
+    pub context: VJepaEncoderOutput<B>,
+    pub temporal: TemporalSparseJepaOutput<B>,
+}
+
+#[derive(Debug)]
+pub struct TemporalSparseJepaStream<B: Backend> {
+    config: TemporalSparseJepaStreamConfig,
+    mask_state: TemporalSparseMaskState,
+    jepa_state: TemporalSparseJepaState<B>,
+}
+
+impl<B: Backend> TemporalSparseJepaStream<B> {
+    pub fn new(config: TemporalSparseJepaStreamConfig) -> Self {
+        let config = config.normalized();
+        Self {
+            mask_state: TemporalSparseMaskState::new(config.mask_config()),
+            jepa_state: TemporalSparseJepaState::new(config.jepa_config()),
+            config,
+        }
+    }
+
+    pub fn config(&self) -> TemporalSparseJepaStreamConfig {
+        self.config
+    }
+
+    pub fn step(&self) -> usize {
+        self.jepa_state.step()
+    }
+
+    pub fn next_is_keyframe(&self) -> bool {
+        self.jepa_state.next_is_keyframe()
+    }
+
+    pub fn reset(&mut self) {
+        self.mask_state.reset();
+        self.jepa_state.reset();
+    }
+
+    pub fn forward_frame_tokens(
+        &mut self,
+        model: &VJepa2_1Model<B>,
+        video: Tensor<B, 5>,
+        frame_tokens: &[Vec<usize>],
+        mask_index: usize,
+    ) -> Result<TemporalSparseJepaStreamOutput<B>> {
+        let [batch, channels, frames, height, width] = video.shape().dims::<5>();
+        ensure!(
+            channels == model.config().in_channels,
+            "temporal stream video channel count must match V-JEPA config"
+        );
+        let tubelet_size = model.config().tubelet_size.max(1);
+        let patch_size = model.config().patch_size.max(1);
+        ensure!(
+            frames >= tubelet_size && height >= patch_size && width >= patch_size,
+            "temporal stream video must contain at least one V-JEPA tubelet patch"
+        );
+        let grid = TokenGridShape::new(
+            frames / tubelet_size,
+            height / patch_size,
+            width / patch_size,
+        );
+        ensure!(
+            !grid.is_empty(),
+            "temporal stream video produced an empty token grid"
+        );
+        let masks = self.mask_state.next_from_frame_tokens(
+            grid,
+            tubelet_size,
+            self.config.image_grid,
+            frame_tokens,
+        )?;
+        let context = model.encode_video(video, Some(&masks.context_mask));
+        ensure!(
+            context.grid == grid,
+            "temporal stream encoder grid changed during sparse encode"
+        );
+        ensure!(
+            context.tokens.shape().dims::<3>()[0] == batch,
+            "temporal stream encoder batch changed during sparse encode"
+        );
+        let temporal = self.jepa_state.forward_predictor(
+            model.config(),
+            &model.predictor,
+            context.tokens.clone(),
+            &masks.context_mask,
+            &masks.target_mask,
+            context.grid,
+            mask_index,
+        )?;
+        ensure!(
+            masks.keyframe == temporal.keyframe,
+            "temporal stream mask and predictor keyframe state diverged"
+        );
+
+        Ok(TemporalSparseJepaStreamOutput {
+            masks,
+            context,
+            temporal,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

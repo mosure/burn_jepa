@@ -1,8 +1,8 @@
 use burn::tensor::Tensor;
 use burn_jepa::{
     SparseImageTokenGrid, SparsePredictorPlan, SparseTokenMask, TemporalSparseJepaConfig,
-    TemporalSparseJepaState, TemporalSparseMaskConfig, TemporalSparseMaskState, TokenGridShape,
-    VJepa2_1Model, VJepaConfig,
+    TemporalSparseJepaState, TemporalSparseJepaStream, TemporalSparseJepaStreamConfig,
+    TemporalSparseMaskConfig, TemporalSparseMaskState, TokenGridShape, VJepa2_1Model, VJepaConfig,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::BTreeSet;
@@ -138,6 +138,38 @@ fn bench_temporal_sparse_mask_projection(c: &mut Criterion) {
     });
 }
 
+fn bench_temporal_sparse_stream_hot_path(c: &mut Criterion) {
+    let device = Default::default();
+    let config = bench_config();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let video = Tensor::<B, 5>::zeros([1, 3, 4, 64, 64], &device);
+    let image_grid = SparseImageTokenGrid::new(2, 2);
+    let frame_tokens = vec![vec![0], vec![1], vec![2], vec![3]];
+    let stream_config =
+        TemporalSparseJepaStreamConfig::new(24, 8, image_grid).with_keyframe_interval(16);
+
+    let mut group = c.benchmark_group("temporal_sparse_stream_hot_path_ndarray");
+    group.throughput(Throughput::Elements(32));
+    group.bench_function("cached_plan_32_sequence_tokens", |b| {
+        b.iter_batched(
+            || {
+                let mut stream = TemporalSparseJepaStream::<B>::new(stream_config);
+                stream
+                    .forward_frame_tokens(&model, video.clone(), &frame_tokens, 0)
+                    .expect("prime temporal stream state");
+                stream
+            },
+            |mut stream| {
+                stream
+                    .forward_frame_tokens(&model, video.clone(), &frame_tokens, 0)
+                    .expect("temporal stream")
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 fn bench_config() -> VJepaConfig {
     let mut config = VJepaConfig::tiny_for_tests();
     config.image_size = 64;
@@ -167,6 +199,7 @@ criterion_group!(
     bench_sparse_forward,
     bench_sparse_predictor_hot_path,
     bench_temporal_sparse_predictor_hot_path,
-    bench_temporal_sparse_mask_projection
+    bench_temporal_sparse_mask_projection,
+    bench_temporal_sparse_stream_hot_path,
 );
 criterion_main!(benches);

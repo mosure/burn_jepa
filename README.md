@@ -70,6 +70,12 @@ between keyframes. This is deliberately a predictor/feature cache rather than a
 transformer KV cache: V-JEPA attention is bidirectional, so causal KV reuse would
 not be numerically equivalent to the full model.
 
+`TemporalSparseJepaStream` composes the stream hot path: project sparse
+per-frame image tokens, encode only the sparse V-JEPA context tokens, run the
+cached sparse predictor, and keep mask/predictor keyframe counters aligned. Use
+it for AutoGaze-style video loops where the dense/full path runs on keyframes
+and sparse updates run between keyframes.
+
 For AutoGaze-style sparse inputs, use `sparse_mask_from_frame_token_indices` with
 the source `SparseImageTokenGrid` to project per-frame sparse image tokens into
 the V-JEPA tubelet grid. This keeps the sparse-patch path independent of decoded
@@ -107,6 +113,7 @@ that reuses `SparsePredictorPlan`. On the local ndarray backend, a short run wit
 - `sparse_predictor_hot_path_ndarray/32_sequence_tokens`: 271.37 us to 273.84 us
 - `temporal_sparse_predictor_hot_path_ndarray/cached_plan_32_sequence_tokens`: 273.75 us to 274.55 us
 - `temporal_sparse_mask_projection_720p`: 8.6548 us to 8.9288 us
+- `temporal_sparse_stream_hot_path_ndarray/cached_plan_32_sequence_tokens`: 8.7408 ms to 8.7889 ms
 
 The AutoGaze -> sparse V-JEPA pipeline bench projects sparse masks directly from
 AutoGaze generated token ids. Decoded fixation traces are opt-in for diagnostics:

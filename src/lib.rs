@@ -46,6 +46,7 @@ pub use sparse_patchify::{
 };
 pub use temporal::{
     TemporalSparseJepaConfig, TemporalSparseJepaOutput, TemporalSparseJepaState,
+    TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TemporalSparseJepaStreamOutput,
     TemporalSparseMaskConfig, TemporalSparseMaskOutput, TemporalSparseMaskState,
 };
 pub use tokens::{

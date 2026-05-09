@@ -2,7 +2,8 @@ use burn::tensor::backend::BackendTypes;
 use burn::tensor::{Tensor, TensorData};
 use burn_jepa::{
     SparseImageTokenGrid, SparseTokenMask, TemporalSparseJepaConfig, TemporalSparseJepaState,
-    TemporalSparseMaskConfig, TemporalSparseMaskState, TokenGridShape, VJepa2_1Model, VJepaConfig,
+    TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TemporalSparseMaskConfig,
+    TemporalSparseMaskState, TokenGridShape, VJepa2_1Model, VJepaConfig,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -272,6 +273,59 @@ fn temporal_sparse_video_step_projects_encodes_and_reuses_plan() {
     assert_eq!(
         second.features.shape().dims::<3>()[1],
         second_masks.context_mask.len()
+    );
+}
+
+#[test]
+fn temporal_stream_projects_encodes_predicts_and_resets() {
+    let device = Default::default();
+    let config = VJepaConfig::tiny_for_tests();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let frame_tokens = vec![vec![0], vec![1], vec![2], vec![3]];
+    let mut stream = TemporalSparseJepaStream::<B>::new(
+        TemporalSparseJepaStreamConfig::new(4, 2, SparseImageTokenGrid::new(2, 2))
+            .with_keyframe_interval(2),
+    );
+    let video = Tensor::<B, 5>::zeros(
+        [
+            1,
+            config.in_channels,
+            config.num_frames,
+            config.image_size,
+            config.image_size,
+        ],
+        &device,
+    );
+
+    let first = stream
+        .forward_frame_tokens(&model, video.clone(), &frame_tokens, 0)
+        .expect("first temporal stream step");
+    let second = stream
+        .forward_frame_tokens(&model, video.clone(), &frame_tokens, 0)
+        .expect("second temporal stream step");
+    stream.reset();
+    let reset = stream
+        .forward_frame_tokens(&model, video, &frame_tokens, 0)
+        .expect("reset temporal stream step");
+
+    assert!(first.masks.keyframe);
+    assert!(first.temporal.keyframe);
+    assert!(!first.temporal.reused_predictor_plan);
+    assert!(!second.masks.keyframe);
+    assert!(!second.temporal.keyframe);
+    assert!(second.temporal.reused_predictor_plan);
+    assert!(reset.masks.keyframe);
+    assert!(reset.temporal.keyframe);
+    assert!(!reset.temporal.reused_predictor_plan);
+    assert_eq!(first.context.tokens.shape().dims::<3>()[1], 4);
+    assert_eq!(
+        second
+            .temporal
+            .predictor
+            .target_predictions
+            .shape()
+            .dims::<3>()[1],
+        2
     );
 }
 
