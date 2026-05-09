@@ -6,7 +6,7 @@ resolver = "3"
 [package]
 name = "burn_jepa"
 description = "Burn-native sparse-token V-JEPA 2.1 inference and training primitives"
-version = "0.1.0"
+version = "0.21.0"
 edition = "2024"
 rust-version = "1.92"
 authors = ["mosure <mitchell@mosure.me>"]
@@ -25,9 +25,9 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["ndarray", "webgpu"]
 ndarray = ["burn/ndarray"]
-webgpu = ["burn/webgpu"]
+webgpu = ["burn/webgpu", "burn_autogaze/webgpu"]
 wgpu = ["burn/wgpu", "burn-store/wgpu"]
-cuda = ["burn/cuda", "burn-store/cuda"]
+cuda = ["burn/cuda", "burn-store/cuda", "burn_autogaze/cuda"]
 wasm = [
   "webgpu",
   "dep:console_error_panic_hook",
@@ -61,12 +61,18 @@ optional = true
 features = ["console"]
 
 [dev-dependencies]
+burn_autogaze = { version = "0.21.2", path = "../burn_autogaze", default-features = false, features = ["ndarray"] }
 criterion = "0.8.2"
 tempfile = "3"
 
 [[bench]]
 name = "sparse_pipeline"
 harness = false
+
+[[bench]]
+name = "autogaze_sparse_jepa_pipeline"
+harness = false
+required-features = ["ndarray", "sparse-patchify-wgpu"]
 
 [profile.dev]
 opt-level = 3

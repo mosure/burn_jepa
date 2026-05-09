@@ -1580,6 +1580,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn_autogaze"
+version = "0.21.2"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-store",
+ "half",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "burn_flex_gmm"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1593,11 +1606,12 @@ dependencies = [
 
 [[package]]
 name = "burn_jepa"
-version = "0.1.0"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "burn",
  "burn-store",
+ "burn_autogaze",
  "burn_flex_gmm",
  "console_error_panic_hook",
  "criterion",
