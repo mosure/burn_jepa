@@ -74,7 +74,10 @@ not be numerically equivalent to the full model.
 per-frame image tokens, encode only the sparse V-JEPA context tokens, run the
 cached sparse predictor, and keep mask/predictor keyframe counters aligned. Use
 it for AutoGaze-style video loops where the dense/full path runs on keyframes
-and sparse updates run between keyframes.
+and sparse updates run between keyframes. Set
+`with_dense_keyframe_refresh(true)` when the caller also wants full-grid encoder
+features returned on keyframe steps; the default keeps keyframes sparse-only so
+inter-frame updates do not pay for dense patchification.
 
 For AutoGaze-style sparse inputs, use `sparse_mask_from_frame_token_indices` with
 the source `SparseImageTokenGrid` to project per-frame sparse image tokens into

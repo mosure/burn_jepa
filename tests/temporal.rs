@@ -329,6 +329,47 @@ fn temporal_stream_projects_encodes_predicts_and_resets() {
     );
 }
 
+#[test]
+fn temporal_stream_can_refresh_dense_keyframes() {
+    let device = Default::default();
+    let config = VJepaConfig::tiny_for_tests();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let frame_tokens = vec![vec![0], vec![1], vec![2], vec![3]];
+    let mut stream = TemporalSparseJepaStream::<B>::new(
+        TemporalSparseJepaStreamConfig::new(4, 2, SparseImageTokenGrid::new(2, 2))
+            .with_keyframe_interval(2)
+            .with_dense_keyframe_refresh(true),
+    );
+    let video = Tensor::<B, 5>::zeros(
+        [
+            1,
+            config.in_channels,
+            config.num_frames,
+            config.image_size,
+            config.image_size,
+        ],
+        &device,
+    );
+
+    let keyframe = stream
+        .forward_frame_tokens(&model, video.clone(), &frame_tokens, 0)
+        .expect("keyframe stream step");
+    let sparse_update = stream
+        .forward_frame_tokens(&model, video, &frame_tokens, 0)
+        .expect("sparse stream step");
+
+    let dense_keyframe = keyframe
+        .dense_keyframe
+        .as_ref()
+        .expect("dense keyframe refresh");
+    assert_eq!(dense_keyframe.grid, config.token_grid());
+    assert_eq!(
+        dense_keyframe.tokens.shape().dims::<3>()[1],
+        config.num_patches()
+    );
+    assert!(sparse_update.dense_keyframe.is_none());
+}
+
 fn masks(config: &VJepaConfig) -> (SparseTokenMask, SparseTokenMask) {
     (
         SparseTokenMask::new(vec![0, 2, 5, 7], config.num_patches()).expect("context"),

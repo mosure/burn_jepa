@@ -57,6 +57,7 @@ pub struct TemporalSparseJepaStreamConfig {
     pub target_tokens: usize,
     pub dilation: usize,
     pub feature_blend: f32,
+    pub dense_keyframe_refresh: bool,
     pub image_grid: SparseImageTokenGrid,
 }
 
@@ -72,6 +73,7 @@ impl TemporalSparseJepaStreamConfig {
             target_tokens,
             dilation: 0,
             feature_blend: 1.0,
+            dense_keyframe_refresh: false,
             image_grid,
         }
     }
@@ -91,6 +93,11 @@ impl TemporalSparseJepaStreamConfig {
         self
     }
 
+    pub fn with_dense_keyframe_refresh(mut self, dense_keyframe_refresh: bool) -> Self {
+        self.dense_keyframe_refresh = dense_keyframe_refresh;
+        self
+    }
+
     fn normalized(self) -> Self {
         Self {
             keyframe_interval: self.keyframe_interval.max(1),
@@ -98,6 +105,7 @@ impl TemporalSparseJepaStreamConfig {
             target_tokens: self.target_tokens.max(1),
             dilation: self.dilation,
             feature_blend: self.feature_blend.clamp(0.0, 1.0),
+            dense_keyframe_refresh: self.dense_keyframe_refresh,
             image_grid: self.image_grid,
         }
     }
@@ -120,6 +128,7 @@ pub struct TemporalSparseJepaStreamOutput<B: Backend> {
     pub masks: TemporalSparseMaskOutput,
     pub context: VJepaEncoderOutput<B>,
     pub temporal: TemporalSparseJepaOutput<B>,
+    pub dense_keyframe: Option<VJepaEncoderOutput<B>>,
 }
 
 #[derive(Debug)]
@@ -189,6 +198,16 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
             self.config.image_grid,
             frame_tokens,
         )?;
+        let dense_keyframe = if self.config.dense_keyframe_refresh && masks.keyframe {
+            let dense = model.encode_video(video.clone(), None);
+            ensure!(
+                dense.grid == grid,
+                "temporal stream dense keyframe grid changed during encode"
+            );
+            Some(dense)
+        } else {
+            None
+        };
         let context = model.encode_video(video, Some(&masks.context_mask));
         ensure!(
             context.grid == grid,
@@ -216,6 +235,7 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
             masks,
             context,
             temporal,
+            dense_keyframe,
         })
     }
 }
