@@ -1,7 +1,6 @@
 # burn_jepa
 
 [![test](https://github.com/mosure/burn_jepa/workflows/test/badge.svg)](https://github.com/mosure/burn_jepa/actions?query=workflow%3Atest)
-[![deploy github pages](https://github.com/mosure/burn_jepa/workflows/deploy%20github%20pages/badge.svg)](https://github.com/mosure/burn_jepa/actions?query=workflow%3A%22deploy+github+pages%22)
 
 Burn-native sparse-token V-JEPA 2.1 inference and training primitives.
 
@@ -16,7 +15,7 @@ Meta V-JEPA 2.1 encoder/predictor recipe:
 - safetensors loading path with PyTorch-to-Burn weight layout adaptation
 - simple symmetric int8 quantization helpers for checkpoint/tooling experiments
 - ndarray, WebGPU/WGPU, CUDA, and wasm feature gates
-- CI, docs/page workflow, benchmarks, and a `bevy_burn_jepa` example crate
+- CI, a static docs/page shell, benchmarks, and a `bevy_burn_jepa` example crate
 
 ## Usage
 
@@ -189,5 +188,8 @@ npm run serve
 
 The native example renders a small live Bevy window and exercises the same Burn
 pipeline shape used by the crate tests. The wasm page is intentionally static by
-default so GitHub Pages can smoke-test the bundled demo shell without requiring
-large model weights.
+default so the bundled demo shell can be deployed without requiring large model
+weights. The `deploy github pages` workflow is manual/environment-dependent:
+this repository currently has GitHub Pages disabled by account plan, so the
+workflow is disabled remotely and the static shell remains checked in under
+`crates/bevy_burn_jepa/www`.

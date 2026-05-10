@@ -26,6 +26,7 @@ evidence, and clear backend/runtime status.
 | WebGPU and ndarray performance behavior is explained. | `docs/e2e-benchmark-results.md` | Report notes sparse V-JEPA stream is similar, but WebGPU E2E is slower because AutoGaze WebGPU generation dominates. | Covered |
 | CUDA feature support compiles. | Cargo features and benchmark target | `cargo check --no-default-features --features cuda` and CUDA E2E bench target check passed. | Covered |
 | CUDA E2E FPS is measured. | `docs/e2e-benchmark-results.md`, `docs/cuda-benchmark.md`, `docs/workflows/cuda-benchmark.yml` | This host has no usable CUDA runtime: no `/dev/nvidia*`, `nvidia-smi` cannot communicate with the driver, and the benchmark preflight skips CUDA. A manual self-hosted CUDA benchmark workflow template now fails if the emitted CSV has no data rows; publishing it under `.github/workflows/` requires workflow-file write permission. | Blocked |
+| Static page shell and workflow status are honest. | `crates/bevy_burn_jepa/www`, `README.md`, `web/README.md`, `crates/bevy_burn_jepa/README.md` | The static shell remains checked in, but the Pages badge is removed and docs note that the deploy workflow is disabled remotely because GitHub reports Pages is unavailable for this repository plan. | Covered |
 | Package remains publishable. | Cargo package manifest | `cargo package --allow-dirty` passed with docs included. | Covered |
 
 ## Verification Commands

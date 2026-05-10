@@ -7,5 +7,7 @@ cargo run -p bevy_burn_jepa
 ```
 
 The native entry point runs one Bevy schedule tick and executes the tiny sparse
-V-JEPA pipeline through Burn's ndarray backend. The GitHub Pages shell in
-`www/` is static by default so it can be deployed without bundling model weights.
+V-JEPA pipeline through Burn's ndarray backend. The static page shell in `www/`
+can be deployed without bundling model weights. GitHub Pages itself is
+environment-dependent and is currently disabled remotely for the root repo
+because the account plan does not expose Pages for it.
