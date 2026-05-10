@@ -78,6 +78,13 @@ and sparse updates run between keyframes. Set
 features returned on keyframe steps; the default keeps keyframes sparse-only so
 inter-frame updates do not pay for dense patchification.
 
+The stream call is window based and does not require `config.num_frames` frames.
+For lowest latency, pass a rolling window as short as one V-JEPA tubelet
+(`tubelet_size` frames) plus the sparse image-token ids for that same window on
+each new frame. Use a full clip/keyframe refresh when exact full-window V-JEPA
+context is required; tubelet-sized rolling updates are the low-latency sparse
+path, not a causal KV-cache equivalent.
+
 On the `sparse-patchify-wgpu` backend,
 `forward_frame_tokens_sparse_patchify_wgpu` routes the stream context path
 through `burn_flex_gmm` sparse patchification, so masked-out patches are not
