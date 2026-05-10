@@ -119,7 +119,7 @@ CUDA-capable device:
 
 ```text
 DriverError(CUDA_ERROR_NO_DEVICE, "no CUDA-capable device is detected")
-skipping autogaze-cuda benchmark: called `Result::unwrap()` on an `Err` value: RecvError
+skipping autogaze-cuda benchmark: called `Result::unwrap()` on an `Err` value: RecvError; CUDA worker thread failed before returning results, which usually means the CUDA runtime could not initialize a device. Check for a preceding CUDA driver error and verify /dev/nvidia* device nodes are visible.
 ```
 
 The emitted CUDA CSV contains only the header, so there are no defensible CUDA

@@ -1081,10 +1081,8 @@ fn run_optional<T>(name: &str, test: impl FnOnce() -> T) -> Option<T> {
         Ok(value) => Some(value),
         Err(payload) => {
             let reason = panic_payload_to_string(payload);
-            if is_unavailable_backend_reason(&reason)
-                || is_optional_backend_channel_failure(name, &reason)
-            {
-                eprintln!("skipping {name} benchmark: {reason}");
+            if let Some(skip_reason) = optional_backend_skip_reason(name, &reason) {
+                eprintln!("skipping {name} benchmark: {skip_reason}");
                 None
             } else {
                 panic!("{name} benchmark setup failed: {reason}");
@@ -1125,8 +1123,19 @@ fn is_unavailable_backend_reason(reason: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn is_optional_backend_channel_failure(name: &str, reason: &str) -> bool {
-    name.contains("cuda") && reason.to_ascii_lowercase().contains("recverror")
+fn optional_backend_skip_reason(name: &str, reason: &str) -> Option<String> {
+    if is_unavailable_backend_reason(reason) {
+        return Some(reason.to_string());
+    }
+
+    let lower = reason.to_ascii_lowercase();
+    if name.contains("cuda") && lower.contains("recverror") {
+        return Some(format!(
+            "{reason}; CUDA worker thread failed before returning results, which usually means the CUDA runtime could not initialize a device. Check for a preceding CUDA driver error and verify /dev/nvidia* device nodes are visible."
+        ));
+    }
+
+    None
 }
 
 #[derive(Default)]

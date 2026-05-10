@@ -114,6 +114,27 @@ fn benchmark_trace_config_is_opt_in_and_disabled_path_avoids_tensor_clone() {
     );
 }
 
+#[test]
+fn benchmark_cuda_channel_failure_reports_runtime_diagnostic() {
+    let bench = include_str!("../benches/autogaze_sparse_jepa_pipeline.rs");
+
+    assert!(
+        bench.contains("fn optional_backend_skip_reason"),
+        "benchmark should centralize optional backend skip handling"
+    );
+    assert!(
+        bench.contains("CUDA worker thread failed before returning results"),
+        "forced CUDA runtime failures should not collapse to an opaque RecvError"
+    );
+    assert!(
+        bench.contains("verify /dev/nvidia* device nodes are visible"),
+        "CUDA skip diagnostic should point at the runtime/device-node blocker"
+    );
+
+    let report = include_str!("../docs/e2e-benchmark-results.md");
+    assert!(report.contains("CUDA worker thread failed before returning results"));
+}
+
 fn parse_benchmark_rows(report: &str) -> Vec<BenchRow> {
     report
         .lines()
