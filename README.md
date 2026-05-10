@@ -77,6 +77,10 @@ and sparse updates run between keyframes. Set
 `with_dense_keyframe_refresh(true)` when the caller also wants full-grid encoder
 features returned on keyframe steps; the default keeps keyframes sparse-only so
 inter-frame updates do not pay for dense patchification.
+Set `with_dense_keyframe_prediction(true)` when the caller also wants the dense
+V-JEPA prediction/target path for the sparse context/target masks on keyframes;
+this is opt-in so normal sparse updates do not clone the video or run dense
+target encoding.
 If the upstream pipeline already has V-JEPA context/target masks, call
 `forward_masks` directly to skip per-frame image-token mask projection while
 preserving the same internal keyframe cadence and cached predictor plan.

@@ -1,9 +1,9 @@
 #[cfg(feature = "sparse-patchify-wgpu")]
 use crate::SparsePatchifyPlan;
 use crate::{
-    SparseImageTokenGrid, SparsePredictorPlan, SparseTokenMask, TokenGridShape, VJepa2_1Model,
-    VJepaConfig, VJepaEncoderOutput, VJepaPredictor, VJepaPredictorOutput,
-    sparse_mask_from_frame_token_indices,
+    DensePredictionOutput, SparseImageTokenGrid, SparsePredictorPlan, SparseTokenMask,
+    TokenGridShape, VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaPredictor,
+    VJepaPredictorOutput, sparse_mask_from_frame_token_indices,
 };
 use anyhow::{Result, ensure};
 use burn::tensor::Tensor;
@@ -70,6 +70,7 @@ pub struct TemporalSparseJepaStreamConfig {
     pub dilation: usize,
     pub feature_blend: f32,
     pub dense_keyframe_refresh: bool,
+    pub dense_keyframe_prediction: bool,
     pub image_grid: SparseImageTokenGrid,
 }
 
@@ -86,6 +87,7 @@ impl TemporalSparseJepaStreamConfig {
             dilation: 0,
             feature_blend: 1.0,
             dense_keyframe_refresh: false,
+            dense_keyframe_prediction: false,
             image_grid,
         }
     }
@@ -110,6 +112,11 @@ impl TemporalSparseJepaStreamConfig {
         self
     }
 
+    pub fn with_dense_keyframe_prediction(mut self, dense_keyframe_prediction: bool) -> Self {
+        self.dense_keyframe_prediction = dense_keyframe_prediction;
+        self
+    }
+
     fn normalized(self) -> Self {
         Self {
             keyframe_interval: self.keyframe_interval.max(1),
@@ -118,6 +125,7 @@ impl TemporalSparseJepaStreamConfig {
             dilation: self.dilation,
             feature_blend: self.feature_blend.clamp(0.0, 1.0),
             dense_keyframe_refresh: self.dense_keyframe_refresh,
+            dense_keyframe_prediction: self.dense_keyframe_prediction,
             image_grid: self.image_grid,
         }
     }
@@ -141,6 +149,7 @@ pub struct TemporalSparseJepaStreamOutput<B: Backend> {
     pub context: VJepaEncoderOutput<B>,
     pub temporal: TemporalSparseJepaOutput<B>,
     pub dense_keyframe: Option<VJepaEncoderOutput<B>>,
+    pub dense_keyframe_prediction: Option<DensePredictionOutput<B>>,
     pub reused_patchify_plan: bool,
 }
 
@@ -224,6 +233,15 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
         grid: TokenGridShape,
         mask_index: usize,
     ) -> Result<TemporalSparseJepaStreamOutput<B>> {
+        let dense_keyframe_prediction = if self.config.dense_keyframe_prediction && masks.keyframe {
+            Some(model.predict_dense_targets(
+                video.clone(),
+                &masks.context_mask,
+                &masks.target_mask,
+            )?)
+        } else {
+            None
+        };
         let dense_keyframe = if self.config.dense_keyframe_refresh && masks.keyframe {
             let dense = model.encode_video(video.clone(), None);
             ensure!(
@@ -264,6 +282,7 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
             context,
             temporal,
             dense_keyframe,
+            dense_keyframe_prediction,
             reused_patchify_plan: false,
         })
     }
@@ -360,6 +379,15 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         grid: TokenGridShape,
         mask_index: usize,
     ) -> Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        let dense_keyframe_prediction = if self.config.dense_keyframe_prediction && masks.keyframe {
+            Some(model.predict_dense_targets(
+                video.clone(),
+                &masks.context_mask,
+                &masks.target_mask,
+            )?)
+        } else {
+            None
+        };
         let dense_keyframe = if self.config.dense_keyframe_refresh && masks.keyframe {
             let dense = model.encode_video(video.clone(), None);
             ensure!(
@@ -408,6 +436,7 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             context,
             temporal,
             dense_keyframe,
+            dense_keyframe_prediction,
             reused_patchify_plan,
         })
     }

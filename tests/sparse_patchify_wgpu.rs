@@ -166,6 +166,49 @@ fn wgpu_temporal_stream_accepts_precomputed_masks_and_reuses_sparse_plan() {
     assert!(sparse_reused.temporal.reused_predictor_plan);
 }
 
+#[test]
+fn wgpu_temporal_stream_dense_keyframe_prediction_is_opt_in() {
+    let device = <B as BackendTypes>::Device::default();
+    let config = VJepaConfig::tiny_for_tests();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let stream_config = TemporalSparseJepaStreamConfig::new(4, 2, SparseImageTokenGrid::new(2, 2))
+        .with_keyframe_interval(2)
+        .with_dense_keyframe_prediction(true);
+    let frame_tokens = vec![vec![0], vec![1], vec![2], vec![3]];
+    let video = Tensor::<B, 5>::zeros(
+        [
+            1,
+            config.in_channels,
+            config.num_frames,
+            config.image_size,
+            config.image_size,
+        ],
+        &device,
+    );
+    let mut stream = TemporalSparseJepaStream::<B>::new(stream_config);
+
+    let keyframe = stream
+        .forward_frame_tokens_sparse_patchify_wgpu(&model, video.clone(), &frame_tokens, 0)
+        .expect("sparse patchify keyframe");
+    let update = stream
+        .forward_frame_tokens_sparse_patchify_wgpu(&model, video, &frame_tokens, 0)
+        .expect("sparse patchify update");
+
+    let dense_prediction = keyframe
+        .dense_keyframe_prediction
+        .as_ref()
+        .expect("dense keyframe prediction");
+    assert_eq!(
+        dense_prediction.predictions.shape().dims::<3>()[1],
+        keyframe.masks.target_mask.len()
+    );
+    assert_eq!(
+        dense_prediction.targets.shape().dims::<3>()[1],
+        keyframe.masks.target_mask.len()
+    );
+    assert!(update.dense_keyframe_prediction.is_none());
+}
+
 fn assert_close(left: &burn::tensor::TensorData, right: &burn::tensor::TensorData, label: &str) {
     let left = left.as_slice::<f32>().expect("left f32");
     let right = right.as_slice::<f32>().expect("right f32");

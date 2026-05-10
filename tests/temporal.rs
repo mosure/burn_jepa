@@ -442,7 +442,58 @@ fn temporal_stream_can_refresh_dense_keyframes() {
         dense_keyframe.tokens.shape().dims::<3>()[1],
         config.num_patches()
     );
+    assert!(keyframe.dense_keyframe_prediction.is_none());
     assert!(sparse_update.dense_keyframe.is_none());
+    assert!(sparse_update.dense_keyframe_prediction.is_none());
+}
+
+#[test]
+fn temporal_stream_can_refresh_dense_keyframe_predictions() {
+    let device = Default::default();
+    let config = VJepaConfig::tiny_for_tests();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let frame_tokens = vec![vec![0], vec![1], vec![2], vec![3]];
+    let mut stream = TemporalSparseJepaStream::<B>::new(
+        TemporalSparseJepaStreamConfig::new(4, 2, SparseImageTokenGrid::new(2, 2))
+            .with_keyframe_interval(2)
+            .with_dense_keyframe_prediction(true),
+    );
+    let video = Tensor::<B, 5>::zeros(
+        [
+            1,
+            config.in_channels,
+            config.num_frames,
+            config.image_size,
+            config.image_size,
+        ],
+        &device,
+    );
+
+    let keyframe = stream
+        .forward_frame_tokens(&model, video.clone(), &frame_tokens, 0)
+        .expect("keyframe stream step");
+    let sparse_update = stream
+        .forward_frame_tokens(&model, video, &frame_tokens, 0)
+        .expect("sparse stream step");
+
+    let dense_prediction = keyframe
+        .dense_keyframe_prediction
+        .as_ref()
+        .expect("dense keyframe prediction");
+    assert_eq!(
+        dense_prediction.predictions.shape().dims::<3>()[1],
+        keyframe.masks.target_mask.len()
+    );
+    assert_eq!(
+        dense_prediction.targets.shape().dims::<3>()[1],
+        keyframe.masks.target_mask.len()
+    );
+    assert_eq!(
+        dense_prediction.target_indices.shape().dims::<2>(),
+        [1, keyframe.masks.target_mask.len()]
+    );
+    assert!(keyframe.dense_keyframe.is_none());
+    assert!(sparse_update.dense_keyframe_prediction.is_none());
 }
 
 #[test]
@@ -494,6 +545,7 @@ fn temporal_stream_accepts_tubelet_sized_next_frame_windows() {
     assert_eq!(keyframe.context.tokens.shape().dims::<3>()[1], 2);
     assert!(keyframe.temporal.keyframe);
     assert!(keyframe.dense_keyframe.is_some());
+    assert!(keyframe.dense_keyframe_prediction.is_none());
     assert_eq!(
         keyframe
             .dense_keyframe
@@ -505,6 +557,7 @@ fn temporal_stream_accepts_tubelet_sized_next_frame_windows() {
     assert!(!update.temporal.keyframe);
     assert!(update.temporal.reused_predictor_plan);
     assert!(update.dense_keyframe.is_none());
+    assert!(update.dense_keyframe_prediction.is_none());
     assert!(stream.next_is_keyframe());
 }
 
