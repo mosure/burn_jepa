@@ -126,25 +126,35 @@ fn benchmark_trace_config_is_opt_in_and_disabled_path_avoids_tensor_clone() {
         "trace measurement should borrow the video so disabled tracing does not clone tensors"
     );
     assert!(
-        compact.contains("ifself.disabled(){return0.0;}"),
-        "disabled tracing should return before entering the decoder/timing path"
+        compact.contains("letautogaze_trace_ms=ifbench_config.trace.enabled(){measure_autogaze_trace_ms(&autogaze,&ag_video,"),
+        "trace measurement should only be called from an enabled config branch"
     );
-    let disabled_return = compact
-        .find("ifself.disabled(){return0.0;}")
-        .expect("disabled trace return guard");
-    for hot_path_marker in [
-        "measure_ms(warmups,reps,||{",
-        "video.clone()",
-        "trace_video_with_mode(",
-    ] {
-        let marker = compact.find(hot_path_marker).unwrap_or_else(|| {
-            panic!("missing trace hot-path marker `{hot_path_marker}`")
-        });
-        assert!(
-            disabled_return < marker,
-            "disabled trace guard must run before `{hot_path_marker}`"
-        );
-    }
+    let trace_branch = compact
+        .find("letautogaze_trace_ms=ifbench_config.trace.enabled(){")
+        .expect("trace config branch");
+    let disabled_branch = compact[trace_branch..]
+        .find("}else{0.0};")
+        .map(|offset| trace_branch + offset)
+        .expect("disabled trace branch");
+    let trace_helper = compact
+        .find("fnmeasure_autogaze_trace_ms")
+        .expect("trace measurement helper");
+    let trace_decoder = compact[trace_helper..]
+        .find("trace_video_with_mode(")
+        .map(|offset| trace_helper + offset)
+        .expect("trace decoder call");
+    let eager_clone = compact[trace_helper..]
+        .find("video.clone()")
+        .map(|offset| trace_helper + offset)
+        .expect("trace tensor clone");
+    assert!(
+        trace_decoder < trace_branch && eager_clone < trace_branch,
+        "trace decoder work should only live in the helper that the disabled branch skips"
+    );
+    assert!(
+        trace_branch < disabled_branch,
+        "trace config branch should have an explicit zero-cost disabled arm"
+    );
     assert!(
         compact.contains("measure_autogaze_trace_ms(&autogaze,&ag_video,"),
         "the call site should pass a borrowed tensor"

@@ -98,36 +98,8 @@ impl BenchTraceConfig {
     }
 
     #[inline]
-    fn disabled(self) -> bool {
-        self.mode == BenchTraceMode::Disabled
-    }
-
-    fn measure_autogaze_trace_ms<B>(
-        self,
-        autogaze: &AutoGazePipeline<B>,
-        video: &Tensor<B, 5>,
-        top_k: usize,
-        device: &B::Device,
-        warmups: usize,
-        reps: usize,
-    ) -> f64
-    where
-        B: Backend,
-    {
-        if self.disabled() {
-            return 0.0;
-        }
-
-        measure_ms(warmups, reps, || {
-            let traces = autogaze.trace_video_with_mode(
-                video.clone(),
-                top_k,
-                AutoGazeInferenceMode::ResizeToModelInput,
-            );
-            black_box(trace_point_count(&traces));
-            <B as Backend>::sync(device).expect("autogaze trace sync");
-            traces.len()
-        })
+    fn enabled(self) -> bool {
+        self.mode == BenchTraceMode::DecodedFixations
     }
 }
 
@@ -136,6 +108,29 @@ enum BenchTraceMode {
     #[default]
     Disabled,
     DecodedFixations,
+}
+
+fn measure_autogaze_trace_ms<B>(
+    autogaze: &AutoGazePipeline<B>,
+    video: &Tensor<B, 5>,
+    top_k: usize,
+    device: &B::Device,
+    warmups: usize,
+    reps: usize,
+) -> f64
+where
+    B: Backend,
+{
+    measure_ms(warmups, reps, || {
+        let traces = autogaze.trace_video_with_mode(
+            video.clone(),
+            top_k,
+            AutoGazeInferenceMode::ResizeToModelInput,
+        );
+        black_box(trace_point_count(&traces));
+        <B as Backend>::sync(device).expect("autogaze trace sync");
+        traces.len()
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -389,14 +384,18 @@ where
                 <B as Backend>::sync(&autogaze_device).expect("autogaze generate sync");
                 generated.num_gazing_each_frame.len()
             });
-            let autogaze_trace_ms = bench_config.trace.measure_autogaze_trace_ms(
-                &autogaze,
-                &ag_video,
-                autogaze_top_k,
-                &autogaze_device,
-                warmups,
-                reps,
-            );
+            let autogaze_trace_ms = if bench_config.trace.enabled() {
+                measure_autogaze_trace_ms(
+                    &autogaze,
+                    &ag_video,
+                    autogaze_top_k,
+                    &autogaze_device,
+                    warmups,
+                    reps,
+                )
+            } else {
+                0.0
+            };
             let sparse_project_plan_ms = measure_ms(warmups, reps, || {
                 let context_mask = context_mask_from_autogaze_generated(
                     &generated,
