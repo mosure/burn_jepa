@@ -129,8 +129,8 @@ The AutoGaze -> sparse V-JEPA pipeline bench projects sparse masks directly from
 AutoGaze generated token ids. Trace collection is disabled in the benchmark
 config by default; set `BURN_JEPA_PIPELINE_BENCH_TRACE=1` to opt into decoded
 fixation traces and include the extra trace path timing. With tracing disabled,
-the bench returns `autogaze_trace_ms=0.000` before allocating trace samples or
-calling AutoGaze's trace decoder.
+the bench returns `autogaze_trace_ms=0.000` before cloning the input tensor,
+allocating trace samples, or calling AutoGaze's trace decoder.
 The CSV includes both one-shot sparse pipeline timing and cached
 `TemporalSparseJepaStream` timing (`temporal_stream_ms`,
 `temporal_e2e_pipeline_ms`, and temporal FPS columns) so next-frame sparse

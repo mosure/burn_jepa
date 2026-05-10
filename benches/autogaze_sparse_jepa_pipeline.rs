@@ -84,8 +84,10 @@ struct BenchTraceConfig {
 }
 
 impl BenchTraceConfig {
+    const ENV: &'static str = "BURN_JEPA_PIPELINE_BENCH_TRACE";
+
     fn from_env() -> Self {
-        let enabled = env_bool("BURN_JEPA_PIPELINE_BENCH_TRACE", false);
+        let enabled = env_bool(Self::ENV, false);
         Self {
             mode: if enabled {
                 BenchTraceMode::DecodedFixations
@@ -95,10 +97,15 @@ impl BenchTraceConfig {
         }
     }
 
+    #[inline]
+    fn disabled(self) -> bool {
+        self.mode == BenchTraceMode::Disabled
+    }
+
     fn measure_autogaze_trace_ms<B>(
         self,
         autogaze: &AutoGazePipeline<B>,
-        video: Tensor<B, 5>,
+        video: &Tensor<B, 5>,
         top_k: usize,
         device: &B::Device,
         warmups: usize,
@@ -107,7 +114,7 @@ impl BenchTraceConfig {
     where
         B: Backend,
     {
-        if self.mode == BenchTraceMode::Disabled {
+        if self.disabled() {
             return 0.0;
         }
 
@@ -352,7 +359,7 @@ where
             });
             let autogaze_trace_ms = bench_config.trace.measure_autogaze_trace_ms(
                 &autogaze,
-                ag_video.clone(),
+                &ag_video,
                 autogaze_top_k,
                 &autogaze_device,
                 warmups,

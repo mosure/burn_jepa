@@ -45,7 +45,10 @@ fn e2e_benchmark_report_has_required_matrix_and_trace_off_rows() {
     }
 
     for row in rows {
-        assert!(row.context_tokens > 0, "context tokens must be positive: {row:?}");
+        assert!(
+            row.context_tokens > 0,
+            "context tokens must be positive: {row:?}"
+        );
         assert!(
             row.temporal_stream_ms > 0.0,
             "temporal stream timing must be positive: {row:?}"
@@ -81,6 +84,34 @@ fn cuda_benchmark_path_documents_blocker_and_rejects_header_only_csv() {
     assert!(workflow_template.contains("if [ \"$rows\" -le 1 ]; then"));
 }
 
+#[test]
+fn benchmark_trace_config_is_opt_in_and_disabled_path_avoids_tensor_clone() {
+    let bench = include_str!("../benches/autogaze_sparse_jepa_pipeline.rs");
+    let compact = compact_source(bench);
+
+    assert!(compact.contains("constENV:&'staticstr=\"BURN_JEPA_PIPELINE_BENCH_TRACE\";"));
+    assert!(
+        compact.contains("env_bool(Self::ENV,false)"),
+        "trace collection should be disabled unless the benchmark config opts in"
+    );
+    assert!(
+        compact.contains("video:&Tensor<B,5>"),
+        "trace measurement should borrow the video so disabled tracing does not clone tensors"
+    );
+    assert!(
+        compact.contains("ifself.disabled(){return0.0;}"),
+        "disabled tracing should return before entering the decoder/timing path"
+    );
+    assert!(
+        compact.contains("measure_autogaze_trace_ms(&autogaze,&ag_video,"),
+        "the call site should pass a borrowed tensor"
+    );
+    assert!(
+        !compact.contains("measure_autogaze_trace_ms(&autogaze,ag_video.clone(),"),
+        "disabled trace config must not pay for an eager tensor clone at the call site"
+    );
+}
+
 fn parse_benchmark_rows(report: &str) -> Vec<BenchRow> {
     report
         .lines()
@@ -89,13 +120,21 @@ fn parse_benchmark_rows(report: &str) -> Vec<BenchRow> {
         .collect()
 }
 
+fn compact_source(source: &str) -> String {
+    source.split_whitespace().collect()
+}
+
 fn parse_benchmark_row(line: &str) -> BenchRow {
     let cols = line
         .trim_matches('|')
         .split('|')
         .map(str::trim)
         .collect::<Vec<_>>();
-    assert_eq!(cols.len(), 8, "unexpected benchmark table row shape: {line}");
+    assert_eq!(
+        cols.len(),
+        8,
+        "unexpected benchmark table row shape: {line}"
+    );
 
     BenchRow {
         backend: cols[0].to_string(),
