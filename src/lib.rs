@@ -48,6 +48,7 @@ pub use temporal::{
     TemporalSparseJepaConfig, TemporalSparseJepaOutput, TemporalSparseJepaState,
     TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TemporalSparseJepaStreamOutput,
     TemporalSparseMaskConfig, TemporalSparseMaskOutput, TemporalSparseMaskState,
+    TemporalSparsePredictorInput,
 };
 pub use tokens::{
     SparseTokenMask, SparseVideoTokens, TokenGridShape, apply_token_mask, complement_indices,

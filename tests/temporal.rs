@@ -3,7 +3,8 @@ use burn::tensor::{Tensor, TensorData};
 use burn_jepa::{
     SparseImageTokenGrid, SparseTokenMask, TemporalSparseJepaConfig, TemporalSparseJepaState,
     TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TemporalSparseMaskConfig,
-    TemporalSparseMaskState, TokenGridShape, VJepa2_1Model, VJepaConfig,
+    TemporalSparseMaskState, TemporalSparsePredictorInput, TokenGridShape, VJepa2_1Model,
+    VJepaConfig,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -20,26 +21,22 @@ fn temporal_state_reuses_predictor_plan_for_stable_masks() {
     assert!(state.next_is_keyframe());
 
     let first = state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             feature_tensor(context.len(), config.encoder.embed_dim, 0.0, &device),
             &context,
             &target,
             config.token_grid(),
-            0,
-        )
+        ))
         .expect("first temporal forward");
     let second = state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             feature_tensor(context.len(), config.encoder.embed_dim, 1.0, &device),
             &context,
             &target,
             config.token_grid(),
-            0,
-        )
+        ))
         .expect("second temporal forward");
 
     assert!(first.keyframe);
@@ -66,26 +63,22 @@ fn temporal_state_blends_sparse_features_between_keyframes() {
     );
 
     state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             feature_tensor(context.len(), config.encoder.embed_dim, 0.0, &device),
             &context,
             &target,
             config.token_grid(),
-            0,
-        )
+        ))
         .expect("prime temporal state");
     let output = state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             feature_tensor(context.len(), config.encoder.embed_dim, 1.0, &device),
             &context,
             &target,
             config.token_grid(),
-            0,
-        )
+        ))
         .expect("blended temporal forward");
 
     let values = output
@@ -114,20 +107,17 @@ fn temporal_state_rebuilds_predictor_plan_when_masks_change() {
     );
 
     state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             feature_tensor(context.len(), config.encoder.embed_dim, 0.0, &device),
             &context,
             &target,
             config.token_grid(),
-            0,
-        )
+        ))
         .expect("prime temporal state");
     let output = state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             feature_tensor(
                 shifted_context.len(),
                 config.encoder.embed_dim,
@@ -137,8 +127,7 @@ fn temporal_state_rebuilds_predictor_plan_when_masks_change() {
             &shifted_context,
             &shifted_target,
             config.token_grid(),
-            0,
-        )
+        ))
         .expect("changed-mask temporal forward");
 
     assert!(!output.reused_predictor_plan);
@@ -220,15 +209,13 @@ fn temporal_sparse_video_step_projects_encodes_and_reuses_plan() {
         .expect("first projected masks");
     let first_context = model.encode_video(video.clone(), Some(&first_masks.context_mask));
     let first = jepa_state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             first_context.tokens,
             &first_masks.context_mask,
             &first_masks.target_mask,
             first_context.grid,
-            0,
-        )
+        ))
         .expect("first sparse temporal video step");
 
     let second_masks = mask_state
@@ -241,15 +228,13 @@ fn temporal_sparse_video_step_projects_encodes_and_reuses_plan() {
         .expect("second projected masks");
     let second_context = model.encode_video(video, Some(&second_masks.context_mask));
     let second = jepa_state
-        .forward_predictor(
-            &config,
-            &model.predictor,
+        .forward_predictor(temporal_input(
+            &model,
             second_context.tokens,
             &second_masks.context_mask,
             &second_masks.target_mask,
             second_context.grid,
-            0,
-        )
+        ))
         .expect("second sparse temporal video step");
 
     assert!(first_masks.keyframe);
@@ -390,4 +375,22 @@ fn feature_tensor(
         TensorData::new(vec![value; tokens * dim], [1, tokens, dim]),
         device,
     )
+}
+
+fn temporal_input<'a>(
+    model: &'a VJepa2_1Model<B>,
+    context_tokens: Tensor<B, 3>,
+    context_mask: &'a SparseTokenMask,
+    target_mask: &'a SparseTokenMask,
+    grid: TokenGridShape,
+) -> TemporalSparsePredictorInput<'a, B> {
+    TemporalSparsePredictorInput {
+        config: model.config(),
+        predictor: &model.predictor,
+        context_tokens,
+        context_mask,
+        target_mask,
+        grid,
+        mask_index: 0,
+    }
 }

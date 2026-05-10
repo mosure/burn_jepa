@@ -2,7 +2,8 @@ use burn::tensor::Tensor;
 use burn_jepa::{
     SparseImageTokenGrid, SparsePredictorPlan, SparseTokenMask, TemporalSparseJepaConfig,
     TemporalSparseJepaState, TemporalSparseJepaStream, TemporalSparseJepaStreamConfig,
-    TemporalSparseMaskConfig, TemporalSparseMaskState, TokenGridShape, VJepa2_1Model, VJepaConfig,
+    TemporalSparseMaskConfig, TemporalSparseMaskState, TemporalSparsePredictorInput,
+    TokenGridShape, VJepa2_1Model, VJepaConfig,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::BTreeSet;
@@ -83,29 +84,29 @@ fn bench_temporal_sparse_predictor_hot_path(c: &mut Criterion) {
                     TemporalSparseJepaConfig::default().with_keyframe_interval(16),
                 );
                 state
-                    .forward_predictor(
-                        &config,
-                        &model.predictor,
-                        context_tokens.clone(),
-                        &context,
-                        &target,
+                    .forward_predictor(TemporalSparsePredictorInput {
+                        config: &config,
+                        predictor: &model.predictor,
+                        context_tokens: context_tokens.clone(),
+                        context_mask: &context,
+                        target_mask: &target,
                         grid,
-                        0,
-                    )
+                        mask_index: 0,
+                    })
                     .expect("prime temporal predictor state");
                 state
             },
             |mut state| {
                 state
-                    .forward_predictor(
-                        &config,
-                        &model.predictor,
-                        context_tokens.clone(),
-                        &context,
-                        &target,
+                    .forward_predictor(TemporalSparsePredictorInput {
+                        config: &config,
+                        predictor: &model.predictor,
+                        context_tokens: context_tokens.clone(),
+                        context_mask: &context,
+                        target_mask: &target,
                         grid,
-                        0,
-                    )
+                        mask_index: 0,
+                    })
                     .expect("temporal predictor")
             },
             BatchSize::SmallInput,

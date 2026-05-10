@@ -52,6 +52,16 @@ pub struct TemporalSparseJepaOutput<B: Backend> {
     pub reused_predictor_plan: bool,
 }
 
+pub struct TemporalSparsePredictorInput<'a, B: Backend> {
+    pub config: &'a VJepaConfig,
+    pub predictor: &'a VJepaPredictor<B>,
+    pub context_tokens: Tensor<B, 3>,
+    pub context_mask: &'a SparseTokenMask,
+    pub target_mask: &'a SparseTokenMask,
+    pub grid: TokenGridShape,
+    pub mask_index: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TemporalSparseJepaStreamConfig {
     pub keyframe_interval: usize,
@@ -225,15 +235,17 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
             context.tokens.shape().dims::<3>()[0] == batch,
             "temporal stream encoder batch changed during sparse encode"
         );
-        let temporal = self.jepa_state.forward_predictor(
-            model.config(),
-            &model.predictor,
-            context.tokens.clone(),
-            &masks.context_mask,
-            &masks.target_mask,
-            context.grid,
-            mask_index,
-        )?;
+        let temporal = self
+            .jepa_state
+            .forward_predictor(TemporalSparsePredictorInput {
+                config: model.config(),
+                predictor: &model.predictor,
+                context_tokens: context.tokens.clone(),
+                context_mask: &masks.context_mask,
+                target_mask: &masks.target_mask,
+                grid: context.grid,
+                mask_index,
+            })?;
         ensure!(
             masks.keyframe == temporal.keyframe,
             "temporal stream mask and predictor keyframe state diverged"
@@ -359,15 +371,17 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             context.tokens.shape().dims::<3>()[0] == batch,
             "temporal stream encoder batch changed during sparse patchify encode"
         );
-        let temporal = self.jepa_state.forward_predictor(
-            model.config(),
-            &model.predictor,
-            context.tokens.clone(),
-            &masks.context_mask,
-            &masks.target_mask,
-            context.grid,
-            mask_index,
-        )?;
+        let temporal = self
+            .jepa_state
+            .forward_predictor(TemporalSparsePredictorInput {
+                config: model.config(),
+                predictor: &model.predictor,
+                context_tokens: context.tokens.clone(),
+                context_mask: &masks.context_mask,
+                target_mask: &masks.target_mask,
+                grid: context.grid,
+                mask_index,
+            })?;
         ensure!(
             masks.keyframe == temporal.keyframe,
             "temporal stream mask and predictor keyframe state diverged"
@@ -451,7 +465,8 @@ impl TemporalSparseMaskState {
     }
 
     pub fn next_is_keyframe(&self) -> bool {
-        self.step % self.config.keyframe_interval.max(1) == 0
+        self.step
+            .is_multiple_of(self.config.keyframe_interval.max(1))
     }
 
     pub fn reset(&mut self) {
@@ -543,38 +558,46 @@ impl<B: Backend> TemporalSparseJepaState<B> {
 
     pub fn forward_predictor(
         &mut self,
-        config: &VJepaConfig,
-        predictor: &VJepaPredictor<B>,
-        context_tokens: Tensor<B, 3>,
-        context_mask: &SparseTokenMask,
-        target_mask: &SparseTokenMask,
-        grid: TokenGridShape,
-        mask_index: usize,
+        input: TemporalSparsePredictorInput<'_, B>,
     ) -> Result<TemporalSparseJepaOutput<B>> {
         ensure!(
-            context_mask.dense_len() == grid.len(),
+            input.context_mask.dense_len() == input.grid.len(),
             "context mask dense token count must match temporal grid"
         );
         ensure!(
-            target_mask.dense_len() == grid.len(),
+            input.target_mask.dense_len() == input.grid.len(),
             "target mask dense token count must match temporal grid"
         );
-        let [batch, context_len, _dim] = context_tokens.shape().dims::<3>();
+        let [batch, context_len, _dim] = input.context_tokens.shape().dims::<3>();
         ensure!(
-            context_len == context_mask.len(),
+            context_len == input.context_mask.len(),
             "context token length must match context mask"
         );
 
         let keyframe = self.is_keyframe();
-        let features = self.update_features(context_tokens, context_mask, grid, batch, keyframe);
-        let reused_predictor_plan =
-            self.ensure_predictor_plan(config, context_mask, target_mask, grid, batch)?;
+        let features = self.update_features(
+            input.context_tokens,
+            input.context_mask,
+            input.grid,
+            batch,
+            keyframe,
+        );
+        let reused_predictor_plan = self.ensure_predictor_plan(
+            input.config,
+            input.context_mask,
+            input.target_mask,
+            input.grid,
+            batch,
+        )?;
         let plan = &self
             .cached_plan
             .as_ref()
             .expect("predictor plan should be cached")
             .plan;
-        let predictor = predictor.forward_sparse_with_plan(features.clone(), plan, mask_index)?;
+        let predictor =
+            input
+                .predictor
+                .forward_sparse_with_plan(features.clone(), plan, input.mask_index)?;
         self.step = self.step.saturating_add(1);
 
         Ok(TemporalSparseJepaOutput {
@@ -586,7 +609,8 @@ impl<B: Backend> TemporalSparseJepaState<B> {
     }
 
     fn is_keyframe(&self) -> bool {
-        self.step % self.config.keyframe_interval.max(1) == 0
+        self.step
+            .is_multiple_of(self.config.keyframe_interval.max(1))
     }
 
     fn update_features(
