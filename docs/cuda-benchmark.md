@@ -55,4 +55,8 @@ Before accepting the result, verify that:
 
 `nvidia-smi` alone is not sufficient evidence in sandboxed environments: NVML
 can see a GPU while the CUDA runtime still cannot open a device. In that case
-the benchmark should keep reporting no defensible CUDA FPS rows.
+the benchmark should keep reporting no defensible CUDA FPS rows. The benchmark
+preflight prints both sides of that state when possible:
+`/proc/driver/nvidia is visible`, optional `nvidia-smi -L sees ...` or probe
+failure details, and
+`CUDA runtime cannot open a device without NVIDIA character devices`.

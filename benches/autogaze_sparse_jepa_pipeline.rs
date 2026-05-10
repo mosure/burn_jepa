@@ -965,29 +965,62 @@ fn cuda_runtime_preflight() -> Result<(), String> {
                     .to_string(),
             );
         }
-        if cfg!(target_os = "linux")
-            && !Path::new("/dev/nvidiactl").exists()
-            && !Path::new("/dev/nvidia0").exists()
-        {
-            return Err(
-                "no /dev/nvidia* device nodes; set BURN_JEPA_PIPELINE_CUDA_FORCE=1 to try anyway"
-                    .to_string(),
-            );
+        let nvidia_smi = nvidia_smi_summary();
+        if cfg!(target_os = "linux") && !cuda_device_nodes_visible() {
+            return Err(cuda_missing_device_nodes_reason(nvidia_smi.as_ref()));
         }
-        match Command::new("nvidia-smi").arg("-L").output() {
-            Ok(output) if output.status.success() && !output.stdout.is_empty() => Ok(()),
-            Ok(output) if output.status.success() => {
-                Err("nvidia-smi -L returned no CUDA devices".to_string())
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(format!("nvidia-smi -L failed: {}", stderr.trim()))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(format!("failed to run nvidia-smi -L: {err}")),
-        }
+        nvidia_smi.map(|_| ())
     })
     .clone()
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_device_nodes_visible() -> bool {
+    Path::new("/dev/nvidiactl").exists() || Path::new("/dev/nvidia0").exists()
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_missing_device_nodes_reason(nvidia_smi: Result<&String, &String>) -> String {
+    let mut reason = String::from("no /dev/nvidia* device nodes");
+    match nvidia_smi {
+        Ok(summary) if !summary.is_empty() => {
+            reason.push_str("; nvidia-smi -L sees ");
+            reason.push_str(summary);
+        }
+        Err(error) => {
+            reason.push_str("; nvidia-smi -L probe failed: ");
+            reason.push_str(error);
+        }
+        _ => {}
+    }
+    if Path::new("/proc/driver/nvidia/version").exists() {
+        reason.push_str("; /proc/driver/nvidia is visible");
+    }
+    reason.push_str(
+        "; CUDA runtime cannot open a device without NVIDIA character devices; set BURN_JEPA_PIPELINE_CUDA_FORCE=1 to try anyway",
+    );
+    reason
+}
+
+#[cfg(feature = "cuda")]
+fn nvidia_smi_summary() -> Result<String, String> {
+    match Command::new("nvidia-smi").arg("-L").output() {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+        Ok(output) if output.status.success() => {
+            Err("nvidia-smi -L returned no CUDA devices".into())
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("nvidia-smi -L failed: {}", stderr.trim()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(format!("failed to run nvidia-smi -L: {err}")),
+    }
 }
 
 fn bench_output_path() -> PathBuf {

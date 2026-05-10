@@ -107,10 +107,12 @@ GPU 0: NVIDIA RTX PRO 6000 Blackwell Workstation Edition (UUID: GPU-343b002b-d5c
 ```
 
 No `/dev/nvidia*` device nodes are visible. The CUDA benchmark selector compiled
-and skips CUDA at runtime during preflight unless forced:
+and skips CUDA at runtime during preflight unless forced. The preflight now
+distinguishes driver/procfs visibility from CUDA runtime device-node access,
+and includes `nvidia-smi -L` output when the benchmark process can query it:
 
 ```text
-skipping autogaze-cuda benchmark: no /dev/nvidia* device nodes; set BURN_JEPA_PIPELINE_CUDA_FORCE=1 to try anyway
+skipping autogaze-cuda benchmark: no /dev/nvidia* device nodes; nvidia-smi -L probe failed: nvidia-smi -L failed: ; /proc/driver/nvidia is visible; CUDA runtime cannot open a device without NVIDIA character devices; set BURN_JEPA_PIPELINE_CUDA_FORCE=1 to try anyway
 ```
 
 Forcing the benchmark past preflight with `BURN_JEPA_PIPELINE_CUDA_FORCE=1`

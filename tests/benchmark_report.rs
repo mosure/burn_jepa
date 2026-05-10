@@ -72,10 +72,16 @@ fn cuda_benchmark_path_documents_blocker_and_rejects_header_only_csv() {
     assert!(report.contains("no defensible CUDA\nFPS rows from this environment"));
     assert!(report.contains("skipping autogaze-cuda benchmark"));
     assert!(report.contains("CUDA_ERROR_NO_DEVICE"));
+    assert!(report.contains("nvidia-smi -L probe failed"));
+    assert!(report.contains("/proc/driver/nvidia is visible"));
+    assert!(report.contains("CUDA runtime cannot open a device without NVIDIA character devices"));
 
     let runbook = include_str!("../docs/cuda-benchmark.md");
     assert!(runbook.contains("nvidia-smi -L"));
     assert!(runbook.contains("nvidia-smi` alone is not sufficient evidence"));
+    assert!(runbook.contains("nvidia-smi -L sees"));
+    assert!(runbook.contains("probe\nfailure details"));
+    assert!(runbook.contains("CUDA runtime cannot open a device without NVIDIA character devices"));
     assert!(runbook.contains("The CSV has data rows, not just the header."));
     assert!(runbook.contains("autogaze_trace_ms` is `0.000`"));
 
@@ -125,6 +131,14 @@ fn benchmark_cuda_channel_failure_reports_runtime_diagnostic() {
     assert!(
         bench.contains("CUDA worker thread failed before returning results"),
         "forced CUDA runtime failures should not collapse to an opaque RecvError"
+    );
+    assert!(
+        bench.contains("fn cuda_missing_device_nodes_reason"),
+        "CUDA preflight should explain driver-visible but device-node-hidden states"
+    );
+    assert!(
+        bench.contains("nvidia-smi -L sees"),
+        "CUDA preflight should report when NVML can see a GPU"
     );
     assert!(
         bench.contains("verify /dev/nvidia* device nodes are visible"),
