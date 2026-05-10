@@ -36,11 +36,16 @@ The following commands were run during the final audit:
 
 ```sh
 cargo test --no-default-features --features ndarray
+cargo test --test temporal --no-default-features --features ndarray
 cargo test --test sparse_patchify_wgpu --no-default-features --features sparse-patchify-wgpu -- --nocapture
+cargo test --test numerical_parity sparse_forward_hot_path_has_no_backend_readbacks \
+  --no-default-features --features ndarray
 BURN_JEPA_VJEPA21_CHECKPOINT_DIR=/home/mosure/.cache/huggingface/hub/models--facebook--vjepa2-vitl-fpc64-256/snapshots/b3c1679b7c34d3255ef3547f27c7b226aefab26f \
 BURN_JEPA_VJEPA21_FORWARD_PARITY=1 \
 cargo test --test numerical_parity real_vjepa_checkpoint_loads_when_fixture_is_set \
   --no-default-features --features ndarray -- --ignored --nocapture
+cargo bench --bench sparse_pipeline temporal_sparse_stream_hot_path_ndarray \
+  --no-default-features --features ndarray -- --sample-size 10
 cargo check --bench autogaze_sparse_jepa_pipeline \
   --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
 cargo bench --bench autogaze_sparse_jepa_pipeline \
