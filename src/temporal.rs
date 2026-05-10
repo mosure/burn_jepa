@@ -260,6 +260,81 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
         })
     }
 
+    pub fn forward_masks(
+        &mut self,
+        model: &VJepa2_1Model<B>,
+        video: Tensor<B, 5>,
+        context_mask: SparseTokenMask,
+        target_mask: SparseTokenMask,
+        mask_index: usize,
+    ) -> Result<TemporalSparseJepaStreamOutput<B>> {
+        let [batch, channels, frames, height, width] = video.shape().dims::<5>();
+        ensure!(
+            channels == model.config().in_channels,
+            "temporal stream video channel count must match V-JEPA config"
+        );
+        let tubelet_size = model.config().tubelet_size.max(1);
+        let patch_size = model.config().patch_size.max(1);
+        ensure!(
+            frames >= tubelet_size && height >= patch_size && width >= patch_size,
+            "temporal stream video must contain at least one V-JEPA tubelet patch"
+        );
+        let grid = TokenGridShape::new(
+            frames / tubelet_size,
+            height / patch_size,
+            width / patch_size,
+        );
+        ensure!(
+            !grid.is_empty(),
+            "temporal stream video produced an empty token grid"
+        );
+        let masks = self
+            .mask_state
+            .next_from_masks(grid, context_mask, target_mask)?;
+        let dense_keyframe = if self.config.dense_keyframe_refresh && masks.keyframe {
+            let dense = model.encode_video(video.clone(), None);
+            ensure!(
+                dense.grid == grid,
+                "temporal stream dense keyframe grid changed during encode"
+            );
+            Some(dense)
+        } else {
+            None
+        };
+        let context = model.encode_video(video, Some(&masks.context_mask));
+        ensure!(
+            context.grid == grid,
+            "temporal stream encoder grid changed during sparse encode"
+        );
+        ensure!(
+            context.tokens.shape().dims::<3>()[0] == batch,
+            "temporal stream encoder batch changed during sparse encode"
+        );
+        let temporal = self
+            .jepa_state
+            .forward_predictor(TemporalSparsePredictorInput {
+                config: model.config(),
+                predictor: &model.predictor,
+                context_tokens: context.tokens.clone(),
+                context_mask: &masks.context_mask,
+                target_mask: &masks.target_mask,
+                grid: context.grid,
+                mask_index,
+            })?;
+        ensure!(
+            masks.keyframe == temporal.keyframe,
+            "temporal stream mask and predictor keyframe state diverged"
+        );
+
+        Ok(TemporalSparseJepaStreamOutput {
+            masks,
+            context,
+            temporal,
+            dense_keyframe,
+            reused_patchify_plan: false,
+        })
+    }
+
     #[cfg(feature = "sparse-patchify-wgpu")]
     fn ensure_patchify_plan(
         &mut self,
@@ -345,6 +420,89 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             self.config.image_grid,
             frame_tokens,
         )?;
+        let dense_keyframe = if self.config.dense_keyframe_refresh && masks.keyframe {
+            let dense = model.encode_video(video.clone(), None);
+            ensure!(
+                dense.grid == grid,
+                "temporal stream dense keyframe grid changed during encode"
+            );
+            Some(dense)
+        } else {
+            None
+        };
+        let reused_patchify_plan =
+            self.ensure_patchify_plan(&masks.context_mask, grid, batch, &device)?;
+        let plan = &self
+            .cached_patchify_plan
+            .as_ref()
+            .expect("sparse patchify plan should be cached")
+            .plan;
+        let context = model.encode_video_sparse_patchify_wgpu(video, plan)?;
+        ensure!(
+            context.grid == grid,
+            "temporal stream sparse patchify grid changed during encode"
+        );
+        ensure!(
+            context.tokens.shape().dims::<3>()[0] == batch,
+            "temporal stream encoder batch changed during sparse patchify encode"
+        );
+        let temporal = self
+            .jepa_state
+            .forward_predictor(TemporalSparsePredictorInput {
+                config: model.config(),
+                predictor: &model.predictor,
+                context_tokens: context.tokens.clone(),
+                context_mask: &masks.context_mask,
+                target_mask: &masks.target_mask,
+                grid: context.grid,
+                mask_index,
+            })?;
+        ensure!(
+            masks.keyframe == temporal.keyframe,
+            "temporal stream mask and predictor keyframe state diverged"
+        );
+
+        Ok(TemporalSparseJepaStreamOutput {
+            masks,
+            context,
+            temporal,
+            dense_keyframe,
+            reused_patchify_plan,
+        })
+    }
+
+    pub fn forward_masks_sparse_patchify_wgpu(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        context_mask: SparseTokenMask,
+        target_mask: SparseTokenMask,
+        mask_index: usize,
+    ) -> Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        let [batch, channels, frames, height, width] = video.shape().dims::<5>();
+        ensure!(
+            channels == model.config().in_channels,
+            "temporal stream video channel count must match V-JEPA config"
+        );
+        let device = video.device();
+        let tubelet_size = model.config().tubelet_size.max(1);
+        let patch_size = model.config().patch_size.max(1);
+        ensure!(
+            frames >= tubelet_size && height >= patch_size && width >= patch_size,
+            "temporal stream video must contain at least one V-JEPA tubelet patch"
+        );
+        let grid = TokenGridShape::new(
+            frames / tubelet_size,
+            height / patch_size,
+            width / patch_size,
+        );
+        ensure!(
+            !grid.is_empty(),
+            "temporal stream video produced an empty token grid"
+        );
+        let masks = self
+            .mask_state
+            .next_from_masks(grid, context_mask, target_mask)?;
         let dense_keyframe = if self.config.dense_keyframe_refresh && masks.keyframe {
             let dense = model.encode_video(video.clone(), None);
             ensure!(
@@ -494,6 +652,22 @@ impl TemporalSparseMaskState {
             "temporal context mask must leave at least one target token"
         );
         let target_mask = target_mask_for_context(&context_mask, self.config.target_tokens)?;
+        self.step = self.step.saturating_add(1);
+        Ok(TemporalSparseMaskOutput {
+            context_mask,
+            target_mask,
+            keyframe,
+        })
+    }
+
+    pub fn next_from_masks(
+        &mut self,
+        grid: TokenGridShape,
+        context_mask: SparseTokenMask,
+        target_mask: SparseTokenMask,
+    ) -> Result<TemporalSparseMaskOutput> {
+        validate_temporal_masks(&context_mask, &target_mask, grid)?;
+        let keyframe = self.next_is_keyframe();
         self.step = self.step.saturating_add(1);
         Ok(TemporalSparseMaskOutput {
             context_mask,
@@ -720,4 +894,40 @@ fn target_mask_for_context(
         }
     }
     SparseTokenMask::new(target, dense_len)
+}
+
+fn validate_temporal_masks(
+    context: &SparseTokenMask,
+    target: &SparseTokenMask,
+    grid: TokenGridShape,
+) -> Result<()> {
+    ensure!(
+        context.dense_len() == grid.len(),
+        "context mask dense token count must match temporal grid"
+    );
+    ensure!(
+        target.dense_len() == grid.len(),
+        "target mask dense token count must match temporal grid"
+    );
+    ensure!(
+        context.len() < grid.len(),
+        "temporal context mask must leave at least one target token"
+    );
+    ensure!(
+        !context.is_empty(),
+        "temporal context mask must contain at least one token"
+    );
+    ensure!(
+        !target.is_empty(),
+        "temporal target mask must contain at least one token"
+    );
+    let context_set = context.indices().iter().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        target
+            .indices()
+            .iter()
+            .all(|index| !context_set.contains(index)),
+        "temporal context and target masks must not overlap"
+    );
+    Ok(())
 }

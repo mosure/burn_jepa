@@ -77,6 +77,9 @@ and sparse updates run between keyframes. Set
 `with_dense_keyframe_refresh(true)` when the caller also wants full-grid encoder
 features returned on keyframe steps; the default keeps keyframes sparse-only so
 inter-frame updates do not pay for dense patchification.
+If the upstream pipeline already has V-JEPA context/target masks, call
+`forward_masks` directly to skip per-frame image-token mask projection while
+preserving the same internal keyframe cadence and cached predictor plan.
 
 The stream call is window based and does not require `config.num_frames` frames.
 For lowest latency, pass a rolling window as short as one V-JEPA tubelet
@@ -92,6 +95,8 @@ patchified before the encoder. The stream caches the sparse patchify plan while
 the context mask/grid/batch stay stable, avoiding repeated backend index tensor
 creation. The generic `forward_frame_tokens` method remains backend-neutral and
 uses the dense patch embed followed by token masking.
+Use `forward_masks_sparse_patchify_wgpu` for the lowest-overhead stable-mask
+path when the caller can reuse precomputed V-JEPA masks.
 
 For AutoGaze-style sparse inputs, use `sparse_mask_from_frame_token_indices` with
 the source `SparseImageTokenGrid` to project per-frame sparse image tokens into
@@ -130,7 +135,8 @@ that reuses `SparsePredictorPlan`. On the local ndarray backend, a short run wit
 - `sparse_predictor_hot_path_ndarray/32_sequence_tokens`: 271.37 us to 273.84 us
 - `temporal_sparse_predictor_hot_path_ndarray/cached_plan_32_sequence_tokens`: 273.75 us to 274.55 us
 - `temporal_sparse_mask_projection_720p`: 8.6548 us to 8.9288 us
-- `temporal_sparse_stream_hot_path_ndarray/cached_plan_32_sequence_tokens`: 8.7408 ms to 8.7889 ms
+- `temporal_sparse_stream_hot_path_ndarray/cached_plan_from_frame_tokens_32_sequence_tokens`: 8.5135 ms to 8.5740 ms
+- `temporal_sparse_stream_hot_path_ndarray/cached_plan_from_precomputed_masks_32_sequence_tokens`: 8.4181 ms to 8.4998 ms
 
 The AutoGaze -> sparse V-JEPA pipeline bench projects sparse masks directly from
 AutoGaze generated token ids. Trace collection is disabled in the benchmark

@@ -318,6 +318,93 @@ fn temporal_stream_projects_encodes_predicts_and_resets() {
 }
 
 #[test]
+fn temporal_stream_accepts_precomputed_masks_without_frame_projection() {
+    let device = Default::default();
+    let config = VJepaConfig::tiny_for_tests();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let (context_mask, target_mask) = masks(&config);
+    let mut stream = TemporalSparseJepaStream::<B>::new(
+        TemporalSparseJepaStreamConfig::new(1, 1, SparseImageTokenGrid::new(1, 1))
+            .with_keyframe_interval(2),
+    );
+    let video = Tensor::<B, 5>::zeros(
+        [
+            1,
+            config.in_channels,
+            config.num_frames,
+            config.image_size,
+            config.image_size,
+        ],
+        &device,
+    );
+
+    let first = stream
+        .forward_masks(
+            &model,
+            video.clone(),
+            context_mask.clone(),
+            target_mask.clone(),
+            0,
+        )
+        .expect("first precomputed-mask stream step");
+    let second = stream
+        .forward_masks(&model, video, context_mask.clone(), target_mask.clone(), 0)
+        .expect("second precomputed-mask stream step");
+
+    assert!(first.masks.keyframe);
+    assert!(!first.temporal.reused_predictor_plan);
+    assert_eq!(first.masks.context_mask.indices(), context_mask.indices());
+    assert_eq!(first.masks.target_mask.indices(), target_mask.indices());
+    assert!(!second.masks.keyframe);
+    assert!(second.temporal.reused_predictor_plan);
+    assert_eq!(
+        second.context.tokens.shape().dims::<3>()[1],
+        context_mask.len()
+    );
+    assert_eq!(
+        second
+            .temporal
+            .predictor
+            .target_predictions
+            .shape()
+            .dims::<3>()[1],
+        target_mask.len()
+    );
+}
+
+#[test]
+fn temporal_stream_rejects_overlapping_precomputed_masks() {
+    let device = Default::default();
+    let config = VJepaConfig::tiny_for_tests();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let (context_mask, _) = masks(&config);
+    let video = Tensor::<B, 5>::zeros(
+        [
+            1,
+            config.in_channels,
+            config.num_frames,
+            config.image_size,
+            config.image_size,
+        ],
+        &device,
+    );
+    let mut stream = TemporalSparseJepaStream::<B>::new(
+        TemporalSparseJepaStreamConfig::new(1, 1, SparseImageTokenGrid::new(1, 1))
+            .with_keyframe_interval(2),
+    );
+
+    let err = stream
+        .forward_masks(&model, video, context_mask.clone(), context_mask, 0)
+        .expect_err("overlapping precomputed masks should fail");
+
+    assert!(
+        err.to_string()
+            .contains("temporal context and target masks must not overlap")
+    );
+    assert!(stream.next_is_keyframe());
+}
+
+#[test]
 fn temporal_stream_can_refresh_dense_keyframes() {
     let device = Default::default();
     let config = VJepaConfig::tiny_for_tests();

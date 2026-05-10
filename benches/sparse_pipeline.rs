@@ -148,10 +148,11 @@ fn bench_temporal_sparse_stream_hot_path(c: &mut Criterion) {
     let frame_tokens = vec![vec![0], vec![1], vec![2], vec![3]];
     let stream_config =
         TemporalSparseJepaStreamConfig::new(24, 8, image_grid).with_keyframe_interval(16);
+    let (context_mask, target_mask) = sparse_pair(config.token_grid().len(), 24, 8);
 
     let mut group = c.benchmark_group("temporal_sparse_stream_hot_path_ndarray");
     group.throughput(Throughput::Elements(32));
-    group.bench_function("cached_plan_32_sequence_tokens", |b| {
+    group.bench_function("cached_plan_from_frame_tokens_32_sequence_tokens", |b| {
         b.iter_batched(
             || {
                 let mut stream = TemporalSparseJepaStream::<B>::new(stream_config);
@@ -168,6 +169,38 @@ fn bench_temporal_sparse_stream_hot_path(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+    group.bench_function(
+        "cached_plan_from_precomputed_masks_32_sequence_tokens",
+        |b| {
+            b.iter_batched(
+                || {
+                    let mut stream = TemporalSparseJepaStream::<B>::new(stream_config);
+                    stream
+                        .forward_masks(
+                            &model,
+                            video.clone(),
+                            context_mask.clone(),
+                            target_mask.clone(),
+                            0,
+                        )
+                        .expect("prime precomputed-mask temporal stream state");
+                    stream
+                },
+                |mut stream| {
+                    stream
+                        .forward_masks(
+                            &model,
+                            video.clone(),
+                            context_mask.clone(),
+                            target_mask.clone(),
+                            0,
+                        )
+                        .expect("precomputed-mask temporal stream")
+                },
+                BatchSize::SmallInput,
+            )
+        },
+    );
     group.finish();
 }
 
