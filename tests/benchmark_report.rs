@@ -71,9 +71,11 @@ fn cuda_benchmark_path_documents_blocker_and_rejects_header_only_csv() {
     assert!(report.contains("## CUDA Status"));
     assert!(report.contains("no defensible CUDA\nFPS rows from this environment"));
     assert!(report.contains("skipping autogaze-cuda benchmark"));
+    assert!(report.contains("CUDA_ERROR_NO_DEVICE"));
 
     let runbook = include_str!("../docs/cuda-benchmark.md");
     assert!(runbook.contains("nvidia-smi -L"));
+    assert!(runbook.contains("nvidia-smi` alone is not sufficient evidence"));
     assert!(runbook.contains("The CSV has data rows, not just the header."));
     assert!(runbook.contains("autogaze_trace_ms` is `0.000`"));
 

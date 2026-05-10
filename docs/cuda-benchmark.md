@@ -46,7 +46,13 @@ Before accepting the result, verify that:
 
 - `nvidia-smi -L` lists at least one device.
 - `/dev/nvidiactl` or `/dev/nvidia0` exists on Linux.
+- A forced smoke does not fail with
+  `DriverError(CUDA_ERROR_NO_DEVICE, "no CUDA-capable device is detected")`.
 - The CSV has data rows, not just the header.
 - `autogaze_trace_ms` is `0.000` when trace is disabled.
 - `temporal_frames_per_sec` is reported for every requested resolution and
   density row.
+
+`nvidia-smi` alone is not sufficient evidence in sandboxed environments: NVML
+can see a GPU while the CUDA runtime still cannot open a device. In that case
+the benchmark should keep reporting no defensible CUDA FPS rows.

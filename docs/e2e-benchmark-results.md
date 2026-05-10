@@ -99,17 +99,27 @@ cargo check --bench autogaze_sparse_jepa_pipeline \
   --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
 ```
 
-Runtime CUDA measurement is blocked on this machine. `nvidia-smi -L` reports:
+Runtime CUDA measurement is blocked on this machine. `nvidia-smi -L` reports a
+driver-visible GPU:
 
 ```text
-NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.
+GPU 0: NVIDIA RTX PRO 6000 Blackwell Workstation Edition (UUID: GPU-343b002b-d5c6-2d9c-9fea-9ab5a52d0879)
 ```
 
 No `/dev/nvidia*` device nodes are visible. The CUDA benchmark selector compiled
-and then skipped CUDA at runtime during preflight:
+and skips CUDA at runtime during preflight unless forced:
 
 ```text
 skipping autogaze-cuda benchmark: no /dev/nvidia* device nodes; set BURN_JEPA_PIPELINE_CUDA_FORCE=1 to try anyway
+```
+
+Forcing the benchmark past preflight with `BURN_JEPA_PIPELINE_CUDA_FORCE=1`
+still does not produce data rows because CubeCL CUDA cannot initialize a
+CUDA-capable device:
+
+```text
+DriverError(CUDA_ERROR_NO_DEVICE, "no CUDA-capable device is detected")
+skipping autogaze-cuda benchmark: called `Result::unwrap()` on an `Err` value: RecvError
 ```
 
 The emitted CUDA CSV contains only the header, so there are no defensible CUDA

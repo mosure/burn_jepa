@@ -25,7 +25,7 @@ evidence, and clear backend/runtime status.
 | Checked-in benchmark evidence has regression coverage. | `tests/benchmark_report.rs` | The integration test parses the E2E report, asserts the ndarray/WebGPU resolution-density matrix, verifies trace-off rows, and checks the CUDA runbook/template reject header-only CSV output. | Covered |
 | WebGPU and ndarray performance behavior is explained. | `docs/e2e-benchmark-results.md` | Report notes sparse V-JEPA stream is similar, but WebGPU E2E is slower because AutoGaze WebGPU generation dominates. | Covered |
 | CUDA feature support compiles. | Cargo features and benchmark target | `cargo check --no-default-features --features cuda` and CUDA E2E bench target check passed. | Covered |
-| CUDA E2E FPS is measured. | `docs/e2e-benchmark-results.md`, `docs/cuda-benchmark.md`, `docs/workflows/cuda-benchmark.yml` | This host has no usable CUDA runtime: no `/dev/nvidia*`, `nvidia-smi` cannot communicate with the driver, and the benchmark preflight skips CUDA. A manual self-hosted CUDA benchmark workflow template now fails if the emitted CSV has no data rows; publishing it under `.github/workflows/` requires workflow-file write permission. | Blocked |
+| CUDA E2E FPS is measured. | `docs/e2e-benchmark-results.md`, `docs/cuda-benchmark.md`, `docs/workflows/cuda-benchmark.yml` | This host has no usable CUDA runtime for Burn/CubeCL: `nvidia-smi -L` can see an RTX PRO 6000, but no `/dev/nvidia*` nodes are visible and a forced CUDA benchmark fails with `CUDA_ERROR_NO_DEVICE`, emitting only a header CSV. A manual self-hosted CUDA benchmark workflow template now fails if the emitted CSV has no data rows; publishing it under `.github/workflows/` requires workflow-file write permission. | Blocked |
 | Static page shell and workflow status are honest. | `crates/bevy_burn_jepa/www`, `README.md`, `web/README.md`, `crates/bevy_burn_jepa/README.md` | The static shell remains checked in, but the Pages badge is removed and docs note that the deploy workflow is disabled remotely because GitHub reports Pages is unavailable for this repository plan. | Covered |
 | Package remains publishable. | Cargo package manifest | `cargo package --allow-dirty` passed with docs included. | Covered |
 
@@ -44,6 +44,15 @@ cargo check --bench autogaze_sparse_jepa_pipeline \
   --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
 cargo bench --bench autogaze_sparse_jepa_pipeline \
   --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
+BURN_JEPA_PIPELINE_AUTOGAZE_BACKENDS=cuda \
+BURN_JEPA_PIPELINE_BENCH_REPS=1 \
+BURN_JEPA_PIPELINE_BENCH_WARMUPS=0 \
+BURN_JEPA_PIPELINE_BENCH_1080P=false \
+BURN_JEPA_PIPELINE_BENCH_TRACE=0 \
+BURN_JEPA_PIPELINE_CUDA_FORCE=1 \
+BURN_JEPA_PIPELINE_BENCH_OUT=target/codex-cuda-live/autogaze_sparse_jepa_cuda_trace_off.csv \
+cargo bench --bench autogaze_sparse_jepa_pipeline \
+  --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
 cargo test --test benchmark_report --no-default-features --features ndarray
 cargo package --allow-dirty
 ```
@@ -53,7 +62,9 @@ cargo package --allow-dirty
 The implementation, tests, parity fixtures, packaging, and ndarray/WebGPU E2E
 benchmarks are aligned with the objective. The only incomplete item is real CUDA
 runtime throughput. The code now preflights CUDA and reports a clean skip when
-the runtime is unavailable; actual CUDA FPS needs a machine with a visible CUDA
-driver and device nodes. Use `docs/cuda-benchmark.md` locally, or install the
+the runtime is unavailable; a forced local run reached CubeCL CUDA but failed
+with `CUDA_ERROR_NO_DEVICE` and produced a header-only CSV. Actual CUDA FPS
+needs a machine where both the driver and CUDA device nodes/runtime are visible
+to the process. Use `docs/cuda-benchmark.md` locally, or install the
 `docs/workflows/cuda-benchmark.yml` template as a manual `cuda benchmark`
 workflow, to produce the missing CUDA FPS artifact on that host.
