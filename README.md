@@ -140,8 +140,10 @@ the bench returns `autogaze_trace_ms=0.000` before cloning the input tensor,
 allocating trace samples, or calling AutoGaze's trace decoder.
 The CSV includes both one-shot sparse pipeline timing and cached
 `TemporalSparseJepaStream` timing (`temporal_stream_ms`,
-`temporal_e2e_pipeline_ms`, and temporal FPS columns) so next-frame sparse
-updates are visible separately from first-use plan construction.
+`rolling_temporal_stream_ms`, `temporal_e2e_pipeline_ms`,
+`rolling_temporal_e2e_pipeline_ms`, and temporal FPS columns) so next-frame
+sparse updates are visible separately from first-use plan construction and
+4-frame clip latency.
 See [docs/e2e-benchmark-results.md](docs/e2e-benchmark-results.md) for the
 latest checked-in ndarray/WebGPU E2E throughput table and CUDA runtime status.
 See [docs/cuda-benchmark.md](docs/cuda-benchmark.md) for the manual CUDA

@@ -7,8 +7,11 @@ struct BenchRow {
     density: String,
     context_tokens: usize,
     temporal_stream_ms: f64,
+    rolling_stream_ms: f64,
     temporal_e2e_ms: f64,
+    rolling_e2e_ms: f64,
     e2e_fps: f64,
+    rolling_fps: f64,
     trace_ms: f64,
 }
 
@@ -54,10 +57,26 @@ fn e2e_benchmark_report_has_required_matrix_and_trace_off_rows() {
             "temporal stream timing must be positive: {row:?}"
         );
         assert!(
+            row.rolling_stream_ms > 0.0,
+            "rolling stream timing must be positive: {row:?}"
+        );
+        assert!(
             row.temporal_e2e_ms >= row.temporal_stream_ms,
             "E2E timing should include the stream timing: {row:?}"
         );
+        assert!(
+            row.rolling_e2e_ms >= row.rolling_stream_ms,
+            "rolling E2E timing should include the rolling stream timing: {row:?}"
+        );
+        assert!(
+            row.rolling_e2e_ms < row.temporal_e2e_ms,
+            "rolling window should be lower latency than the 4-frame clip path: {row:?}"
+        );
         assert!(row.e2e_fps > 0.0, "FPS must be positive: {row:?}");
+        assert!(
+            row.rolling_fps > 0.0,
+            "rolling FPS must be positive: {row:?}"
+        );
         assert_eq!(
             row.trace_ms, 0.0,
             "checked-in E2E report should be trace-disabled: {row:?}"
@@ -110,6 +129,22 @@ fn benchmark_trace_config_is_opt_in_and_disabled_path_avoids_tensor_clone() {
         compact.contains("ifself.disabled(){return0.0;}"),
         "disabled tracing should return before entering the decoder/timing path"
     );
+    let disabled_return = compact
+        .find("ifself.disabled(){return0.0;}")
+        .expect("disabled trace return guard");
+    for hot_path_marker in [
+        "measure_ms(warmups,reps,||{",
+        "video.clone()",
+        "trace_video_with_mode(",
+    ] {
+        let marker = compact.find(hot_path_marker).unwrap_or_else(|| {
+            panic!("missing trace hot-path marker `{hot_path_marker}`")
+        });
+        assert!(
+            disabled_return < marker,
+            "disabled trace guard must run before `{hot_path_marker}`"
+        );
+    }
     assert!(
         compact.contains("measure_autogaze_trace_ms(&autogaze,&ag_video,"),
         "the call site should pass a borrowed tensor"
@@ -169,7 +204,7 @@ fn parse_benchmark_row(line: &str) -> BenchRow {
         .collect::<Vec<_>>();
     assert_eq!(
         cols.len(),
-        8,
+        11,
         "unexpected benchmark table row shape: {line}"
     );
 
@@ -179,8 +214,11 @@ fn parse_benchmark_row(line: &str) -> BenchRow {
         density: cols[2].to_string(),
         context_tokens: cols[3].parse().expect("context tokens"),
         temporal_stream_ms: cols[4].parse().expect("temporal stream ms"),
-        temporal_e2e_ms: cols[5].parse().expect("temporal e2e ms"),
-        e2e_fps: cols[6].parse().expect("e2e fps"),
-        trace_ms: cols[7].parse().expect("trace ms"),
+        rolling_stream_ms: cols[5].parse().expect("rolling stream ms"),
+        temporal_e2e_ms: cols[6].parse().expect("temporal e2e ms"),
+        rolling_e2e_ms: cols[7].parse().expect("rolling e2e ms"),
+        e2e_fps: cols[8].parse().expect("e2e fps"),
+        rolling_fps: cols[9].parse().expect("rolling fps"),
+        trace_ms: cols[10].parse().expect("trace ms"),
     }
 }
