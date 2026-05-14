@@ -42,7 +42,8 @@ pub use experiment::{
     ExperimentConfig, ExperimentDataConfig, ExperimentDataReport, ExperimentMaskPolicy,
     ExperimentModelVariant, ExperimentPlanReport, ExperimentRunReport, ExperimentSuccessCriteria,
     ExperimentTrial, ExperimentTrialReport, ExperimentTrialStatus, ExperimentTrialTiming,
-    analyze_experiment, prepare_experiment_data, run_experiment, write_experiment_plan,
+    ExperimentTttLayerSet, analyze_experiment, prepare_experiment_data, run_experiment,
+    write_experiment_plan,
 };
 pub use model::{
     DensePredictionOutput, PatchEmbed2d, PatchEmbed3d, SparseEncoderBatchPlan, SparseEncoderPlan,
@@ -98,8 +99,8 @@ pub use training::{
     train_ttt_distillation,
 };
 pub use ttt::{
-    TttBackpropMode, TttEncoderConfig, TttLayerState, TttState, TttTargetMode, VJepaTttEncoder,
-    VJepaTttLayer, VJepaTttModel,
+    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttState, TttTargetMode,
+    VJepaTttEncoder, VJepaTttLayer, VJepaTttModel,
 };
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;

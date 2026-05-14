@@ -3,7 +3,7 @@ use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::{Tensor, TensorData};
 use burn_jepa::{
     BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseTokenMask,
-    TttBackpropMode, TttEncoderConfig, TttLayerState, TttRolloutReportMode,
+    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttRolloutReportMode,
     TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttTargetMode, VJepa2_1Model,
     VJepaTttLayer, VJepaTttModel, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
     train_ttt_distillation,
@@ -11,6 +11,17 @@ use burn_jepa::{
 
 type B = burn::backend::NdArray<f32>;
 type AB = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+
+#[test]
+fn ttt_default_layer_placement_is_first_last() {
+    let config = TttEncoderConfig::default();
+    let model = burn_jepa::VJepaConfig::default();
+    assert_eq!(config.layer_placement, TttLayerPlacement::FirstLast);
+    assert_eq!(
+        config.resolved_layers(&model),
+        vec![0, model.encoder.depth.saturating_sub(1)]
+    );
+}
 
 #[test]
 fn ttt_training_config_round_trips_through_public_training_namespace() {

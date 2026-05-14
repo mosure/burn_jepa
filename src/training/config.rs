@@ -64,8 +64,9 @@ impl BurnJepaTrainConfig {
 
     pub fn validate_for_ttt(&self) -> Result<()> {
         self.validate_common()?;
+        let model_config = self.model_config_for_validation()?;
         ensure!(
-            !self.ttt.layers.is_empty(),
+            !self.ttt.resolved_layers(&model_config).is_empty(),
             "train-ttt requires at least one TTT layer"
         );
         Ok(())

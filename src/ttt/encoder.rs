@@ -40,7 +40,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
         device: &B::Device,
     ) -> Result<Self> {
         ttt_config.validate(model_config)?;
-        let layer_indices = ttt_config.normalized_layers();
+        let layer_indices = ttt_config.resolved_layers(model_config);
         let ttt_layers = layer_indices
             .iter()
             .map(|_| VJepaTttLayer::new(model_config.encoder.embed_dim, &ttt_config, device))

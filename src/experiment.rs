@@ -1,7 +1,7 @@
 use crate::{
     BurnJepaTrainConfig, JepaDataset, JepaDatasetConfig, JepaDatasetKind, JepaManifestRow,
-    JepaTensorBatch, JepaTrainBackend, SparseTokenMask, TokenGridShape, TttTargetMode,
-    VJepa2_1Model, VJepaConfig, VJepaLoadOptions, VJepaTttModel, apply_token_mask,
+    JepaTensorBatch, JepaTrainBackend, SparseTokenMask, TokenGridShape, TttLayerPlacement,
+    TttTargetMode, VJepa2_1Model, VJepaConfig, VJepaLoadOptions, VJepaTttModel, apply_token_mask,
     dataset_from_config, load_jepa_tensor_batch, train_ttt_distillation, video_token_grid,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -29,6 +29,7 @@ pub struct ExperimentConfig {
     pub target_density: f32,
     pub model_variants: Vec<ExperimentModelVariant>,
     pub mask_policies: Vec<ExperimentMaskPolicy>,
+    pub ttt_layer_sets: Vec<ExperimentTttLayerSet>,
     pub base: BurnJepaTrainConfig,
     pub data: ExperimentDataConfig,
 }
@@ -65,6 +66,7 @@ impl Default for ExperimentConfig {
                 ExperimentMaskPolicy::AutogazeSparse,
                 ExperimentMaskPolicy::PrecomputedMasks,
             ],
+            ttt_layer_sets: vec![ExperimentTttLayerSet::encoder_first_last()],
             base,
             data: ExperimentDataConfig::default(),
         }
@@ -113,6 +115,16 @@ impl ExperimentConfig {
             !self.mask_policies.is_empty(),
             "experiment.mask_policies must not be empty"
         );
+        ensure!(
+            !self.ttt_layer_sets.is_empty(),
+            "experiment.ttt_layer_sets must not be empty"
+        );
+        for set in &self.ttt_layer_sets {
+            ensure!(
+                set.predictor_layers.is_empty(),
+                "experiment TTT predictor layer sets are not implemented yet; use encoder_layers or placement"
+            );
+        }
         if self.require_real_checkpoint {
             ensure!(
                 self.base.model.checkpoint_dir.is_some()
@@ -136,17 +148,26 @@ impl ExperimentConfig {
             for &density in &self.densities {
                 for model_variant in &self.model_variants {
                     for mask_policy in &self.mask_policies {
-                        trials.push(ExperimentTrial {
-                            seed,
-                            density,
-                            model_variant: *model_variant,
-                            mask_policy: *mask_policy,
-                        });
+                        for ttt_layer_set_index in 0..self.ttt_layer_sets.len() {
+                            trials.push(ExperimentTrial {
+                                seed,
+                                density,
+                                model_variant: *model_variant,
+                                mask_policy: *mask_policy,
+                                ttt_layer_set_index,
+                            });
+                        }
                     }
                 }
             }
         }
         trials
+    }
+
+    fn ttt_layer_set(&self, trial: ExperimentTrial) -> &ExperimentTttLayerSet {
+        self.ttt_layer_sets
+            .get(trial.ttt_layer_set_index)
+            .unwrap_or_else(|| &self.ttt_layer_sets[0])
     }
 }
 
@@ -236,12 +257,67 @@ pub enum ExperimentMaskPolicy {
     ManifestPrecomputedMasks,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExperimentTttLayerSet {
+    pub name: String,
+    pub placement: Option<TttLayerPlacement>,
+    pub encoder_layers: Vec<usize>,
+    pub predictor_layers: Vec<usize>,
+}
+
+impl ExperimentTttLayerSet {
+    pub fn encoder_first_last() -> Self {
+        Self {
+            name: "encoder_first_last".to_string(),
+            placement: Some(TttLayerPlacement::FirstLast),
+            encoder_layers: Vec::new(),
+            predictor_layers: Vec::new(),
+        }
+    }
+
+    pub fn encoder_thirds() -> Self {
+        Self {
+            name: "encoder_thirds".to_string(),
+            placement: Some(TttLayerPlacement::Thirds),
+            encoder_layers: Vec::new(),
+            predictor_layers: Vec::new(),
+        }
+    }
+
+    fn apply_to(&self, config: &mut BurnJepaTrainConfig) {
+        if let Some(placement) = self.placement {
+            config.ttt.layer_placement = placement;
+        } else if !self.encoder_layers.is_empty() {
+            config.ttt.layer_placement = TttLayerPlacement::Explicit;
+        }
+        config.ttt.layers = self.encoder_layers.clone();
+        config.ttt.predictor_layers = self.predictor_layers.clone();
+    }
+
+    fn resolved_encoder_layers(&self, base: &BurnJepaTrainConfig) -> Vec<usize> {
+        let mut config = base.clone();
+        self.apply_to(&mut config);
+        model_config(&config)
+            .map(|model| config.ttt.resolved_layers(&model))
+            .unwrap_or_else(|_| self.encoder_layers.clone())
+    }
+}
+
+impl Default for ExperimentTttLayerSet {
+    fn default() -> Self {
+        Self::encoder_first_last()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ExperimentTrial {
     pub seed: u64,
     pub density: f32,
     pub model_variant: ExperimentModelVariant,
     pub mask_policy: ExperimentMaskPolicy,
+    #[serde(default)]
+    pub ttt_layer_set_index: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -279,6 +355,7 @@ pub struct ExperimentSuccessCriteria {
     pub full_mask_matrix: bool,
     pub mask_loss_enabled: bool,
     pub density_count: usize,
+    pub ttt_layer_set_count: usize,
     pub matched_ttt_trials: usize,
     pub ttt_loss_improved_trials: usize,
     pub ttt_cosine_improved_trials: usize,
@@ -292,6 +369,12 @@ pub struct ExperimentTrialReport {
     pub target_density: f32,
     pub model_variant: ExperimentModelVariant,
     pub mask_policy: ExperimentMaskPolicy,
+    #[serde(default)]
+    pub ttt_layer_set: String,
+    #[serde(default)]
+    pub ttt_encoder_layers: Vec<usize>,
+    #[serde(default)]
+    pub ttt_predictor_layers: Vec<usize>,
     pub status: ExperimentTrialStatus,
     pub train_final_loss: Option<f64>,
     pub train_best_loss: Option<f64>,
@@ -559,6 +642,7 @@ fn experiment_success_criteria(
         && (config.base.loss.feature_loss_weight > 0.0
             || config.base.loss.predictor_loss_weight > 0.0);
     criteria.density_count = config.densities.len();
+    criteria.ttt_layer_set_count = config.ttt_layer_sets.len();
     criteria
 }
 
@@ -599,6 +683,7 @@ fn experiment_success_criteria_from_trials(
                 && candidate.mask_policy == trial.mask_policy
                 && candidate.seed == trial.seed
                 && (candidate.density - trial.density).abs() <= f32::EPSILON
+                && candidate.ttt_layer_set == trial.ttt_layer_set
                 && candidate.status == ExperimentTrialStatus::Completed
         });
         if let Some(baseline) = baseline {
@@ -625,6 +710,7 @@ fn experiment_success_criteria_from_trials(
         full_mask_matrix,
         mask_loss_enabled: false,
         density_count: unique_density_count(trials),
+        ttt_layer_set_count: unique_layer_set_count(trials),
         matched_ttt_trials,
         ttt_loss_improved_trials,
         ttt_cosine_improved_trials,
@@ -661,6 +747,9 @@ fn run_trial<B: crate::TttSparsePatchifyTrainingBackend>(
             target_density: config.target_density,
             model_variant: trial.model_variant,
             mask_policy: trial.mask_policy,
+            ttt_layer_set: trial_layer_set_name(config, trial),
+            ttt_encoder_layers: trial_encoder_layers(config, trial),
+            ttt_predictor_layers: config.ttt_layer_set(trial).predictor_layers.clone(),
             status: ExperimentTrialStatus::Failed,
             train_final_loss: None,
             train_best_loss: None,
@@ -708,6 +797,9 @@ fn train_ttt_trial<B: crate::TttSparsePatchifyTrainingBackend>(
         target_density: config.target_density,
         model_variant: trial.model_variant,
         mask_policy: trial.mask_policy,
+        ttt_layer_set: trial_layer_set_name(config, trial),
+        ttt_encoder_layers: report.memory.layers.clone(),
+        ttt_predictor_layers: config.ttt_layer_set(trial).predictor_layers.clone(),
         status: ExperimentTrialStatus::Completed,
         train_final_loss: Some(report.final_loss),
         train_best_loss: Some(report.best_loss),
@@ -761,6 +853,9 @@ fn evaluate_teacher_reference<B: AutodiffBackend>(
         target_density: config.target_density,
         model_variant: ExperimentModelVariant::Teacher3dReference,
         mask_policy: trial.mask_policy,
+        ttt_layer_set: trial_layer_set_name(config, trial),
+        ttt_encoder_layers: trial_encoder_layers(config, trial),
+        ttt_predictor_layers: config.ttt_layer_set(trial).predictor_layers.clone(),
         status: ExperimentTrialStatus::Completed,
         train_final_loss: None,
         train_best_loss: None,
@@ -812,6 +907,9 @@ fn evaluate_single_frame<B: AutodiffBackend>(
         target_density: config.target_density,
         model_variant: trial.model_variant,
         mask_policy: trial.mask_policy,
+        ttt_layer_set: trial_layer_set_name(config, trial),
+        ttt_encoder_layers: trial_encoder_layers(config, trial),
+        ttt_predictor_layers: config.ttt_layer_set(trial).predictor_layers.clone(),
         status: ExperimentTrialStatus::Completed,
         train_final_loss: None,
         train_best_loss: None,
@@ -879,7 +977,9 @@ fn evaluate_teacher_or_single_frame<B: AutodiffBackend>(
     let teacher = load_model::<B>(&config.base, device)?.no_grad();
     let mut ttt_config = config.base.ttt.clone();
     if trial.is_some() {
+        ttt_config.layer_placement = TttLayerPlacement::Explicit;
         ttt_config.layers.clear();
+        ttt_config.predictor_layers.clear();
     }
     let base = load_model::<B>(&config.base, device)?;
     let student = VJepaTttModel::from_model(base, ttt_config, device)?;
@@ -1042,6 +1142,7 @@ fn trial_train_config(
     trial: ExperimentTrial,
 ) -> Result<BurnJepaTrainConfig> {
     let mut train_config = config.base.clone();
+    config.ttt_layer_set(trial).apply_to(&mut train_config);
     train_config.training.mask = Some(mask_for_trial(
         &train_config,
         trial.mask_policy,
@@ -1050,6 +1151,16 @@ fn trial_train_config(
         trial.seed,
     )?);
     Ok(train_config)
+}
+
+fn trial_layer_set_name(config: &ExperimentConfig, trial: ExperimentTrial) -> String {
+    config.ttt_layer_set(trial).name.clone()
+}
+
+fn trial_encoder_layers(config: &ExperimentConfig, trial: ExperimentTrial) -> Vec<usize> {
+    config
+        .ttt_layer_set(trial)
+        .resolved_encoder_layers(&config.base)
 }
 
 fn mask_for_trial(
@@ -1549,6 +1660,12 @@ fn write_analysis(path: &Path, report: &ExperimentRunReport) -> Result<()> {
     );
     push_markdown_table(
         &mut text,
+        "By TTT Layer Set",
+        layer_set_summary_columns(),
+        &summarize_by_layer_set(&report.trials),
+    );
+    push_markdown_table(
+        &mut text,
         "By Model And Mask",
         model_mask_summary_columns(),
         &summarize_by_model_mask(&report.trials),
@@ -1607,6 +1724,18 @@ fn trial_csv_columns() -> Vec<CsvColumn<ExperimentTrialReport>> {
         CsvColumn {
             name: "mask_policy",
             value: |trial| format!("{:?}", trial.mask_policy),
+        },
+        CsvColumn {
+            name: "ttt_layer_set",
+            value: |trial| trial.ttt_layer_set.clone(),
+        },
+        CsvColumn {
+            name: "ttt_encoder_layers",
+            value: |trial| format_usize_list(&trial.ttt_encoder_layers),
+        },
+        CsvColumn {
+            name: "ttt_predictor_layers",
+            value: |trial| format_usize_list(&trial.ttt_predictor_layers),
         },
         CsvColumn {
             name: "density",
@@ -1846,6 +1975,10 @@ fn success_criteria_rows(criteria: &ExperimentSuccessCriteria) -> Vec<SuccessCri
             value: criteria.density_count.to_string(),
         },
         SuccessCriteriaRow {
+            gate: "TTT layer set count",
+            value: criteria.ttt_layer_set_count.to_string(),
+        },
+        SuccessCriteriaRow {
             gate: "Matched TTT trials",
             value: criteria.matched_ttt_trials.to_string(),
         },
@@ -1932,6 +2065,10 @@ fn summarize_by_mask(trials: &[ExperimentTrialReport]) -> Vec<ExperimentGroupSum
     summarize_groups(trials, |trial| format!("{:?}", trial.mask_policy))
 }
 
+fn summarize_by_layer_set(trials: &[ExperimentTrialReport]) -> Vec<ExperimentGroupSummary> {
+    summarize_groups(trials, |trial| trial.ttt_layer_set.clone())
+}
+
 fn summarize_by_model_mask(trials: &[ExperimentTrialReport]) -> Vec<ExperimentGroupSummary> {
     summarize_groups(trials, |trial| {
         format!("{:?}/{:?}", trial.model_variant, trial.mask_policy)
@@ -1985,6 +2122,20 @@ fn mask_summary_columns() -> Vec<MarkdownColumn<ExperimentGroupSummary>> {
     ]
 }
 
+fn layer_set_summary_columns() -> Vec<MarkdownColumn<ExperimentGroupSummary>> {
+    vec![
+        group_label_column("TTT layer set"),
+        group_trials_column(),
+        group_f64_column("Mean eval loss", |row| row.mean_eval_loss),
+        group_f64_column("Mean eval cosine", |row| row.mean_eval_cosine),
+        group_f64_column("Mean full loss", |row| row.mean_full_loss),
+        group_f64_column("Mean full cosine", |row| row.mean_full_cosine),
+        group_f64_column("Mean samples/sec", |row| row.mean_samples_per_second),
+        group_f64_column("Mean train ms", |row| row.mean_train_ms),
+        group_mib_column("Mean fast memory MiB", |row| row.mean_fast_memory_mib),
+    ]
+}
+
 fn model_mask_summary_columns() -> Vec<MarkdownColumn<ExperimentGroupSummary>> {
     vec![
         group_label_column("Model/mask"),
@@ -2032,6 +2183,7 @@ fn group_mib_column(
 #[derive(Clone, Debug)]
 struct MatchedTttDeltaRow {
     ttt_variant: String,
+    ttt_layer_set: String,
     mask: String,
     density: f32,
     seed: u64,
@@ -2058,10 +2210,12 @@ fn matched_ttt_deltas(trials: &[ExperimentTrialReport]) -> Vec<MatchedTttDeltaRo
                     && candidate.mask_policy == trial.mask_policy
                     && candidate.seed == trial.seed
                     && (candidate.density - trial.density).abs() <= f32::EPSILON
+                    && candidate.ttt_layer_set == trial.ttt_layer_set
                     && candidate.status == ExperimentTrialStatus::Completed
             })?;
             Some(MatchedTttDeltaRow {
                 ttt_variant: format!("{:?}", trial.model_variant),
+                ttt_layer_set: trial.ttt_layer_set.clone(),
                 mask: format!("{:?}", trial.mask_policy),
                 density: trial.density,
                 seed: trial.seed,
@@ -2086,6 +2240,11 @@ fn matched_delta_columns() -> Vec<MarkdownColumn<MatchedTttDeltaRow>> {
         markdown_column("Mask", MarkdownAlign::Left, |row: &MatchedTttDeltaRow| {
             row.mask.clone()
         }),
+        markdown_column(
+            "TTT layer set",
+            MarkdownAlign::Left,
+            |row: &MatchedTttDeltaRow| row.ttt_layer_set.clone(),
+        ),
         markdown_column(
             "Density",
             MarkdownAlign::Right,
@@ -2116,8 +2275,12 @@ fn delta_column(
 
 fn trial_id(trial: ExperimentTrial) -> String {
     format!(
-        "{:?}_{:?}_d{:.4}_s{}",
-        trial.model_variant, trial.mask_policy, trial.density, trial.seed
+        "{:?}_{:?}_l{}_d{:.4}_s{}",
+        trial.model_variant,
+        trial.mask_policy,
+        trial.ttt_layer_set_index,
+        trial.density,
+        trial.seed
     )
     .replace("::", "_")
     .replace('.', "p")
@@ -2286,6 +2449,14 @@ fn fmt_opt_usize(value: Option<usize>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
+fn format_usize_list(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn opt_delta(left: Option<f64>, right: Option<f64>) -> Option<f64> {
     Some(left? - right?)
 }
@@ -2320,6 +2491,16 @@ fn unique_density_count(trials: &[ExperimentTrialReport]) -> usize {
     densities.sort_unstable();
     densities.dedup();
     densities.len()
+}
+
+fn unique_layer_set_count(trials: &[ExperimentTrialReport]) -> usize {
+    let mut layer_sets = trials
+        .iter()
+        .map(|trial| trial.ttt_layer_set.as_str())
+        .collect::<Vec<_>>();
+    layer_sets.sort_unstable();
+    layer_sets.dedup();
+    layer_sets.len()
 }
 
 fn stable_hash(value: &str) -> u64 {

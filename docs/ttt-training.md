@@ -241,6 +241,23 @@ Set `training.cache_teacher_tokens = true` to cache detached teacher features
 inside a run. Reports include `teacher_cache_hits` and
 `teacher_cache_misses` in train/eval stage metrics.
 
+## TTT Layer Placement
+
+`ttt.layer_placement` controls where recurrent TTT adapters are inserted in the
+JEPA encoder. Supported placements are `first`, `middle`, `last`,
+`first_last`, `thirds`, and `explicit`. `explicit` uses `ttt.layers` directly.
+The default is `first_last`, which resolves to `[0, 11]` for a 12-layer ViT-B
+encoder. It was selected as the smoke/training default because the real V-JEPA
+2.1 CUDA ablation below matched the best held-out sparse loss while avoiding
+the much larger backward cost of the three-adapter preset. Use `thirds` for the
+higher-capacity `[3, 7, 11]` ViT-B preset when longer quality-focused runs can
+afford the extra backward time.
+
+`ttt.predictor_layers` is reserved in the config schema, but predictor-layer TTT
+adapters are intentionally rejected today. The recurrent TTT state is trained to
+make the single-frame encoder behave like the temporal 3D encoder; the JEPA
+predictor is still trained through the normal sparse predictor loss.
+
 ## Dataset Modes
 
 `dataset.kind = "synthetic"` is intended for smoke tests and CI. Manifest mode
@@ -378,6 +395,24 @@ The CUDA matrix includes first-use kernel compilation and dispatch stalls in
 the early sparse-predictor policies. After warm-up, most two-step tiny TTT
 trials ran in roughly 50-80 ms on this machine; treat the full CUDA matrix time
 as cold-runtime validation, not steady-state throughput.
+
+TTT layer-placement ablations from 2026-05-14:
+
+| Run | Checkpoint/Data | Layer Set | Layers | Variant | Trials | Eval Loss | Eval Cosine | Train Time | Samples/sec |
+|---|---|---|---|---|---:|---:|---:|---:|---:|
+| `real-cuda-224` | V-JEPA 2.1 ViT-B + real video windows | `encoder_first_last` | `[0, 11]` | `ttt_teacher_final` | 1 | 0.3791 | 0.8445 | 46.739 s | 0.171 |
+| `real-cuda-224` | V-JEPA 2.1 ViT-B + real video windows | `encoder_thirds` | `[3, 7, 11]` | `ttt_teacher_final` | 1 | 0.3800 | 0.8442 | 176.536 s | 0.045 |
+| `real-cuda-224` | V-JEPA 2.1 ViT-B + real video windows | `encoder_last` | `[11]` | `ttt_teacher_final` | 1 | 0.3863 | 0.8418 | 12.947 s | 0.618 |
+| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_thirds` | `[1, 2, 3]` | `ttt_teacher_final` | 4 | 1.1586 | 0.4207 | synthetic | synthetic |
+| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_first_last` | `[0, 3]` | `ttt_teacher_final` | 4 | 1.3336 | 0.3332 | synthetic | synthetic |
+| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_last` | `[3]` | `ttt_teacher_final` | 4 | 1.4493 | 0.2753 | synthetic | synthetic |
+
+The real-checkpoint row is the default-selection gate. `first_last` matched the
+best short-run held-out sparse loss/cosine while cutting train time by roughly
+3.8x versus `thirds`. The synthetic depth-4 confirmation still prefers
+`thirds`, which is why it remains the documented high-capacity preset. In the
+same real CUDA smoke, `ttt_self_hidden` trailed `ttt_teacher_final` for every
+layer set, so smoke configs should keep `ttt.target = "teacher_final"`.
 
 Real-checkpoint CUDA mask/memory ablations from 2026-05-14 used the published
 V-JEPA 2.1 ViT-B checkpoint fixture under

@@ -178,6 +178,11 @@ and detached every `ttt.rollout_blocks` tubelets for block-rollout training.
 fast-weight target; `ttt.target = "self_hidden"` uses current hidden states.
 Set `loss.predictor_loss_weight > 0` to train the normal sparse JEPA predictor
 objective alongside feature distillation.
+The default TTT placement is `ttt.layer_placement = "first_last"`, which
+resolves to the first and final encoder blocks. Local real-checkpoint CUDA
+ablation selected it as the best short-run speed/quality default; use
+`"thirds"` for the higher-capacity `[3, 7, 11]` ViT-B preset in longer
+quality-focused runs.
 
 Set `model.ttt_checkpoint_path` to continue adapter training from a saved
 `ttt-model.mpk` while still loading the pretrained V-JEPA checkpoint for frozen

@@ -1,6 +1,7 @@
 use burn_jepa::{
     ExperimentConfig, ExperimentMaskPolicy, ExperimentModelVariant, JepaDatasetKind,
-    JepaSampleKind, prepare_experiment_data, run_experiment, write_experiment_plan,
+    JepaSampleKind, TttLayerPlacement, prepare_experiment_data, run_experiment,
+    write_experiment_plan,
 };
 
 type AB = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
@@ -17,9 +18,23 @@ fn experiment_config_plans_trial_matrix() {
         ExperimentMaskPolicy::FullFrame,
         ExperimentMaskPolicy::RandomSparse,
     ];
+    config.ttt_layer_sets = vec![
+        burn_jepa::ExperimentTttLayerSet {
+            name: "first".to_string(),
+            placement: Some(TttLayerPlacement::First),
+            encoder_layers: Vec::new(),
+            predictor_layers: Vec::new(),
+        },
+        burn_jepa::ExperimentTttLayerSet {
+            name: "last".to_string(),
+            placement: Some(TttLayerPlacement::Last),
+            encoder_layers: Vec::new(),
+            predictor_layers: Vec::new(),
+        },
+    ];
 
     let report = write_experiment_plan(&config).expect("write plan");
-    assert_eq!(report.trial_count, 8);
+    assert_eq!(report.trial_count, 16);
     assert!(report.run_manifest.exists());
     assert!(report.planned_trials.exists());
 }
@@ -57,6 +72,11 @@ fn default_experiment_config_covers_full_synthetic_gate_matrix() {
         config
             .mask_policies
             .contains(&ExperimentMaskPolicy::PrecomputedMasks)
+    );
+    assert_eq!(config.ttt_layer_sets.len(), 1);
+    assert_eq!(
+        config.ttt_layer_sets[0].placement,
+        Some(TttLayerPlacement::FirstLast)
     );
 }
 
@@ -150,6 +170,7 @@ fn experiment_run_smoke_writes_summary_analysis_and_csv() {
     assert_eq!(report.failed_trials, 0);
     assert!(report.success_criteria.all_trials_completed);
     assert!(report.success_criteria.mask_loss_enabled);
+    assert_eq!(report.success_criteria.ttt_layer_set_count, 1);
     assert!(!report.success_criteria.full_model_matrix);
     assert!(!report.success_criteria.full_mask_matrix);
     assert!(report.summary_path.exists());
@@ -162,4 +183,16 @@ fn experiment_run_smoke_writes_summary_analysis_and_csv() {
             .any(|trial| trial.eval_loss.is_some() || trial.train_final_loss.is_some())
     );
     assert!(report.trials.iter().any(|trial| trial.timing.train_ms > 0));
+    assert!(
+        report
+            .trials
+            .iter()
+            .all(|trial| !trial.ttt_layer_set.is_empty())
+    );
+    assert!(
+        report
+            .trials
+            .iter()
+            .any(|trial| !trial.ttt_encoder_layers.is_empty())
+    );
 }

@@ -31,9 +31,7 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
     model: &VJepaConfig,
     batch_size: usize,
 ) -> TttMemoryMetrics {
-    let mut layers = config.ttt.layers.clone();
-    layers.sort_unstable();
-    layers.dedup();
+    let layers = config.ttt.resolved_layers(model);
     let embed_dim = model.encoder.embed_dim.max(1);
     let layer_count = layers.len();
     let batch_size = batch_size.max(1);
