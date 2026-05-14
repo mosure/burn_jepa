@@ -4,7 +4,8 @@ use burn::tensor::Tensor;
 use burn::tensor::backend::BackendTypes;
 use burn_jepa::{
     SparseImageTokenGrid, SparsePatchifyPlan, SparseTokenMask, TemporalSparseJepaStream,
-    TemporalSparseJepaStreamConfig, VJepa2_1Model, VJepaConfig,
+    TemporalSparseJepaStreamConfig, TttEncoderConfig, VJepa2_1Model, VJepaConfig, VJepaTttModel,
+    apply_token_mask,
 };
 
 type B = burn_flex_gmm::wgpu::DefaultWgpuBackend;
@@ -48,6 +49,46 @@ fn wgpu_sparse_patchify_matches_dense_encoder_on_selected_tokens() {
             "sparse patchify encoder drift at {idx}: dense={lhs} sparse={rhs} diff={diff}"
         );
     }
+}
+
+#[test]
+fn wgpu_ttt_sparse_image_patchify_matches_dense_patch_embed_on_selected_tokens() {
+    let device = <B as BackendTypes>::Device::default();
+    let config = VJepaConfig::tiny_for_tests();
+    let base = VJepa2_1Model::<B>::new(&config, &device);
+    let model =
+        VJepaTttModel::from_model(base, TttEncoderConfig::default(), &device).expect("TTT model");
+    let frame_grid = burn_jepa::TokenGridShape::new(1, config.grid_height(), config.grid_width());
+    let mask = SparseTokenMask::new(vec![0, 3], frame_grid.len()).expect("mask");
+    let plan = SparsePatchifyPlan::<B>::new(mask.clone(), frame_grid, 1, &device).expect("plan");
+    let values = (0..config.in_channels * config.image_size * config.image_size)
+        .map(|idx| (idx as f32).cos() * 0.01)
+        .collect::<Vec<_>>();
+    let image = Tensor::<B, 1>::from_floats(values.as_slice(), &device).reshape([
+        1,
+        config.in_channels,
+        config.image_size,
+        config.image_size,
+    ]);
+
+    let dense = model
+        .encoder
+        .base
+        .image_patch_embed
+        .forward(image.clone().reshape([
+            1,
+            config.in_channels,
+            1,
+            config.image_size,
+            config.image_size,
+        ]));
+    let dense = apply_token_mask(dense, mask.to_tensor::<B>(1, &device)).to_data();
+    let sparse = model
+        .encoder
+        .sparse_patchify_image_wgpu(image, &plan)
+        .expect("sparse image patchify")
+        .to_data();
+    assert_close(&dense, &sparse, "TTT sparse image patchify");
 }
 
 #[test]
@@ -101,7 +142,9 @@ fn wgpu_temporal_stream_sparse_patchify_matches_dense_masked_stream() {
         "predictor",
     );
     assert!(!sparse.reused_patchify_plan);
+    assert!(!sparse.reused_encoder_plan);
     assert!(sparse_reused.reused_patchify_plan);
+    assert!(sparse_reused.reused_encoder_plan);
     assert!(sparse_reused.temporal.reused_predictor_plan);
 }
 
@@ -162,7 +205,9 @@ fn wgpu_temporal_stream_accepts_precomputed_masks_and_reuses_sparse_plan() {
         "precomputed predictor",
     );
     assert!(!sparse.reused_patchify_plan);
+    assert!(!sparse.reused_encoder_plan);
     assert!(sparse_reused.reused_patchify_plan);
+    assert!(sparse_reused.reused_encoder_plan);
     assert!(sparse_reused.temporal.reused_predictor_plan);
 }
 

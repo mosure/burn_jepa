@@ -296,14 +296,17 @@ fn temporal_stream_projects_encodes_predicts_and_resets() {
     assert!(first.masks.keyframe);
     assert!(first.temporal.keyframe);
     assert!(!first.temporal.reused_predictor_plan);
+    assert!(!first.reused_encoder_plan);
     assert!(!first.reused_patchify_plan);
     assert!(!second.masks.keyframe);
     assert!(!second.temporal.keyframe);
     assert!(second.temporal.reused_predictor_plan);
+    assert!(second.reused_encoder_plan);
     assert!(!second.reused_patchify_plan);
     assert!(reset.masks.keyframe);
     assert!(reset.temporal.keyframe);
     assert!(!reset.temporal.reused_predictor_plan);
+    assert!(!reset.reused_encoder_plan);
     assert!(!reset.reused_patchify_plan);
     assert_eq!(first.context.tokens.shape().dims::<3>()[1], 4);
     assert_eq!(
@@ -353,10 +356,12 @@ fn temporal_stream_accepts_precomputed_masks_without_frame_projection() {
 
     assert!(first.masks.keyframe);
     assert!(!first.temporal.reused_predictor_plan);
+    assert!(!first.reused_encoder_plan);
     assert_eq!(first.masks.context_mask.indices(), context_mask.indices());
     assert_eq!(first.masks.target_mask.indices(), target_mask.indices());
     assert!(!second.masks.keyframe);
     assert!(second.temporal.reused_predictor_plan);
+    assert!(second.reused_encoder_plan);
     assert_eq!(
         second.context.tokens.shape().dims::<3>()[1],
         context_mask.len()

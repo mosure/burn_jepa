@@ -77,10 +77,12 @@ jobs:
           BURN_JEPA_PIPELINE_BENCH_WARMUPS: ${{ inputs.warmups }}
           BURN_JEPA_PIPELINE_BENCH_1080P: ${{ inputs.include_1080p }}
           BURN_JEPA_PIPELINE_BENCH_TRACE: ${{ inputs.trace }}
+          BURN_JEPA_PIPELINE_BENCH_DENSE_PATCHIFY: "0"
           BURN_JEPA_PIPELINE_CUDA_FORCE: ${{ inputs.force_cuda }}
+          BURN_JEPA_PIPELINE_JEPA_BACKENDS: sparse-patchify-cuda
         run: |
           cargo bench --bench autogaze_sparse_jepa_pipeline \
-            --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
+            --no-default-features --features ndarray,autogaze-ndarray,autogaze-cuda,sparse-patchify-cuda,cuda
           rows="$(awk 'END { print NR }' "$BURN_JEPA_PIPELINE_BENCH_OUT")"
           if [ "$rows" -le 1 ]; then
             echo "CUDA benchmark produced no data rows" >&2

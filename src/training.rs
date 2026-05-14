@@ -1,40 +1,25 @@
-use crate::{SparseTokenMask, VJepa2_1Model};
-use anyhow::Result;
-use burn::tensor::Tensor;
-use burn::tensor::backend::{AutodiffBackend, Backend};
+mod batch;
+mod config;
+mod dense;
+mod mask;
+mod model_io;
+mod report;
+mod ttt;
 
-#[derive(Debug)]
-pub struct DensePredictiveLoss<B: Backend> {
-    pub loss: Tensor<B, 1>,
-    pub predictions: Tensor<B, 3>,
-    pub targets: Tensor<B, 3>,
-}
-
-#[derive(Debug)]
-pub struct VJepaTrainingBatch<B: Backend> {
-    pub video: Tensor<B, 5>,
-    pub context_mask: SparseTokenMask,
-    pub target_mask: SparseTokenMask,
-}
-
-pub fn dense_predictive_loss<B: Backend>(
-    predictions: Tensor<B, 3>,
-    targets: Tensor<B, 3>,
-) -> DensePredictiveLoss<B> {
-    let loss = (predictions.clone() - targets.clone())
-        .powf_scalar(2.0)
-        .mean();
-    DensePredictiveLoss {
-        loss,
-        predictions,
-        targets,
-    }
-}
-
-impl<B: AutodiffBackend> VJepa2_1Model<B> {
-    pub fn training_loss(&self, batch: VJepaTrainingBatch<B>) -> Result<DensePredictiveLoss<B>> {
-        let dense =
-            self.predict_dense_targets(batch.video, &batch.context_mask, &batch.target_mask)?;
-        Ok(dense_predictive_loss(dense.predictions, dense.targets))
-    }
-}
+pub use config::{
+    BurnJepaTrainConfig, JepaTrainBackend, TrainModelConfig, TrainingBatchingMode,
+    TrainingLoopConfig, TttDistillationConfig, TttSparsePatchifyTrainingMode, TttSparseRolloutMode,
+};
+pub use dense::{DensePredictiveLoss, VJepaTrainingBatch, dense_predictive_loss, train_dense_jepa};
+pub use mask::{
+    TrainingAutogazeTokenSource, TrainingImageTokenGrid, TrainingMaskConfig,
+    center_prior_frame_tokens,
+};
+pub use report::{
+    DenseJepaTrainingReport, TttBackpropMetrics, TttDomainEvalMetric, TttEvalReport,
+    TttRolloutMetrics, TttRolloutReportMode, TttTrainingReport,
+};
+pub use ttt::{
+    TttDistillationLoss, TttSparsePatchifyTrainingBackend, evaluate_ttt_distillation,
+    evaluate_ttt_model_file, train_ttt_distillation,
+};

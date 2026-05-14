@@ -4,7 +4,9 @@ use burn::module::Param;
 use burn::nn::Linear;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
-use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore};
+use burn_store::{
+    ApplyResult, ModuleSnapshot, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore,
+};
 use safetensors::{Dtype, SafeTensors};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -76,9 +78,27 @@ impl VJepaLoadOptions {
                 if self.upstream_vjepa21_names {
                     store = apply_upstream_key_remapping_pytorch(store);
                 }
-                model
+                let result = model
                     .load_from(&mut store)
-                    .with_context(|| format!("load weights from {}", weights_path.display()))?
+                    .with_context(|| format!("load weights from {}", weights_path.display()))?;
+                if self.upstream_vjepa21_names
+                    && self.pytorch_top_level_key.is_none()
+                    && result.applied.is_empty()
+                {
+                    load_nested_upstream_vjepa21_pytorch(
+                        &mut model,
+                        &weights_path,
+                        self.allow_partial,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "load nested upstream V-JEPA checkpoint from {}",
+                            weights_path.display()
+                        )
+                    })?
+                } else {
+                    result
+                }
             }
             _ => {
                 let mut store = SafetensorsStore::from_file(&weights_path)
@@ -131,6 +151,57 @@ impl VJepaLoadOptions {
         }
         Ok((model, config, report))
     }
+}
+
+fn load_nested_upstream_vjepa21_pytorch<B: Backend>(
+    model: &mut VJepa2_1Model<B>,
+    weights_path: &Path,
+    allow_partial: bool,
+) -> Result<ApplyResult> {
+    let mut encoder_store = PytorchStore::from_file(weights_path)
+        .allow_partial(true)
+        .with_top_level_key("ema_encoder");
+    encoder_store = apply_upstream_nested_encoder_key_remapping_pytorch(encoder_store);
+    let mut result = model
+        .load_from(&mut encoder_store)
+        .context("load upstream ema_encoder")?;
+    if result.applied.is_empty() {
+        let mut encoder_store = PytorchStore::from_file(weights_path)
+            .allow_partial(true)
+            .with_top_level_key("encoder");
+        encoder_store = apply_upstream_nested_encoder_key_remapping_pytorch(encoder_store);
+        result = model
+            .load_from(&mut encoder_store)
+            .context("load upstream encoder")?;
+    }
+    if !allow_partial && !result.missing.is_empty() {
+        bail!(
+            "nested upstream V-JEPA checkpoint did not fully load; missing {} tensors",
+            result.missing.len()
+        );
+    }
+    zero_encoder_modality_embeddings(model);
+    Ok(result)
+}
+
+fn zero_encoder_modality_embeddings<B: Backend>(model: &mut VJepa2_1Model<B>) {
+    // Official nested Meta checkpoints store these as [1, 1, D], while this
+    // port stores [1, D]. Keep skipped modality embeddings deterministic.
+    let video = model.encoder.video_mod_embed.val();
+    let [video_rows, video_dim] = video.shape().dims::<2>();
+    let video_device = video.device();
+    model.encoder.video_mod_embed = Param::from_tensor(Tensor::<B, 2>::zeros(
+        [video_rows, video_dim],
+        &video_device,
+    ));
+
+    let image = model.encoder.image_mod_embed.val();
+    let [image_rows, image_dim] = image.shape().dims::<2>();
+    let image_device = image.device();
+    model.encoder.image_mod_embed = Param::from_tensor(Tensor::<B, 2>::zeros(
+        [image_rows, image_dim],
+        &image_device,
+    ));
 }
 
 fn is_hf_vjepa2_config(config: &VJepaConfig) -> bool {
@@ -457,6 +528,24 @@ fn apply_upstream_key_remapping_pytorch(store: PytorchStore) -> PytorchStore {
         .with_key_remapping(r"^predictor\.layernorm\.", "predictor.norm.")
         .with_key_remapping(r"^predictor\.proj\.", "predictor.target_proj.")
         .with_key_remapping(r"\.attention\.proj\.", ".attn.proj.")
+}
+
+fn apply_upstream_nested_encoder_key_remapping_pytorch(store: PytorchStore) -> PytorchStore {
+    store
+        .with_key_remapping(
+            r"^module\.backbone\.patch_embed_img\.",
+            "encoder.image_patch_embed.",
+        )
+        .with_key_remapping(r"^module\.backbone\.patch_embed\.", "encoder.patch_embed.")
+        .with_key_remapping(r"^module\.backbone\.blocks\.(\d+)\.", "encoder.blocks.$1.")
+        .with_key_remapping(
+            r"^module\.backbone\.norms_block\.(\d+)\.",
+            "encoder.norms_block.$1.",
+        )
+        .with_key_remapping(r"\.norm([12])\.weight$", ".norm$1.gamma")
+        .with_key_remapping(r"\.norm([12])\.bias$", ".norm$1.beta")
+        .with_key_remapping(r"\.norms_block\.(\d+)\.weight$", ".norms_block.$1.gamma")
+        .with_key_remapping(r"\.norms_block\.(\d+)\.bias$", ".norms_block.$1.beta")
 }
 
 pub fn load_config_from_hf_dir(dir: impl AsRef<Path>, name: &str) -> Result<VJepaConfig> {

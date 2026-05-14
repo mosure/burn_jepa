@@ -1,14 +1,14 @@
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
 use crate::SparsePatchifyPlan;
 use crate::{
-    DensePredictionOutput, SparseImageTokenGrid, SparsePredictorPlan, SparseTokenMask,
-    TokenGridShape, VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaPredictor,
-    VJepaPredictorOutput, sparse_mask_from_frame_token_indices,
+    DensePredictionOutput, SparseEncoderPlan, SparseImageTokenGrid, SparsePredictorPlan,
+    SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig, VJepaEncoderOutput,
+    VJepaPredictor, VJepaPredictorOutput, sparse_mask_from_frame_token_indices,
+    target_mask_from_context,
 };
 use anyhow::{Result, ensure};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
-use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TemporalSparseJepaConfig {
@@ -150,6 +150,7 @@ pub struct TemporalSparseJepaStreamOutput<B: Backend> {
     pub temporal: TemporalSparseJepaOutput<B>,
     pub dense_keyframe: Option<VJepaEncoderOutput<B>>,
     pub dense_keyframe_prediction: Option<DensePredictionOutput<B>>,
+    pub reused_encoder_plan: bool,
     pub reused_patchify_plan: bool,
 }
 
@@ -158,7 +159,8 @@ pub struct TemporalSparseJepaStream<B: Backend> {
     config: TemporalSparseJepaStreamConfig,
     mask_state: TemporalSparseMaskState,
     jepa_state: TemporalSparseJepaState<B>,
-    #[cfg(feature = "sparse-patchify-wgpu")]
+    cached_encoder_plan: Option<CachedSparseEncoderPlan<B>>,
+    #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
     cached_patchify_plan: Option<CachedSparsePatchifyPlan<B>>,
 }
 
@@ -168,7 +170,8 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
         Self {
             mask_state: TemporalSparseMaskState::new(config.mask_config()),
             jepa_state: TemporalSparseJepaState::new(config.jepa_config()),
-            #[cfg(feature = "sparse-patchify-wgpu")]
+            cached_encoder_plan: None,
+            #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
             cached_patchify_plan: None,
             config,
         }
@@ -189,6 +192,7 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
     pub fn reset(&mut self) {
         self.mask_state.reset();
         self.jepa_state.reset();
+        self.cached_encoder_plan = None;
         self.reset_patchify_plan();
     }
 
@@ -252,7 +256,15 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
         } else {
             None
         };
-        let context = model.encode_video(video, Some(&masks.context_mask));
+        let device = video.device();
+        let reused_encoder_plan =
+            self.ensure_encoder_plan(model.config(), &masks.context_mask, grid, batch, &device)?;
+        let encoder_plan = &self
+            .cached_encoder_plan
+            .as_ref()
+            .expect("sparse encoder plan should be cached")
+            .plan;
+        let context = model.encode_video_with_plan(video, encoder_plan)?;
         ensure!(
             context.grid == grid,
             "temporal stream encoder grid changed during sparse encode"
@@ -283,11 +295,36 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
             temporal,
             dense_keyframe,
             dense_keyframe_prediction,
+            reused_encoder_plan,
             reused_patchify_plan: false,
         })
     }
 
-    #[cfg(feature = "sparse-patchify-wgpu")]
+    fn ensure_encoder_plan(
+        &mut self,
+        config: &VJepaConfig,
+        context_mask: &SparseTokenMask,
+        grid: TokenGridShape,
+        batch: usize,
+        device: &B::Device,
+    ) -> Result<bool> {
+        if self
+            .cached_encoder_plan
+            .as_ref()
+            .is_some_and(|cached| cached.matches(context_mask, grid, batch))
+        {
+            return Ok(true);
+        }
+        self.cached_encoder_plan = Some(CachedSparseEncoderPlan {
+            plan: SparseEncoderPlan::new(config, context_mask.clone(), grid, batch, true, device)?,
+            context_mask: context_mask.clone(),
+            grid,
+            batch,
+        });
+        Ok(false)
+    }
+
+    #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
     fn ensure_patchify_plan(
         &mut self,
         context_mask: &SparseTokenMask,
@@ -311,16 +348,30 @@ impl<B: Backend> TemporalSparseJepaStream<B> {
         Ok(false)
     }
 
-    #[cfg(feature = "sparse-patchify-wgpu")]
+    #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
     fn reset_patchify_plan(&mut self) {
         self.cached_patchify_plan = None;
     }
 
-    #[cfg(not(feature = "sparse-patchify-wgpu"))]
+    #[cfg(not(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda")))]
     fn reset_patchify_plan(&mut self) {}
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[derive(Debug)]
+struct CachedSparseEncoderPlan<B: Backend> {
+    plan: SparseEncoderPlan<B>,
+    context_mask: SparseTokenMask,
+    grid: TokenGridShape,
+    batch: usize,
+}
+
+impl<B: Backend> CachedSparseEncoderPlan<B> {
+    fn matches(&self, mask: &SparseTokenMask, grid: TokenGridShape, batch: usize) -> bool {
+        self.context_mask == *mask && self.grid == grid && self.batch == batch
+    }
+}
+
+#[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
 #[derive(Debug)]
 struct CachedSparsePatchifyPlan<B: Backend> {
     plan: SparsePatchifyPlan<B>,
@@ -329,7 +380,7 @@ struct CachedSparsePatchifyPlan<B: Backend> {
     batch: usize,
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
 impl<B: Backend> CachedSparsePatchifyPlan<B> {
     fn matches(&self, mask: &SparseTokenMask, grid: TokenGridShape, batch: usize) -> bool {
         self.context_mask == *mask && self.grid == grid && self.batch == batch
@@ -399,14 +450,25 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             None
         };
         let device = video.device();
+        let reused_encoder_plan =
+            self.ensure_encoder_plan(model.config(), &masks.context_mask, grid, batch, &device)?;
         let reused_patchify_plan =
             self.ensure_patchify_plan(&masks.context_mask, grid, batch, &device)?;
-        let plan = &self
+        let patchify_plan = &self
             .cached_patchify_plan
             .as_ref()
             .expect("sparse patchify plan should be cached")
             .plan;
-        let context = model.encode_video_sparse_patchify_wgpu(video, plan)?;
+        let encoder_plan = &self
+            .cached_encoder_plan
+            .as_ref()
+            .expect("sparse encoder plan should be cached")
+            .plan;
+        let context = model.encode_video_sparse_patchify_wgpu_with_plan(
+            video,
+            patchify_plan,
+            encoder_plan,
+        )?;
         ensure!(
             context.grid == grid,
             "temporal stream sparse patchify grid changed during encode"
@@ -437,6 +499,125 @@ impl TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             temporal,
             dense_keyframe,
             dense_keyframe_prediction,
+            reused_encoder_plan,
+            reused_patchify_plan,
+        })
+    }
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+impl TemporalSparseJepaStream<burn_flex_gmm::cuda::DefaultCudaBackend> {
+    pub fn forward_frame_tokens_sparse_patchify_cuda(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        video: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 5>,
+        frame_tokens: &[Vec<usize>],
+        mask_index: usize,
+    ) -> Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        let (batch, grid) = temporal_stream_video_grid(model.config(), video.shape().dims::<5>())?;
+        let masks = self.mask_state.next_from_frame_tokens(
+            grid,
+            model.config().tubelet_size.max(1),
+            self.config.image_grid,
+            frame_tokens,
+        )?;
+        self.forward_sparse_patchified_masks_cuda(model, video, masks, batch, grid, mask_index)
+    }
+
+    pub fn forward_masks_sparse_patchify_cuda(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        video: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 5>,
+        context_mask: SparseTokenMask,
+        target_mask: SparseTokenMask,
+        mask_index: usize,
+    ) -> Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        let (batch, grid) = temporal_stream_video_grid(model.config(), video.shape().dims::<5>())?;
+        let masks = self
+            .mask_state
+            .next_from_masks(grid, context_mask, target_mask)?;
+        self.forward_sparse_patchified_masks_cuda(model, video, masks, batch, grid, mask_index)
+    }
+
+    fn forward_sparse_patchified_masks_cuda(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        video: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 5>,
+        masks: TemporalSparseMaskOutput,
+        batch: usize,
+        grid: TokenGridShape,
+        mask_index: usize,
+    ) -> Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        let dense_keyframe_prediction = if self.config.dense_keyframe_prediction && masks.keyframe {
+            Some(model.predict_dense_targets(
+                video.clone(),
+                &masks.context_mask,
+                &masks.target_mask,
+            )?)
+        } else {
+            None
+        };
+        let dense_keyframe = if self.config.dense_keyframe_refresh && masks.keyframe {
+            let dense = model.encode_video(video.clone(), None);
+            ensure!(
+                dense.grid == grid,
+                "temporal stream dense keyframe grid changed during encode"
+            );
+            Some(dense)
+        } else {
+            None
+        };
+        let device = video.device();
+        let reused_encoder_plan =
+            self.ensure_encoder_plan(model.config(), &masks.context_mask, grid, batch, &device)?;
+        let reused_patchify_plan =
+            self.ensure_patchify_plan(&masks.context_mask, grid, batch, &device)?;
+        let patchify_plan = &self
+            .cached_patchify_plan
+            .as_ref()
+            .expect("sparse patchify plan should be cached")
+            .plan;
+        let encoder_plan = &self
+            .cached_encoder_plan
+            .as_ref()
+            .expect("sparse encoder plan should be cached")
+            .plan;
+        let context = model.encode_video_sparse_patchify_cuda_with_plan(
+            video,
+            patchify_plan,
+            encoder_plan,
+        )?;
+        ensure!(
+            context.grid == grid,
+            "temporal stream sparse patchify grid changed during encode"
+        );
+        ensure!(
+            context.tokens.shape().dims::<3>()[0] == batch,
+            "temporal stream encoder batch changed during sparse patchify encode"
+        );
+        let temporal = self
+            .jepa_state
+            .forward_predictor(TemporalSparsePredictorInput {
+                config: model.config(),
+                predictor: &model.predictor,
+                context_tokens: context.tokens.clone(),
+                context_mask: &masks.context_mask,
+                target_mask: &masks.target_mask,
+                grid: context.grid,
+                mask_index,
+            })?;
+        ensure!(
+            masks.keyframe == temporal.keyframe,
+            "temporal stream mask and predictor keyframe state diverged"
+        );
+
+        Ok(TemporalSparseJepaStreamOutput {
+            masks,
+            context,
+            temporal,
+            dense_keyframe,
+            dense_keyframe_prediction,
+            reused_encoder_plan,
             reused_patchify_plan,
         })
     }
@@ -538,7 +719,7 @@ impl TemporalSparseMaskState {
             context_mask.len() < grid.len(),
             "temporal context mask must leave at least one target token"
         );
-        let target_mask = target_mask_for_context(&context_mask, self.config.target_tokens)?;
+        let target_mask = target_mask_from_context(&context_mask, self.config.target_tokens)?;
         self.step = self.step.saturating_add(1);
         Ok(TemporalSparseMaskOutput {
             context_mask,
@@ -755,34 +936,6 @@ impl<B: Backend> CachedSparseFeatures<B> {
     }
 }
 
-fn target_mask_for_context(
-    context: &SparseTokenMask,
-    target_tokens: usize,
-) -> Result<SparseTokenMask> {
-    let dense_len = context.dense_len();
-    let target_tokens = target_tokens
-        .max(1)
-        .min(dense_len.saturating_sub(context.len()).max(1));
-    let context_set = context.indices().iter().copied().collect::<BTreeSet<_>>();
-    let mut target = SparseTokenMask::evenly_spaced(dense_len, target_tokens)
-        .indices()
-        .iter()
-        .copied()
-        .filter(|index| !context_set.contains(index))
-        .collect::<Vec<_>>();
-    if target.len() < target_tokens {
-        for index in 0..dense_len {
-            if !context_set.contains(&index) && !target.contains(&index) {
-                target.push(index);
-                if target.len() >= target_tokens {
-                    break;
-                }
-            }
-        }
-    }
-    SparseTokenMask::new(target, dense_len)
-}
-
 fn temporal_stream_video_grid(
     config: &VJepaConfig,
     shape: [usize; 5],
@@ -835,12 +988,12 @@ fn validate_temporal_masks(
         !target.is_empty(),
         "temporal target mask must contain at least one token"
     );
-    let context_set = context.indices().iter().copied().collect::<BTreeSet<_>>();
+    let mut context_keep = vec![false; grid.len()];
+    for &index in context.indices() {
+        context_keep[index] = true;
+    }
     ensure!(
-        target
-            .indices()
-            .iter()
-            .all(|index| !context_set.contains(index)),
+        target.indices().iter().all(|&index| !context_keep[index]),
         "temporal context and target masks must not overlap"
     );
     Ok(())

@@ -1,18 +1,20 @@
 use bevy::prelude::*;
 use burn::tensor::Tensor;
-use burn_jepa::{VJepaConfig, VJepaPipeline, make_context_target_masks};
+use burn_jepa::{
+    SparseJepaSparsityDriverConfig, VJepaConfig, VJepaPipeline, resolve_sparsity_driver_masks,
+};
 
 type ExampleBackend = burn::backend::NdArray<f32>;
 
 #[derive(Clone, Debug, Resource)]
 pub struct BevyBurnJepaConfig {
-    pub context_keep_ratio: f32,
+    pub sparsity_driver: SparseJepaSparsityDriverConfig,
 }
 
 impl Default for BevyBurnJepaConfig {
     fn default() -> Self {
         Self {
-            context_keep_ratio: 0.5,
+            sparsity_driver: SparseJepaSparsityDriverConfig::keep_ratio(0.5),
         }
     }
 }
@@ -50,8 +52,13 @@ fn run_sparse_smoke(
     let config = VJepaConfig::tiny_for_tests();
     let pipeline = VJepaPipeline::<ExampleBackend>::random(config.clone(), &device);
     let video = Tensor::<ExampleBackend, 5>::zeros([1, 3, 4, 32, 32], &device);
-    let (context, target) =
-        make_context_target_masks(config.token_grid(), config_resource.context_keep_ratio);
+    let (context, target) = resolve_sparsity_driver_masks(
+        &config_resource.sparsity_driver,
+        &video,
+        &config,
+        config.token_grid(),
+    )
+    .expect("sparse driver masks");
     let output = pipeline
         .model()
         .predict_dense_targets(video, &context, &target)

@@ -1,6 +1,6 @@
 use crate::{
     SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig, VJepaLoadOptions,
-    make_context_target_masks,
+    nodes::{SparseJepaSparsityDriverConfig, resolve_sparsity_driver_masks},
 };
 use anyhow::{Result, anyhow, ensure};
 use burn::tensor::backend::Backend;
@@ -77,7 +77,7 @@ pub struct VJepaEmbedOutput<B: Backend> {
 pub struct VJepaPipeline<B: Backend> {
     model: VJepa2_1Model<B>,
     config: VJepaConfig,
-    context_keep_ratio: f32,
+    sparsity_driver: SparseJepaSparsityDriverConfig,
 }
 
 impl<B: Backend> VJepaPipeline<B> {
@@ -85,7 +85,7 @@ impl<B: Backend> VJepaPipeline<B> {
         Self {
             model,
             config,
-            context_keep_ratio: 0.5,
+            sparsity_driver: SparseJepaSparsityDriverConfig::keep_ratio(0.5),
         }
     }
 
@@ -108,7 +108,12 @@ impl<B: Backend> VJepaPipeline<B> {
     }
 
     pub fn with_context_keep_ratio(mut self, ratio: f32) -> Self {
-        self.context_keep_ratio = ratio.clamp(0.0, 1.0);
+        self.sparsity_driver = SparseJepaSparsityDriverConfig::keep_ratio(ratio.clamp(0.0, 1.0));
+        self
+    }
+
+    pub fn with_sparsity_driver(mut self, driver: SparseJepaSparsityDriverConfig) -> Self {
+        self.sparsity_driver = driver;
         self
     }
 
@@ -145,7 +150,8 @@ impl<B: Backend> VJepaPipeline<B> {
         video: Tensor<B, 5>,
     ) -> Result<crate::DensePredictionOutput<B>> {
         let grid = grid_for_video(&video, &self.config);
-        let (context, target) = make_context_target_masks(grid, self.context_keep_ratio);
+        let (context, target) =
+            resolve_sparsity_driver_masks(&self.sparsity_driver, &video, &self.config, grid)?;
         self.model.predict_dense_targets(video, &context, &target)
     }
 

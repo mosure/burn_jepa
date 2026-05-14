@@ -25,9 +25,13 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["ndarray", "webgpu"]
 ndarray = ["burn/ndarray"]
-webgpu = ["burn/webgpu", "burn_autogaze/webgpu"]
+webgpu = ["burn/webgpu"]
 wgpu = ["burn/wgpu", "burn-store/wgpu"]
-cuda = ["burn/cuda", "burn-store/cuda", "burn_autogaze/cuda"]
+cuda = ["burn/cuda", "burn-store/cuda"]
+autogaze = ["dep:burn_autogaze"]
+autogaze-ndarray = ["autogaze", "burn_autogaze/ndarray"]
+autogaze-webgpu = ["autogaze", "burn_autogaze/webgpu"]
+autogaze-cuda = ["autogaze", "burn_autogaze/cuda"]
 wasm = [
   "webgpu",
   "dep:console_error_panic_hook",
@@ -37,17 +41,36 @@ wasm = [
   "dep:web-sys",
 ]
 bevy-web-demo = ["wasm"]
-sparse-patchify-wgpu = ["dep:burn_flex_gmm", "burn_flex_gmm/wgpu-kernel"]
+sparse-patchify-wgpu = ["wgpu", "dep:burn_flex_gmm", "burn_flex_gmm/wgpu-kernel"]
+sparse-patchify-cuda = [
+  "cuda",
+  "dep:burn-backend",
+  "dep:burn-fusion",
+  "dep:burn-ir",
+  "dep:burn_flex_gmm",
+  "burn_flex_gmm/cuda-kernel",
+]
 
 [dependencies]
 anyhow = "1"
-burn = { version = "0.21.0", default-features = false, features = ["fusion", "std"] }
+burn = { version = "0.21.0", default-features = false, features = ["autodiff", "fusion", "std"] }
+burn-backend = { version = "0.21.0", default-features = false, optional = true }
+burn-fusion = { version = "0.21.0", default-features = false, optional = true }
+burn-ir = { version = "0.21.0", default-features = false, optional = true }
 burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
-burn_flex_gmm = { version = "0.21.0", default-features = false, optional = true }
+burn_autogaze = { version = "0.21.5", default-features = false, optional = true }
+burn_flex_gmm = { version = "0.21.1", default-features = false, optional = true }
+clap = { version = "4.6", features = ["derive"] }
 half = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 safetensors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.9"
+
+[[bin]]
+name = "burn-jepa"
+path = "src/bin/burn-jepa.rs"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { version = "0.1", optional = true }
@@ -61,7 +84,6 @@ optional = true
 features = ["console"]
 
 [dev-dependencies]
-burn_autogaze = { version = "0.21.2", default-features = false, features = ["ndarray"] }
 criterion = "0.8.2"
 tempfile = "3"
 
@@ -72,7 +94,11 @@ harness = false
 [[bench]]
 name = "autogaze_sparse_jepa_pipeline"
 harness = false
-required-features = ["ndarray", "sparse-patchify-wgpu"]
+required-features = ["autogaze"]
+
+[[bench]]
+name = "ttt_training"
+harness = false
 
 [profile.dev]
 opt-level = 3

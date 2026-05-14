@@ -1,0 +1,241 @@
+use crate::TttBackpropMode;
+use anyhow::{Context, Result};
+use burn::tensor::Tensor;
+use burn::tensor::backend::Backend;
+use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttStepMetric {
+    pub step: usize,
+    pub loss: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttMemoryMetrics {
+    pub layers: Vec<usize>,
+    pub embed_dim: usize,
+    pub batch_size: usize,
+    pub chunk_tokens: usize,
+    pub ttt_lr: f32,
+    pub fast_weight_elements: usize,
+    pub fast_weight_bytes_f32: usize,
+    pub trainable_param_elements: usize,
+    pub trainable_param_bytes_f32: usize,
+    pub adam_state_bytes_f32: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttMaskMetrics {
+    pub context_tokens: usize,
+    pub target_tokens: usize,
+    pub dense_tokens: usize,
+    pub context_density: f32,
+    pub target_density: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttBackpropMetrics {
+    pub mode: TttBackpropMode,
+    pub truncate_blocks: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TttStageMetrics {
+    pub mask_ms: u128,
+    pub teacher_forward_ms: u128,
+    pub student_forward_ms: u128,
+    pub loss_ms: u128,
+    pub backward_ms: u128,
+    pub optimizer_ms: u128,
+    pub backward_optim_ms: u128,
+    pub teacher_cache_hits: usize,
+    pub teacher_cache_misses: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttDomainEvalMetric {
+    pub domain: String,
+    pub samples: usize,
+    pub loss: f64,
+    pub cosine: f64,
+    pub full_loss: Option<f64>,
+    pub full_cosine: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TttRolloutReportMode {
+    Dense,
+    SparseContext,
+    SparseTarget,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttRolloutMetrics {
+    pub mode: TttRolloutReportMode,
+    pub dense_tokens: usize,
+    pub student_tokens: usize,
+    pub student_token_density: f32,
+    pub full_grid_eval: bool,
+    pub autodiff_sparse_patchify: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttTrainingReport {
+    pub steps: usize,
+    pub samples: usize,
+    pub initial_loss: f64,
+    pub best_loss: f64,
+    pub final_loss: f64,
+    pub loss_trace: Vec<TttStepMetric>,
+    pub memory: TttMemoryMetrics,
+    pub mask: Option<TttMaskMetrics>,
+    pub rollout: TttRolloutMetrics,
+    pub backprop: TttBackpropMetrics,
+    pub pre_train_eval_loss: Option<f64>,
+    pub pre_train_eval_cosine: Option<f64>,
+    pub pre_train_full_eval_loss: Option<f64>,
+    pub pre_train_full_eval_cosine: Option<f64>,
+    pub eval_loss: Option<f64>,
+    pub eval_cosine: Option<f64>,
+    pub eval_full_loss: Option<f64>,
+    pub eval_full_cosine: Option<f64>,
+    pub eval_samples: usize,
+    pub train_stage: TttStageMetrics,
+    pub eval_stage: TttStageMetrics,
+    pub eval_domains: Vec<TttDomainEvalMetric>,
+    pub train_elapsed_ms: u128,
+    pub eval_elapsed_ms: u128,
+    pub elapsed_ms: u128,
+    pub samples_per_second: f64,
+    pub model_path: Option<PathBuf>,
+    pub report_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttEvalReport {
+    pub model_path: PathBuf,
+    pub eval_steps: usize,
+    pub eval_samples: usize,
+    pub loss: f64,
+    pub cosine: f64,
+    pub full_loss: Option<f64>,
+    pub full_cosine: Option<f64>,
+    pub memory: TttMemoryMetrics,
+    pub mask: Option<TttMaskMetrics>,
+    pub rollout: TttRolloutMetrics,
+    pub stage: TttStageMetrics,
+    pub domains: Vec<TttDomainEvalMetric>,
+    pub elapsed_ms: u128,
+    pub samples_per_second: f64,
+    pub report_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DenseJepaTrainingReport {
+    pub steps: usize,
+    pub samples: usize,
+    pub final_loss: f64,
+    pub elapsed_ms: u128,
+    pub samples_per_second: f64,
+    pub model_path: Option<PathBuf>,
+    pub report_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TrainingLossSummary {
+    pub initial: Option<f64>,
+    pub best: Option<f64>,
+    pub final_loss: f64,
+}
+
+impl TrainingLossSummary {
+    pub(super) fn dense(final_loss: f64) -> Self {
+        Self {
+            initial: None,
+            best: None,
+            final_loss,
+        }
+    }
+
+    pub(super) fn ttt(initial: Option<f64>, best: f64, final_loss: f64) -> Self {
+        Self {
+            initial,
+            best: Some(best),
+            final_loss,
+        }
+    }
+}
+
+pub(super) fn tensor_scalar<B: Backend>(tensor: Tensor<B, 1>) -> Result<f64> {
+    let values = tensor
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .context("read scalar tensor")?;
+    Ok(values.first().copied().unwrap_or_default() as f64)
+}
+
+pub(super) fn samples_per_second(samples: usize, elapsed_ms: u128) -> f64 {
+    if elapsed_ms == 0 {
+        samples as f64
+    } else {
+        samples as f64 / (elapsed_ms as f64 / 1000.0)
+    }
+}
+
+pub(super) fn save_training_report(
+    output_dir: &Path,
+    name: &str,
+    steps: usize,
+    samples: usize,
+    loss: TrainingLossSummary,
+    elapsed_ms: u128,
+    model_path: Option<PathBuf>,
+) -> Result<PathBuf> {
+    #[derive(Serialize)]
+    struct Report<'a> {
+        steps: usize,
+        samples: usize,
+        initial_loss: Option<f64>,
+        best_loss: Option<f64>,
+        final_loss: f64,
+        eval_loss: Option<f64>,
+        eval_cosine: Option<f64>,
+        eval_samples: usize,
+        elapsed_ms: u128,
+        samples_per_second: f64,
+        model_path: Option<&'a Path>,
+    }
+
+    let report = Report {
+        steps,
+        samples,
+        initial_loss: loss.initial,
+        best_loss: loss.best,
+        final_loss: loss.final_loss,
+        eval_loss: None,
+        eval_cosine: None,
+        eval_samples: 0,
+        elapsed_ms,
+        samples_per_second: samples_per_second(samples, elapsed_ms),
+        model_path: model_path.as_deref(),
+    };
+    let path = output_dir.join(name);
+    fs::write(&path, serde_json::to_string_pretty(&report)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+pub(super) fn save_ttt_training_report(
+    output_dir: &Path,
+    name: &str,
+    report: &TttTrainingReport,
+) -> Result<PathBuf> {
+    let path = output_dir.join(name);
+    fs::write(&path, serde_json::to_string_pretty(report)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}

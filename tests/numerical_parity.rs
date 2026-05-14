@@ -120,6 +120,42 @@ fn sparse_forward_hot_path_has_no_backend_readbacks() {
 }
 
 #[test]
+fn cached_sparse_forward_paths_do_not_rebuild_position_tensors() {
+    let model_source = include_str!("../src/model.rs");
+    let temporal_source = include_str!("../src/temporal.rs");
+    let encoder_hot_path = source_between(
+        model_source,
+        "pub fn forward_sparse_tokens_with_plan",
+        "#[cfg(feature = \"sparse-patchify-wgpu\")]",
+    );
+    let predictor_hot_path = source_between(
+        model_source,
+        "pub fn forward_sparse_with_plan",
+        "#[derive(Debug)]\npub struct DensePredictionOutput",
+    );
+    let temporal_wgpu_hot_path = source_between(
+        temporal_source,
+        "fn forward_sparse_patchified_masks",
+        "}\n}\n\n#[derive(Clone, Copy, Debug, PartialEq)]\npub struct TemporalSparseMaskConfig",
+    );
+
+    for (label, source) in [
+        ("encoder sparse plan path", encoder_hot_path),
+        ("predictor sparse plan path", predictor_hot_path),
+        ("temporal WGPU sparse patchify path", temporal_wgpu_hot_path),
+    ] {
+        assert!(
+            !source.contains("TensorData::new"),
+            "{label} should use cached backend tensors instead of rebuilding TensorData"
+        );
+        assert!(
+            !source.contains("position_tensor::<"),
+            "{label} should use cached sparse positional tensors"
+        );
+    }
+}
+
+#[test]
 fn tiny_safetensors_loader_round_trips_burn_weights() {
     let device = Default::default();
     let config = parity_config();
@@ -527,6 +563,17 @@ fn test_target_mask_for_context(
         .take(target_tokens.max(1))
         .collect::<Vec<_>>();
     SparseTokenMask::new(target, context.dense_len()).expect("target mask")
+}
+
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let source = source
+        .split(start)
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing source marker {start}"));
+    source
+        .split(end)
+        .next()
+        .unwrap_or_else(|| panic!("missing source marker {end}"))
 }
 
 fn env_bool(name: &str) -> bool {

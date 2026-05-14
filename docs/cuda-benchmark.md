@@ -19,9 +19,11 @@ The workflow runs:
 cargo check --no-default-features --features cuda
 
 BURN_JEPA_PIPELINE_AUTOGAZE_BACKENDS=cuda \
+BURN_JEPA_PIPELINE_JEPA_BACKENDS=sparse-patchify-cuda \
 BURN_JEPA_PIPELINE_BENCH_TRACE=0 \
+BURN_JEPA_PIPELINE_BENCH_DENSE_PATCHIFY=0 \
 cargo bench --bench autogaze_sparse_jepa_pipeline \
-  --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
+  --no-default-features --features ndarray,autogaze-ndarray,autogaze-cuda,sparse-patchify-cuda,cuda
 ```
 
 The workflow uploads `target/cuda-benchmark/autogaze_sparse_jepa_cuda.csv` as
@@ -33,22 +35,26 @@ For a local CUDA machine, the equivalent command is:
 
 ```sh
 BURN_JEPA_PIPELINE_AUTOGAZE_BACKENDS=cuda \
+BURN_JEPA_PIPELINE_JEPA_BACKENDS=sparse-patchify-cuda \
 BURN_JEPA_PIPELINE_BENCH_REPS=3 \
 BURN_JEPA_PIPELINE_BENCH_WARMUPS=1 \
 BURN_JEPA_PIPELINE_BENCH_1080P=false \
 BURN_JEPA_PIPELINE_BENCH_TRACE=0 \
+BURN_JEPA_PIPELINE_BENCH_DENSE_PATCHIFY=0 \
 BURN_JEPA_PIPELINE_BENCH_OUT=target/cuda-benchmark/autogaze_sparse_jepa_cuda.csv \
 cargo bench --bench autogaze_sparse_jepa_pipeline \
-  --no-default-features --features ndarray,sparse-patchify-wgpu,cuda
+  --no-default-features --features ndarray,autogaze-ndarray,autogaze-cuda,sparse-patchify-cuda,cuda
 ```
 
 Before accepting the result, verify that:
 
 - `nvidia-smi -L` lists at least one device.
 - `/dev/nvidiactl` or `/dev/nvidia0` exists on Linux.
+- The benchmark process appears in `nvidia-smi` while a live run is active.
 - A forced smoke does not fail with
   `DriverError(CUDA_ERROR_NO_DEVICE, "no CUDA-capable device is detected")`.
 - The CSV has data rows, not just the header.
+- `jepa_backend` is `sparse-patchify-cuda` for end-to-end CUDA sparse patchify.
 - `autogaze_trace_ms` is `0.000` when trace is disabled.
 - `temporal_frames_per_sec` is reported for every requested resolution and
   density row.
@@ -60,3 +66,8 @@ preflight prints both sides of that state when possible:
 `/proc/driver/nvidia is visible`, optional `nvidia-smi -L sees ...` or probe
 failure details, and
 `CUDA runtime cannot open a device without NVIDIA character devices`.
+
+The latest local run on 2026-05-13 used an RTX PRO 6000 Blackwell Workstation
+Edition and produced data rows in
+`target/codex-cuda-live/autogaze_sparse_jepa_cuda_trace_off.csv`; see
+`docs/e2e-benchmark-results.md` for the checked-in CUDA matrix.

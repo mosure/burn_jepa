@@ -2,4 +2,20 @@
 **/*.rs.bk
 node_modules/
 dist/
+pkg/
+.cache/
+.direnv/
+.env
+.env.*
+!.env.example
 .DS_Store
+
+# Generated model/checkpoint artifacts are too large and machine-specific.
+*.ckpt
+*.mpk
+*.npy
+*.npz
+*.onnx
+*.pt
+*.pth
+*.safetensors

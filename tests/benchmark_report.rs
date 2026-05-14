@@ -19,9 +19,13 @@ struct BenchRow {
 fn e2e_benchmark_report_has_required_matrix_and_trace_off_rows() {
     let report = include_str!("../docs/e2e-benchmark-results.md");
     let rows = parse_benchmark_rows(report);
-    assert_eq!(rows.len(), 24, "expected ndarray and webgpu 3x4 matrices");
+    assert_eq!(
+        rows.len(),
+        36,
+        "expected ndarray, webgpu, and cuda 3x4 matrices"
+    );
 
-    let expected_backends = ["ndarray", "webgpu"];
+    let expected_backends = ["ndarray", "webgpu", "cuda"];
     let expected_resolutions = ["224x224", "384x384", "720p"];
     let expected_densities = ["0.0100", "0.0500", "0.1000", "0.2500"];
 
@@ -85,15 +89,16 @@ fn e2e_benchmark_report_has_required_matrix_and_trace_off_rows() {
 }
 
 #[test]
-fn cuda_benchmark_path_documents_blocker_and_rejects_header_only_csv() {
+fn cuda_benchmark_path_documents_runtime_and_rejects_header_only_csv() {
     let report = include_str!("../docs/e2e-benchmark-results.md");
     assert!(report.contains("## CUDA Status"));
-    assert!(report.contains("no defensible CUDA\nFPS rows from this environment"));
-    assert!(report.contains("skipping autogaze-cuda benchmark"));
-    assert!(report.contains("CUDA_ERROR_NO_DEVICE"));
-    assert!(report.contains("nvidia-smi -L probe failed"));
-    assert!(report.contains("/proc/driver/nvidia is visible"));
-    assert!(report.contains("CUDA runtime cannot open a device without NVIDIA character devices"));
+    assert!(report.contains("CUDA is now the fastest measured E2E lane"));
+    assert!(report.contains("## Pure CUDA Sparse Patchify Smoke"));
+    assert!(report.contains("sparse-patchify-cuda | 224x224 | 0.0500"));
+    assert!(report.contains("CUDA training smoke completed successfully"));
+    assert!(report.contains("96/96 CUDA trials"));
+    assert!(report.contains("header-only CSV rejection"));
+    assert!(report.contains("RTX PRO 6000 Blackwell Workstation Edition"));
 
     let runbook = include_str!("../docs/cuda-benchmark.md");
     assert!(runbook.contains("nvidia-smi -L"));
@@ -102,10 +107,12 @@ fn cuda_benchmark_path_documents_blocker_and_rejects_header_only_csv() {
     assert!(runbook.contains("probe\nfailure details"));
     assert!(runbook.contains("CUDA runtime cannot open a device without NVIDIA character devices"));
     assert!(runbook.contains("The CSV has data rows, not just the header."));
+    assert!(runbook.contains("BURN_JEPA_PIPELINE_BENCH_DENSE_PATCHIFY=0"));
     assert!(runbook.contains("autogaze_trace_ms` is `0.000`"));
 
     let workflow_template = include_str!("../docs/workflows/cuda-benchmark.yml");
     assert!(workflow_template.contains("BURN_JEPA_PIPELINE_AUTOGAZE_BACKENDS: cuda"));
+    assert!(workflow_template.contains("BURN_JEPA_PIPELINE_JEPA_BACKENDS: sparse-patchify-cuda"));
     assert!(workflow_template.contains("BURN_JEPA_PIPELINE_BENCH_TRACE"));
     assert!(workflow_template.contains("CUDA benchmark produced no data rows"));
     assert!(workflow_template.contains("if [ \"$rows\" -le 1 ]; then"));
@@ -166,6 +173,96 @@ fn benchmark_trace_config_is_opt_in_and_disabled_path_avoids_tensor_clone() {
 }
 
 #[test]
+fn e2e_benchmark_reuses_library_projection_and_patchify_core() {
+    let bench = include_str!("../benches/autogaze_sparse_jepa_pipeline.rs");
+
+    assert!(
+        bench.contains("project_generated_tokens"),
+        "E2E bench should use the sparse window plan AutoGaze projection helper"
+    );
+    assert!(
+        bench.contains("project_generated_masks"),
+        "E2E bench should use the sparse window plan direct mask projection helper"
+    );
+    let autogaze = include_str!("../src/autogaze.rs");
+    assert!(
+        autogaze.contains("pub fn autogaze_frame_tokens"),
+        "library should keep generated-token readout centralized"
+    );
+    assert!(
+        autogaze.contains("pub fn autogaze_frame_token_pairs"),
+        "library should expose generated-token iteration without frame-token allocation"
+    );
+    assert!(
+        autogaze.contains("pub fn project_autogaze_generated_masks"),
+        "library should expose direct generated-token-to-mask projection"
+    );
+    assert!(
+        bench.contains("sparse_patchify_video_wgpu"),
+        "E2E bench should use the model-owned sparse patchify helper"
+    );
+    assert!(
+        bench.contains("sparse_patchify_video_cuda"),
+        "E2E bench should expose the CUDA sparse patchify helper"
+    );
+    assert!(
+        bench.contains("BURN_JEPA_PIPELINE_JEPA_BACKENDS"),
+        "E2E bench should allow selecting the sparse JEPA backend independently"
+    );
+    assert!(
+        autogaze.contains("autogaze_sparse_top_k_for_context"),
+        "library should keep density-aware AutoGaze top-k selection centralized"
+    );
+    assert!(
+        bench.contains("AutogazeSparseJepaWindowConfig"),
+        "E2E bench should reuse the library sparse window planner"
+    );
+    assert!(
+        autogaze.contains("autogaze_sparse_generation_budget"),
+        "sparse window planning should centralize AutoGaze generation budget selection"
+    );
+    assert!(
+        bench.contains(".generate_streaming("),
+        "E2E bench should measure streaming AutoGaze generation through the shared sparse window plan"
+    );
+    assert!(
+        autogaze.contains("pub fn generate_streaming"),
+        "sparse window planning should expose the shared streaming AutoGaze generation helper"
+    );
+    assert!(
+        !bench.contains("SparsePatchify3dConfig {"),
+        "E2E bench should not duplicate sparse patchify kernel setup"
+    );
+    assert!(
+        !bench.contains("fn generated_frame_tokens"),
+        "E2E bench should not keep local AutoGaze token projection logic"
+    );
+    assert!(
+        !bench.contains(".max_gaze_tokens_each_frame().max("),
+        "E2E bench should not force sparse rows to generate the maximum AutoGaze token budget"
+    );
+    assert!(
+        !bench.contains("fn density_top_k"),
+        "E2E bench should not estimate per-frame AutoGaze top-k from dense V-JEPA tokens directly"
+    );
+
+    let manifest = include_str!("../Cargo.toml");
+    assert!(manifest.contains("burn_autogaze = { version = \"0.21.5\""));
+    assert!(manifest.contains("burn_flex_gmm = { version = \"0.21.1\""));
+    assert!(manifest.contains("sparse-patchify-cuda"));
+    assert!(manifest.contains("autogaze-webgpu"));
+    assert!(manifest.contains("autogaze-cuda"));
+
+    let report = include_str!("../docs/e2e-benchmark-results.md");
+    assert!(report.contains("## 720p Stage Metrics"));
+    assert!(report.contains("Mask project"));
+    assert!(report.contains("Rolling mask stream"));
+    assert!(report.contains("default top-k overfetch is\nnow 1.0"));
+    assert!(report.contains("Rolling AG cached"));
+    assert!(report.contains("Exact-budget top-k"));
+}
+
+#[test]
 fn benchmark_cuda_channel_failure_reports_runtime_diagnostic() {
     let bench = include_str!("../benches/autogaze_sparse_jepa_pipeline.rs");
 
@@ -190,14 +287,24 @@ fn benchmark_cuda_channel_failure_reports_runtime_diagnostic() {
         "CUDA skip diagnostic should point at the runtime/device-node blocker"
     );
 
-    let report = include_str!("../docs/e2e-benchmark-results.md");
-    assert!(report.contains("CUDA worker thread failed before returning results"));
+    let runbook = include_str!("../docs/cuda-benchmark.md");
+    assert!(runbook.contains("CUDA runtime cannot open a device without NVIDIA character devices"));
+    assert!(runbook.contains("CSV has data rows, not just the header"));
 }
 
 fn parse_benchmark_rows(report: &str) -> Vec<BenchRow> {
     report
         .lines()
-        .filter(|line| line.starts_with("| ndarray |") || line.starts_with("| webgpu |"))
+        .filter(|line| {
+            line.starts_with("| ndarray |")
+                || line.starts_with("| webgpu |")
+                || line.starts_with("| cuda |")
+        })
+        .filter(|line| {
+            line.contains("| 224x224 |")
+                || line.contains("| 384x384 |")
+                || line.contains("| 720p |")
+        })
         .map(parse_benchmark_row)
         .collect()
 }

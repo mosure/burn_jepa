@@ -1,29 +1,60 @@
+#[cfg(feature = "autogaze")]
+mod autogaze;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cli;
 mod config;
+pub mod dataset;
+pub mod experiment;
 mod model;
 mod nodes;
 mod pipeline;
 mod positional;
 mod quantization;
+pub mod runtime;
 mod safetensors_io;
 mod sparse_patchify;
 mod temporal;
 mod tokens;
-mod training;
+pub mod training;
+mod ttt;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasm;
 
+#[cfg(feature = "autogaze")]
+pub use autogaze::{
+    AutogazeFrameTokenPairs, AutogazeSparseJepaMasks, AutogazeSparseJepaProjection,
+    AutogazeSparseJepaProjectionConfig, AutogazeSparseJepaWindowConfig,
+    AutogazeSparseJepaWindowPlan, autogaze_frame_token_pairs, autogaze_frame_tokens,
+    autogaze_image_token_grid, autogaze_sparse_context_tokens, autogaze_sparse_generation_budget,
+    autogaze_sparse_top_k_for_context, autogaze_sparse_top_k_for_context_with_overfetch,
+    generate_autogaze_streaming_with_budget, project_autogaze_generated_masks,
+    project_autogaze_generated_tokens,
+};
 pub use config::{
     VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig, VJepaPreprocessConfig,
 };
+pub use dataset::{
+    JepaDataset, JepaDatasetConfig, JepaDatasetKind, JepaManifestRow, JepaSample, JepaSampleKind,
+    JepaSampleMetadata, JepaTensorBatch, ManifestJepaDataset, SyntheticJepaDataset,
+    dataset_from_config, load_jepa_tensor_batch, synthetic_video,
+};
+pub use experiment::{
+    ExperimentConfig, ExperimentDataConfig, ExperimentDataReport, ExperimentMaskPolicy,
+    ExperimentModelVariant, ExperimentPlanReport, ExperimentRunReport, ExperimentSuccessCriteria,
+    ExperimentTrial, ExperimentTrialReport, ExperimentTrialStatus, ExperimentTrialTiming,
+    analyze_experiment, prepare_experiment_data, run_experiment, write_experiment_plan,
+};
 pub use model::{
-    DensePredictionOutput, PatchEmbed2d, PatchEmbed3d, SparsePredictorPlan,
-    SparseVJepaForwardOutput, TokenSequencePosition, TransformerBlock, VJepa2_1Model, VJepaEncoder,
-    VJepaEncoderOutput, VJepaMlp, VJepaPredictor, VJepaPredictorOutput, VJepaSelfAttention,
+    DensePredictionOutput, PatchEmbed2d, PatchEmbed3d, SparseEncoderBatchPlan, SparseEncoderPlan,
+    SparsePredictorPlan, SparseVJepaForwardOutput, TokenSequencePosition, TransformerBlock,
+    VJepa2_1Model, VJepaEncoder, VJepaEncoderOutput, VJepaMlp, VJepaPredictor,
+    VJepaPredictorOutput, VJepaSelfAttention,
 };
 pub use nodes::{
-    FnOutputNode, RgbaVideoInput, SparseJepaInputNode, SparseJepaOutputNode, SparseJepaPacket,
-    SparseJepaTensorPipeline, SparseJepaTensorPipelineConfig, TensorVideoInput, VecOutputNode,
-    empty_rgb_video_shape,
+    FnOutputNode, RgbaVideoInput, SparseJepaAutogazeSparsityConfig, SparseJepaInputNode,
+    SparseJepaOutputNode, SparseJepaPacket, SparseJepaPatchDiffSparsityConfig,
+    SparseJepaSparsityDriverConfig, SparseJepaTensorPipeline, SparseJepaTensorPipelineConfig,
+    TensorVideoInput, VecOutputNode, empty_rgb_video_shape, resolve_sparsity_driver_masks,
 };
 pub use pipeline::{
     VJEPA_IMAGE_MEAN, VJEPA_IMAGE_STD, VJEPA_RESCALE_FACTOR, VJepaEmbedOutput, VJepaPipeline,
@@ -41,8 +72,9 @@ pub use safetensors_io::{
     load_config_from_hf_dir,
 };
 pub use sparse_patchify::{
-    SparseImageTokenGrid, SparsePatchRect, SparsePatchifyPlan, sparse_mask_from_frame_rects,
-    sparse_mask_from_frame_token_indices, video_token_grid,
+    SparseImageTokenGrid, SparsePatchRect, SparsePatchifyBatchPlan, SparsePatchifyPlan,
+    sparse_mask_from_frame_rects, sparse_mask_from_frame_token_indices,
+    sparse_mask_from_frame_token_pairs, video_token_grid,
 };
 pub use temporal::{
     TemporalSparseJepaConfig, TemporalSparseJepaOutput, TemporalSparseJepaState,
@@ -51,10 +83,24 @@ pub use temporal::{
     TemporalSparsePredictorInput,
 };
 pub use tokens::{
-    SparseTokenMask, SparseVideoTokens, TokenGridShape, apply_token_mask, complement_indices,
-    dense_token_indices, make_context_target_masks, repeat_token_indices,
+    SparseMaskBatch, SparseTokenMask, SparseVideoTokens, TokenGridShape, apply_mask_batch,
+    apply_token_mask, complement_indices, dense_token_indices, make_context_target_masks,
+    repeat_token_indices, target_mask_from_context,
 };
-pub use training::{DensePredictiveLoss, VJepaTrainingBatch, dense_predictive_loss};
+pub use training::{
+    BurnJepaTrainConfig, DenseJepaTrainingReport, DensePredictiveLoss, JepaTrainBackend,
+    TrainModelConfig, TrainingAutogazeTokenSource, TrainingBatchingMode, TrainingImageTokenGrid,
+    TrainingLoopConfig, TrainingMaskConfig, TttBackpropMetrics, TttDistillationConfig,
+    TttDistillationLoss, TttDomainEvalMetric, TttEvalReport, TttRolloutMetrics,
+    TttRolloutReportMode, TttSparsePatchifyTrainingBackend, TttSparsePatchifyTrainingMode,
+    TttSparseRolloutMode, TttTrainingReport, VJepaTrainingBatch, center_prior_frame_tokens,
+    dense_predictive_loss, evaluate_ttt_distillation, evaluate_ttt_model_file, train_dense_jepa,
+    train_ttt_distillation,
+};
+pub use ttt::{
+    TttBackpropMode, TttEncoderConfig, TttLayerState, TttState, TttTargetMode, VJepaTttEncoder,
+    VJepaTttLayer, VJepaTttModel,
+};
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;
 
@@ -81,6 +127,12 @@ pub type SparsePatchifyWgpuVJepaModel = VJepa2_1Model<burn_flex_gmm::wgpu::Defau
 
 #[cfg(feature = "sparse-patchify-wgpu")]
 pub type SparsePatchifyWgpuVJepaPipeline = VJepaPipeline<burn_flex_gmm::wgpu::DefaultWgpuBackend>;
+
+#[cfg(feature = "sparse-patchify-cuda")]
+pub type SparsePatchifyCudaVJepaModel = VJepa2_1Model<burn_flex_gmm::cuda::DefaultCudaBackend>;
+
+#[cfg(feature = "sparse-patchify-cuda")]
+pub type SparsePatchifyCudaVJepaPipeline = VJepaPipeline<burn_flex_gmm::cuda::DefaultCudaBackend>;
 
 #[cfg(feature = "webgpu")]
 pub type WebGpuVJepaModel = VJepa2_1Model<burn::backend::WebGpu<f32, i32>>;

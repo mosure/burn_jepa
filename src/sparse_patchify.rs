@@ -1,8 +1,14 @@
 use crate::positional::{coords_to_token_index, token_index_to_coords};
-use crate::{SparseTokenMask, TokenGridShape, VJepaConfig};
+use crate::{SparseMaskBatch, SparseTokenMask, TokenGridShape, VJepaConfig};
 use anyhow::{Result, ensure};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
+
+#[cfg(feature = "sparse-patchify-cuda")]
+type FusionCudaBackend = burn::backend::Cuda<f32, i32>;
+
+#[cfg(feature = "sparse-patchify-cuda")]
+type RawCudaBackend = burn_flex_gmm::cuda::DefaultCudaBackend;
 
 #[derive(Clone, Debug)]
 pub struct SparsePatchifyPlan<B: Backend> {
@@ -11,6 +17,110 @@ pub struct SparsePatchifyPlan<B: Backend> {
     pub batch: usize,
     pub coords: Tensor<B, 2, Int>,
     pub coords_host: Vec<[u32; 4]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SparsePatchifyBatchPlan<B: Backend> {
+    pub mask: SparseMaskBatch<B>,
+    pub grid: TokenGridShape,
+    pub batch: usize,
+    pub coords: Tensor<B, 2, Int>,
+    pub coords_host: Vec<[u32; 4]>,
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+pub fn sparse_patchify3d_forward_cuda_fusion(
+    config: &burn_flex_gmm::SparsePatchify3dConfig,
+    input: Tensor<FusionCudaBackend, 5>,
+    coords: Tensor<FusionCudaBackend, 2, Int>,
+    weight: Tensor<FusionCudaBackend, 5>,
+    bias: Tensor<FusionCudaBackend, 1>,
+) -> Tensor<FusionCudaBackend, 2> {
+    use burn::tensor::Tensor as BurnTensor;
+    use burn_backend::{DType, Shape, TensorPrimitive};
+    use burn_fusion::stream::{Operation, OperationStreams};
+    use burn_ir::{CustomOpIr, OperationIr, OperationOutput, TensorIr, TensorStatus};
+
+    #[derive(Debug)]
+    struct SparsePatchifyCudaFusionOp {
+        config: burn_flex_gmm::SparsePatchify3dConfig,
+        desc: CustomOpIr,
+    }
+
+    impl Operation<<RawCudaBackend as burn_fusion::FusionBackend>::FusionRuntime>
+        for SparsePatchifyCudaFusionOp
+    {
+        fn execute(
+            &self,
+            handles: &mut burn_ir::HandleContainer<
+                burn_fusion::FusionHandle<
+                    <RawCudaBackend as burn_fusion::FusionBackend>::FusionRuntime,
+                >,
+            >,
+        ) {
+            let (inputs, outputs) = self.desc.as_fixed::<4, 1>();
+            let input = BurnTensor::<RawCudaBackend, 5>::from_primitive(TensorPrimitive::Float(
+                handles.get_float_tensor::<RawCudaBackend>(&inputs[0]),
+            ));
+            let coords = BurnTensor::<RawCudaBackend, 2, Int>::from_primitive(
+                handles.get_int_tensor::<RawCudaBackend>(&inputs[1]),
+            );
+            let weight = BurnTensor::<RawCudaBackend, 5>::from_primitive(TensorPrimitive::Float(
+                handles.get_float_tensor::<RawCudaBackend>(&inputs[2]),
+            ));
+            let bias = BurnTensor::<RawCudaBackend, 1>::from_primitive(TensorPrimitive::Float(
+                handles.get_float_tensor::<RawCudaBackend>(&inputs[3]),
+            ));
+            let output = burn_flex_gmm::cuda::sparse_patchify3d_forward_cuda(
+                &self.config,
+                input,
+                coords,
+                weight,
+                bias,
+            )
+            .expect("sparse patchify CUDA fusion op failed");
+            handles.register_float_tensor::<RawCudaBackend>(
+                &outputs[0].id,
+                output.into_primitive().tensor(),
+            );
+        }
+    }
+
+    let rows = coords.shape().dims::<2>()[0];
+    let input = input.into_primitive().tensor();
+    let coords = coords.into_primitive();
+    let weight = weight.into_primitive().tensor();
+    let bias = bias.into_primitive().tensor();
+    let client = input.client.clone();
+    let streams = OperationStreams::with_inputs([&input, &coords, &weight, &bias]);
+    let inputs = [
+        input.into_ir(),
+        coords.into_ir(),
+        weight.into_ir(),
+        bias.into_ir(),
+    ];
+    let output = TensorIr {
+        status: TensorStatus::NotInit,
+        shape: Shape::new([rows, config.out_channels]),
+        id: client.create_empty_handle(),
+        dtype: DType::F32,
+    };
+    let desc = CustomOpIr::new(
+        "burn_jepa::sparse_patchify3d_forward_cuda",
+        &inputs,
+        std::slice::from_ref(&output),
+    );
+    let output = client
+        .register(
+            streams,
+            OperationIr::Custom(desc.clone()),
+            SparsePatchifyCudaFusionOp {
+                config: *config,
+                desc,
+            },
+        )
+        .output();
+    Tensor::from_primitive(TensorPrimitive::Float(output))
 }
 
 impl<B: Backend> SparsePatchifyPlan<B> {
@@ -56,6 +166,53 @@ impl<B: Backend> SparsePatchifyPlan<B> {
     ) -> Result<Self> {
         let mask = SparseTokenMask::new(indices, grid.len())?;
         Self::new(mask, grid, batch, device)
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.mask.len()
+    }
+
+    pub fn output_rows(&self) -> usize {
+        self.batch * self.mask.len()
+    }
+}
+
+impl<B: Backend> SparsePatchifyBatchPlan<B> {
+    pub fn new(mask: SparseMaskBatch<B>, grid: TokenGridShape, device: &B::Device) -> Result<Self> {
+        ensure!(mask.batch() > 0, "sparse patchify batch must be nonzero");
+        ensure!(
+            mask.dense_len() == grid.len(),
+            "sparse patchify batch mask dense token count must match grid"
+        );
+        let batch = mask.batch();
+        let token_count = mask.len();
+        let rows = mask.rows();
+        let mut coords_host = Vec::with_capacity(batch * token_count);
+        let mut coords_flat = Vec::with_capacity(batch * token_count * 4);
+        for (batch_index, row) in rows.iter().enumerate() {
+            for &index in row {
+                let (tubelet, token_row, col) = token_index_to_coords(index, grid);
+                let coord = [
+                    batch_index as u32,
+                    tubelet as u32,
+                    token_row as u32,
+                    col as u32,
+                ];
+                coords_host.push(coord);
+                coords_flat.extend(coord.into_iter().map(|value| value as i64));
+            }
+        }
+        let coords = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(coords_flat, [batch * token_count, 4]),
+            device,
+        );
+        Ok(Self {
+            mask,
+            grid,
+            batch,
+            coords,
+            coords_host,
+        })
     }
 
     pub fn token_count(&self) -> usize {
@@ -169,6 +326,21 @@ pub fn sparse_mask_from_frame_token_indices(
     dilation: usize,
     keep_tokens: usize,
 ) -> Result<SparseTokenMask> {
+    let pairs = frame_tokens
+        .iter()
+        .enumerate()
+        .flat_map(|(frame, tokens)| tokens.iter().copied().map(move |token| (frame, token)));
+    sparse_mask_from_frame_token_pairs(grid, tubelet_size, image_grid, pairs, dilation, keep_tokens)
+}
+
+pub fn sparse_mask_from_frame_token_pairs(
+    grid: TokenGridShape,
+    tubelet_size: usize,
+    image_grid: SparseImageTokenGrid,
+    frame_tokens: impl IntoIterator<Item = (usize, usize)>,
+    dilation: usize,
+    keep_tokens: usize,
+) -> Result<SparseTokenMask> {
     ensure!(!grid.is_empty(), "sparse patchify grid must be non-empty");
     ensure!(tubelet_size > 0, "tubelet size must be nonzero");
     ensure!(
@@ -176,32 +348,16 @@ pub fn sparse_mask_from_frame_token_indices(
         "sparse image token grid must be non-empty"
     );
     let target = keep_tokens.max(1).min(grid.len());
-    let mut selected = Vec::with_capacity(target);
-    let mut keep = vec![false; grid.len()];
+    let mut builder = SparseMaskSelectionBuilder::new(grid, target);
 
-    for tubelet in 0..grid.depth {
-        let start = tubelet * tubelet_size;
-        if start >= frame_tokens.len() {
-            break;
+    for (frame, token) in frame_tokens {
+        let tubelet = frame / tubelet_size;
+        if tubelet >= grid.depth {
+            continue;
         }
-        let end = ((tubelet + 1) * tubelet_size).min(frame_tokens.len());
-        for tokens in &frame_tokens[start..end] {
-            for &token in tokens {
-                if let Some(rect) = image_grid.token_rect(token) {
-                    push_rect_tokens_limited(
-                        rect,
-                        tubelet,
-                        grid,
-                        dilation,
-                        target,
-                        &mut keep,
-                        &mut selected,
-                    );
-                    if selected.len() >= target {
-                        return SparseTokenMask::new(selected, grid.len());
-                    }
-                }
-            }
+        builder.push_image_token(token, image_grid, tubelet, dilation);
+        if builder.is_full() {
+            return builder.finish();
         }
     }
 
@@ -210,18 +366,18 @@ pub fn sparse_mask_from_frame_token_indices(
         .iter()
         .copied()
     {
-        push_sparse_index_limited(index, target, &mut keep, &mut selected);
-        if selected.len() >= target {
-            return SparseTokenMask::new(selected, grid.len());
+        builder.push_sparse_index(index);
+        if builder.is_full() {
+            return builder.finish();
         }
     }
     for index in 0..grid.len() {
-        push_sparse_index_limited(index, target, &mut keep, &mut selected);
-        if selected.len() >= target {
+        builder.push_sparse_index(index);
+        if builder.is_full() {
             break;
         }
     }
-    SparseTokenMask::new(selected, grid.len())
+    builder.finish()
 }
 
 pub fn sparse_mask_from_frame_rects(
@@ -259,63 +415,101 @@ pub fn sparse_mask_from_frame_rects(
     SparseTokenMask::new(indices, grid.len())
 }
 
-fn push_rect_tokens_limited(
-    rect: SparsePatchRect,
-    tubelet: usize,
+fn image_token_patch_bounds(
+    token: usize,
+    image_grid: SparseImageTokenGrid,
     grid: TokenGridShape,
-    dilation: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if image_grid.is_empty() || token >= image_grid.len() || grid.height == 0 || grid.width == 0 {
+        return None;
+    }
+    let image_row = token / image_grid.width;
+    let image_col = token % image_grid.width;
+    let row_start = image_row * grid.height / image_grid.height;
+    let row_end = ((image_row + 1) * grid.height)
+        .div_ceil(image_grid.height)
+        .saturating_sub(1)
+        .min(grid.height - 1);
+    let col_start = image_col * grid.width / image_grid.width;
+    let col_end = ((image_col + 1) * grid.width)
+        .div_ceil(image_grid.width)
+        .saturating_sub(1)
+        .min(grid.width - 1);
+    Some((row_start, row_end, col_start, col_end))
+}
+
+#[derive(Debug)]
+struct SparseMaskSelectionBuilder {
+    grid: TokenGridShape,
     target: usize,
-    keep: &mut [bool],
-    selected: &mut Vec<usize>,
-) {
-    let Some((row_start, row_end, col_start, col_end)) = rect_patch_bounds(rect, grid) else {
-        return;
-    };
-    let row_start = row_start.saturating_sub(dilation);
-    let row_end = (row_end + dilation).min(grid.height.saturating_sub(1));
-    let col_start = col_start.saturating_sub(dilation);
-    let col_end = (col_end + dilation).min(grid.width.saturating_sub(1));
-    for row in row_start..=row_end {
-        for col in col_start..=col_end {
-            let index = coords_to_token_index(tubelet, row, col, grid);
-            push_sparse_index_limited(index, target, keep, selected);
-            if selected.len() >= target {
-                return;
+    keep: Vec<bool>,
+    selected: Vec<usize>,
+}
+
+impl SparseMaskSelectionBuilder {
+    fn new(grid: TokenGridShape, target: usize) -> Self {
+        Self {
+            grid,
+            target,
+            keep: vec![false; grid.len()],
+            selected: Vec::with_capacity(target),
+        }
+    }
+
+    fn push_image_token(
+        &mut self,
+        token: usize,
+        image_grid: SparseImageTokenGrid,
+        tubelet: usize,
+        dilation: usize,
+    ) {
+        let Some((row_start, row_end, col_start, col_end)) =
+            image_token_patch_bounds(token, image_grid, self.grid)
+        else {
+            return;
+        };
+        self.push_patch_bounds(row_start, row_end, col_start, col_end, tubelet, dilation);
+    }
+
+    fn push_patch_bounds(
+        &mut self,
+        row_start: usize,
+        row_end: usize,
+        col_start: usize,
+        col_end: usize,
+        tubelet: usize,
+        dilation: usize,
+    ) {
+        let row_start = row_start.saturating_sub(dilation);
+        let row_end = (row_end + dilation).min(self.grid.height.saturating_sub(1));
+        let col_start = col_start.saturating_sub(dilation);
+        let col_end = (col_end + dilation).min(self.grid.width.saturating_sub(1));
+        for row in row_start..=row_end {
+            for col in col_start..=col_end {
+                let index = coords_to_token_index(tubelet, row, col, self.grid);
+                self.push_sparse_index(index);
+                if self.is_full() {
+                    return;
+                }
             }
         }
     }
-}
 
-fn push_sparse_index_limited(
-    index: usize,
-    target: usize,
-    keep: &mut [bool],
-    selected: &mut Vec<usize>,
-) {
-    if selected.len() >= target || index >= keep.len() || keep[index] {
-        return;
+    fn push_sparse_index(&mut self, index: usize) {
+        if self.is_full() || index >= self.keep.len() || self.keep[index] {
+            return;
+        }
+        self.keep[index] = true;
+        self.selected.push(index);
     }
-    keep[index] = true;
-    selected.push(index);
-}
 
-fn rect_patch_bounds(
-    rect: SparsePatchRect,
-    grid: TokenGridShape,
-) -> Option<(usize, usize, usize, usize)> {
-    let rect = rect.normalized();
-    if rect.x1 <= rect.x0 || rect.y1 <= rect.y0 || grid.height == 0 || grid.width == 0 {
-        return None;
+    fn is_full(&self) -> bool {
+        self.selected.len() >= self.target
     }
-    let col_start = ((rect.x0 * grid.width as f32).floor() as usize).min(grid.width - 1);
-    let row_start = ((rect.y0 * grid.height as f32).floor() as usize).min(grid.height - 1);
-    let col_end = ((rect.x1 * grid.width as f32).ceil() as usize)
-        .saturating_sub(1)
-        .min(grid.width - 1);
-    let row_end = ((rect.y1 * grid.height as f32).ceil() as usize)
-        .saturating_sub(1)
-        .min(grid.height - 1);
-    Some((row_start, row_end, col_start, col_end))
+
+    fn finish(self) -> Result<SparseTokenMask> {
+        SparseTokenMask::new(self.selected, self.grid.len())
+    }
 }
 
 fn mark_dilated(
@@ -402,6 +596,20 @@ mod tests {
             .expect("mask");
 
         assert_eq!(mask.indices(), &[2, 3, 6, 7]);
+    }
+
+    #[test]
+    fn sparse_mask_from_frame_token_pairs_matches_grouped_tokens() {
+        let grid = TokenGridShape::new(2, 4, 4);
+        let image_grid = SparseImageTokenGrid::new(2, 2);
+        let frame_tokens = vec![vec![], vec![1], vec![2], vec![]];
+        let grouped =
+            sparse_mask_from_frame_token_indices(grid, 2, image_grid, &frame_tokens, 0, 4)
+                .expect("grouped mask");
+        let pairs = sparse_mask_from_frame_token_pairs(grid, 2, image_grid, [(1, 1), (2, 2)], 0, 4)
+            .expect("pair mask");
+
+        assert_eq!(pairs, grouped);
     }
 
     #[test]

@@ -59,18 +59,19 @@ impl SparseTokenMask {
     }
 
     pub fn evenly_spaced(dense_len: usize, keep: usize) -> Self {
+        let indices = Self::evenly_spaced_indices(dense_len, keep);
+        Self::new(indices, dense_len).expect("generated mask is valid")
+    }
+
+    pub fn evenly_spaced_indices(dense_len: usize, keep: usize) -> Vec<usize> {
         let keep = keep.max(1).min(dense_len.max(1));
         if keep == dense_len {
-            return Self {
-                indices: (0..dense_len).collect(),
-                dense_len,
-            };
+            return (0..dense_len).collect();
         }
         let last = dense_len.saturating_sub(1);
-        let indices = (0..keep)
+        (0..keep)
             .map(|i| ((i * last) + (keep / 2)) / keep.max(1))
-            .collect();
-        Self::new(indices, dense_len).expect("generated mask is valid")
+            .collect()
     }
 
     pub fn all(dense_len: usize) -> Self {
@@ -118,6 +119,146 @@ impl SparseTokenMask {
 }
 
 #[derive(Clone, Debug)]
+pub enum SparseMaskBatch<B: Backend> {
+    Uniform {
+        mask: SparseTokenMask,
+        indices: Tensor<B, 2, Int>,
+        batch: usize,
+    },
+    FixedWidth {
+        rows: Vec<Vec<usize>>,
+        dense_len: usize,
+        indices: Tensor<B, 2, Int>,
+    },
+}
+
+impl<B: Backend> SparseMaskBatch<B> {
+    pub fn uniform(mask: SparseTokenMask, batch: usize, device: &B::Device) -> Result<Self> {
+        ensure!(batch > 0, "sparse mask batch must be non-empty");
+        let indices = mask.to_tensor::<B>(batch, device);
+        Ok(Self::Uniform {
+            mask,
+            indices,
+            batch,
+        })
+    }
+
+    pub fn fixed_width(
+        rows: Vec<Vec<usize>>,
+        dense_len: usize,
+        device: &B::Device,
+    ) -> Result<Self> {
+        ensure!(dense_len > 0, "dense token count must be nonzero");
+        ensure!(!rows.is_empty(), "sparse mask batch must be non-empty");
+        let width = rows[0].len();
+        ensure!(width > 0, "fixed-width sparse mask rows must be non-empty");
+        ensure!(
+            rows.iter().all(|row| row.len() == width),
+            "fixed-width sparse mask rows must have equal lengths"
+        );
+        let mut normalized = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            row.sort_unstable();
+            row.dedup();
+            ensure!(
+                row.len() == width,
+                "fixed-width sparse mask row contains duplicate indices"
+            );
+            ensure!(
+                row.iter().all(|&index| index < dense_len),
+                "sparse token index outside dense token range"
+            );
+            normalized.push(row);
+        }
+        let values = normalized
+            .iter()
+            .flat_map(|row| row.iter().map(|&index| index as i64))
+            .collect::<Vec<_>>();
+        let indices = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(values, [normalized.len(), width]),
+            device,
+        );
+        Ok(Self::FixedWidth {
+            rows: normalized,
+            dense_len,
+            indices,
+        })
+    }
+
+    pub fn from_rows(rows: Vec<Vec<usize>>, dense_len: usize, device: &B::Device) -> Result<Self> {
+        ensure!(!rows.is_empty(), "sparse mask batch must be non-empty");
+        if rows.iter().all(|row| row == &rows[0]) {
+            return Self::uniform(
+                SparseTokenMask::new(rows[0].clone(), dense_len)?,
+                rows.len(),
+                device,
+            );
+        }
+        Self::fixed_width(rows, dense_len, device)
+    }
+
+    pub fn batch(&self) -> usize {
+        match self {
+            Self::Uniform { batch, .. } => *batch,
+            Self::FixedWidth { rows, .. } => rows.len(),
+        }
+    }
+
+    pub fn dense_len(&self) -> usize {
+        match self {
+            Self::Uniform { mask, .. } => mask.dense_len(),
+            Self::FixedWidth { dense_len, .. } => *dense_len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Uniform { mask, .. } => mask.len(),
+            Self::FixedWidth { rows, .. } => rows[0].len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_uniform(&self) -> bool {
+        matches!(self, Self::Uniform { .. })
+    }
+
+    pub fn uniform_mask(&self) -> Option<&SparseTokenMask> {
+        match self {
+            Self::Uniform { mask, .. } => Some(mask),
+            Self::FixedWidth { .. } => None,
+        }
+    }
+
+    pub fn indices(&self) -> Tensor<B, 2, Int> {
+        match self {
+            Self::Uniform { indices, .. } | Self::FixedWidth { indices, .. } => indices.clone(),
+        }
+    }
+
+    pub fn rows(&self) -> Vec<Vec<usize>> {
+        match self {
+            Self::Uniform { mask, batch, .. } => (0..*batch)
+                .map(|_| mask.indices().to_vec())
+                .collect::<Vec<_>>(),
+            Self::FixedWidth { rows, .. } => rows.clone(),
+        }
+    }
+
+    pub fn first_mask(&self) -> Result<SparseTokenMask> {
+        match self {
+            Self::Uniform { mask, .. } => Ok(mask.clone()),
+            Self::FixedWidth {
+                rows, dense_len, ..
+            } => SparseTokenMask::new(rows[0].clone(), *dense_len),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SparseVideoTokens<B: Backend> {
     pub tokens: Tensor<B, 3>,
     pub indices: Tensor<B, 2, Int>,
@@ -158,6 +299,39 @@ pub fn make_context_target_masks(
     (context, target)
 }
 
+pub fn target_mask_from_context(
+    context: &SparseTokenMask,
+    target_tokens: usize,
+) -> Result<SparseTokenMask> {
+    let dense_len = context.dense_len();
+    let target_tokens = target_tokens
+        .max(1)
+        .min(dense_len.saturating_sub(context.len()).max(1));
+    let mut blocked = vec![false; dense_len];
+    for &index in context.indices() {
+        blocked[index] = true;
+    }
+    let mut target = SparseTokenMask::evenly_spaced_indices(dense_len, target_tokens)
+        .into_iter()
+        .filter(|&index| !blocked[index])
+        .collect::<Vec<_>>();
+    for &index in &target {
+        blocked[index] = true;
+    }
+    if target.len() < target_tokens {
+        for (index, blocked) in blocked.iter_mut().enumerate() {
+            if !*blocked {
+                target.push(index);
+                *blocked = true;
+                if target.len() >= target_tokens {
+                    break;
+                }
+            }
+        }
+    }
+    SparseTokenMask::new(target, dense_len)
+}
+
 pub fn repeat_token_indices<B: Backend>(
     indices: &[usize],
     batch: usize,
@@ -178,6 +352,13 @@ pub fn apply_token_mask<B: Backend>(
     tokens.gather(1, gather_indices)
 }
 
+pub fn apply_mask_batch<B: Backend>(
+    tokens: Tensor<B, 3>,
+    mask: &SparseMaskBatch<B>,
+) -> Tensor<B, 3> {
+    apply_token_mask(tokens, mask.indices())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +370,20 @@ mod tests {
         let mask = SparseTokenMask::new(vec![3, 1, 1], 5).expect("mask");
         assert_eq!(mask.indices(), &[1, 3]);
         assert_eq!(mask.complement().indices(), &[0, 2, 4]);
+    }
+
+    #[test]
+    fn target_mask_from_context_is_disjoint_and_fills_budget() {
+        let context = SparseTokenMask::new(vec![0, 2, 4], 6).expect("context");
+        let target = target_mask_from_context(&context, 2).expect("target");
+
+        assert_eq!(target.len(), 2);
+        assert!(
+            target
+                .indices()
+                .iter()
+                .all(|idx| !context.indices().contains(idx))
+        );
     }
 
     #[test]

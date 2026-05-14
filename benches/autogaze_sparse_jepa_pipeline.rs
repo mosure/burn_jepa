@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     env, fs,
     hint::black_box,
     panic::{self, AssertUnwindSafe},
@@ -22,16 +21,130 @@ use burn::{
 };
 use burn_autogaze::{
     AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeInferenceMode, AutoGazePipeline,
-    ConnectorConfig, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
+    AutoGazeStreamingCache, ConnectorConfig, GazeDecoderConfig, GazeModelConfig,
+    NativeAutoGazeModel, VisionModelConfig,
 };
 use burn_jepa::{
-    SparseImageTokenGrid, SparsePatchifyPlan, SparsePredictorPlan, SparseTokenMask,
-    TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TokenGridShape, VJepa2_1Model,
-    VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig,
-    sparse_mask_from_frame_token_indices,
+    AutogazeSparseJepaWindowConfig, SparsePatchifyPlan, SparsePredictorPlan,
+    TemporalSparseJepaStream, TemporalSparseJepaStreamOutput, VJepa2_1Model, VJepaConfig,
+    VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig, autogaze_image_token_grid,
 };
 
-type JepaBackend = burn_flex_gmm::wgpu::DefaultWgpuBackend;
+#[cfg(not(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda")))]
+compile_error!(
+    "autogaze_sparse_jepa_pipeline requires sparse-patchify-wgpu or sparse-patchify-cuda"
+);
+
+trait SparsePatchifyBenchBackend: Backend {
+    const JEPA_BACKEND_LABEL: &'static str;
+
+    fn sparse_patchify_tokens(
+        model: &VJepa2_1Model<Self>,
+        video: Tensor<Self, 5>,
+        plan: &SparsePatchifyPlan<Self>,
+    ) -> anyhow::Result<Tensor<Self, 3>>;
+}
+
+trait SparsePatchifyBenchStream<B: SparsePatchifyBenchBackend> {
+    fn forward_frame_tokens_sparse_patchify_bench(
+        &mut self,
+        model: &VJepa2_1Model<B>,
+        video: Tensor<B, 5>,
+        frame_tokens: &[Vec<usize>],
+        mask_index: usize,
+    ) -> anyhow::Result<TemporalSparseJepaStreamOutput<B>>;
+
+    fn forward_masks_sparse_patchify_bench(
+        &mut self,
+        model: &VJepa2_1Model<B>,
+        video: Tensor<B, 5>,
+        context_mask: burn_jepa::SparseTokenMask,
+        target_mask: burn_jepa::SparseTokenMask,
+        mask_index: usize,
+    ) -> anyhow::Result<TemporalSparseJepaStreamOutput<B>>;
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl SparsePatchifyBenchBackend for burn_flex_gmm::wgpu::DefaultWgpuBackend {
+    const JEPA_BACKEND_LABEL: &'static str = "sparse-patchify-wgpu";
+
+    fn sparse_patchify_tokens(
+        model: &VJepa2_1Model<Self>,
+        video: Tensor<Self, 5>,
+        plan: &SparsePatchifyPlan<Self>,
+    ) -> anyhow::Result<Tensor<Self, 3>> {
+        model.encoder.sparse_patchify_video_wgpu(video, plan)
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl SparsePatchifyBenchStream<burn_flex_gmm::wgpu::DefaultWgpuBackend>
+    for TemporalSparseJepaStream<burn_flex_gmm::wgpu::DefaultWgpuBackend>
+{
+    fn forward_frame_tokens_sparse_patchify_bench(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        frame_tokens: &[Vec<usize>],
+        mask_index: usize,
+    ) -> anyhow::Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>>
+    {
+        self.forward_frame_tokens_sparse_patchify_wgpu(model, video, frame_tokens, mask_index)
+    }
+
+    fn forward_masks_sparse_patchify_bench(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        context_mask: burn_jepa::SparseTokenMask,
+        target_mask: burn_jepa::SparseTokenMask,
+        mask_index: usize,
+    ) -> anyhow::Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>>
+    {
+        self.forward_masks_sparse_patchify_wgpu(model, video, context_mask, target_mask, mask_index)
+    }
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+impl SparsePatchifyBenchBackend for burn_flex_gmm::cuda::DefaultCudaBackend {
+    const JEPA_BACKEND_LABEL: &'static str = "sparse-patchify-cuda";
+
+    fn sparse_patchify_tokens(
+        model: &VJepa2_1Model<Self>,
+        video: Tensor<Self, 5>,
+        plan: &SparsePatchifyPlan<Self>,
+    ) -> anyhow::Result<Tensor<Self, 3>> {
+        model.encoder.sparse_patchify_video_cuda(video, plan)
+    }
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+impl SparsePatchifyBenchStream<burn_flex_gmm::cuda::DefaultCudaBackend>
+    for TemporalSparseJepaStream<burn_flex_gmm::cuda::DefaultCudaBackend>
+{
+    fn forward_frame_tokens_sparse_patchify_bench(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        video: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 5>,
+        frame_tokens: &[Vec<usize>],
+        mask_index: usize,
+    ) -> anyhow::Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::cuda::DefaultCudaBackend>>
+    {
+        self.forward_frame_tokens_sparse_patchify_cuda(model, video, frame_tokens, mask_index)
+    }
+
+    fn forward_masks_sparse_patchify_bench(
+        &mut self,
+        model: &VJepa2_1Model<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        video: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 5>,
+        context_mask: burn_jepa::SparseTokenMask,
+        target_mask: burn_jepa::SparseTokenMask,
+        mask_index: usize,
+    ) -> anyhow::Result<TemporalSparseJepaStreamOutput<burn_flex_gmm::cuda::DefaultCudaBackend>>
+    {
+        self.forward_masks_sparse_patchify_cuda(model, video, context_mask, target_mask, mask_index)
+    }
+}
 
 const BATCH: usize = 1;
 const CHANNELS: usize = 3;
@@ -68,12 +181,22 @@ const RESOLUTIONS: &[Resolution] = &[
 #[derive(Clone, Copy, Debug)]
 struct BenchConfig {
     trace: BenchTraceConfig,
+    dense_patchify: bool,
+    progress: bool,
 }
 
 impl BenchConfig {
     fn from_env() -> Self {
         Self {
             trace: BenchTraceConfig::from_env(),
+            dense_patchify: env_bool("BURN_JEPA_PIPELINE_BENCH_DENSE_PATCHIFY", true),
+            progress: env_bool("BURN_JEPA_PIPELINE_BENCH_PROGRESS", false),
+        }
+    }
+
+    fn progress(self, message: impl AsRef<str>) {
+        if self.progress {
+            eprintln!("{}", message.as_ref());
         }
     }
 }
@@ -155,7 +278,12 @@ struct BenchRow {
     context_tokens: usize,
     target_tokens: usize,
     autogaze_generate_ms: f64,
+    rolling_autogaze_generate_ms: f64,
+    rolling_autogaze_streaming_generate_ms: f64,
     autogaze_trace_ms: f64,
+    sparse_project_ms: f64,
+    sparse_mask_project_ms: f64,
+    sparse_plan_ms: f64,
     sparse_project_plan_ms: f64,
     dense_patchify_ms: f64,
     sparse_patchify_ms: f64,
@@ -163,15 +291,23 @@ struct BenchRow {
     predictor_ms: f64,
     sparse_jepa_ms: f64,
     temporal_stream_ms: f64,
+    temporal_mask_stream_ms: f64,
     rolling_temporal_stream_ms: f64,
+    rolling_temporal_mask_stream_ms: f64,
     e2e_pipeline_ms: f64,
     temporal_e2e_pipeline_ms: f64,
+    temporal_mask_e2e_pipeline_ms: f64,
     rolling_temporal_e2e_pipeline_ms: f64,
+    rolling_mask_temporal_e2e_pipeline_ms: f64,
+    rolling_streaming_temporal_e2e_pipeline_ms: f64,
     clips_per_sec: f64,
     frames_per_sec: f64,
     temporal_clips_per_sec: f64,
+    temporal_mask_clips_per_sec: f64,
     temporal_frames_per_sec: f64,
     rolling_temporal_frames_per_sec: f64,
+    rolling_mask_temporal_frames_per_sec: f64,
+    rolling_streaming_temporal_frames_per_sec: f64,
 }
 
 fn main() {
@@ -180,28 +316,30 @@ fn main() {
     let include_1080 = env_bool("BURN_JEPA_PIPELINE_BENCH_1080P", true);
     let bench_config = BenchConfig::from_env();
     let backend_filter = backend_filter();
+    let jepa_backend_filter = jepa_backend_filter();
+    let resolution_filter = name_filter("BURN_JEPA_PIPELINE_BENCH_RESOLUTIONS");
+    let densities = density_cases();
     let resolutions = RESOLUTIONS
         .iter()
         .copied()
         .filter(|case| include_1080 || case.name != "1080p16pad")
+        .filter(|case| name_enabled(&resolution_filter, case.name))
         .collect::<Vec<_>>();
     let mut rows = Vec::new();
 
     println!("{}", BenchRow::csv_header());
 
     if backend_enabled(&backend_filter, "ndarray") {
-        append_backend_rows(
+        append_autogaze_backend_rows::<burn::backend::NdArray<f32>>(
             &mut rows,
-            run_optional("autogaze-ndarray", || {
-                run_autogaze_backend::<burn::backend::NdArray<f32>>(
-                    "autogaze-ndarray",
-                    <burn::backend::NdArray<f32> as BackendTypes>::Device::default(),
-                    &resolutions,
-                    bench_config,
-                    warmups,
-                    reps,
-                )
-            }),
+            "autogaze-ndarray",
+            <burn::backend::NdArray<f32> as BackendTypes>::Device::default(),
+            &jepa_backend_filter,
+            &resolutions,
+            &densities,
+            bench_config,
+            warmups,
+            reps,
         );
     }
 
@@ -209,18 +347,16 @@ fn main() {
     if backend_enabled(&backend_filter, "webgpu")
         && let Some(device) = webgpu_device()
     {
-        append_backend_rows(
+        append_autogaze_backend_rows::<burn::backend::WebGpu<f32, i32>>(
             &mut rows,
-            run_optional("autogaze-webgpu", || {
-                run_autogaze_backend::<burn::backend::WebGpu<f32, i32>>(
-                    "autogaze-webgpu",
-                    device,
-                    &resolutions,
-                    bench_config,
-                    warmups,
-                    reps,
-                )
-            }),
+            "autogaze-webgpu",
+            device,
+            &jepa_backend_filter,
+            &resolutions,
+            &densities,
+            bench_config,
+            warmups,
+            reps,
         );
     }
 
@@ -229,18 +365,16 @@ fn main() {
         if let Err(reason) = cuda_runtime_preflight() {
             eprintln!("skipping autogaze-cuda benchmark: {reason}");
         } else {
-            append_backend_rows(
+            append_autogaze_backend_rows::<burn::backend::Cuda<f32, i32>>(
                 &mut rows,
-                run_optional("autogaze-cuda", || {
-                    run_autogaze_backend::<burn::backend::Cuda<f32, i32>>(
-                        "autogaze-cuda",
-                        burn::backend::cuda::CudaDevice::default(),
-                        &resolutions,
-                        bench_config,
-                        warmups,
-                        reps,
-                    )
-                }),
+                "autogaze-cuda",
+                burn::backend::cuda::CudaDevice::default(),
+                &jepa_backend_filter,
+                &resolutions,
+                &densities,
+                bench_config,
+                warmups,
+                reps,
             );
         }
     }
@@ -260,10 +394,82 @@ fn append_backend_rows(rows: &mut Vec<BenchRow>, backend_rows: Option<Vec<BenchR
     }
 }
 
-fn run_autogaze_backend<B>(
+fn append_autogaze_backend_rows<B>(
+    rows: &mut Vec<BenchRow>,
+    autogaze_backend: &'static str,
+    autogaze_device: B::Device,
+    jepa_backend_filter: &[String],
+    resolutions: &[Resolution],
+    densities: &[f32],
+    bench_config: BenchConfig,
+    warmups: usize,
+    reps: usize,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    #[cfg(feature = "sparse-patchify-wgpu")]
+    if backend_enabled(
+        jepa_backend_filter,
+        <burn_flex_gmm::wgpu::DefaultWgpuBackend as SparsePatchifyBenchBackend>::JEPA_BACKEND_LABEL,
+    ) {
+        let name = format!(
+            "{autogaze_backend}+{}",
+            <burn_flex_gmm::wgpu::DefaultWgpuBackend as SparsePatchifyBenchBackend>::JEPA_BACKEND_LABEL
+        );
+        append_backend_rows(
+            rows,
+            run_optional(&name, || {
+                run_autogaze_backend::<B, burn_flex_gmm::wgpu::DefaultWgpuBackend>(
+                    autogaze_backend,
+                    autogaze_device.clone(),
+                    resolutions,
+                    densities,
+                    bench_config,
+                    warmups,
+                    reps,
+                )
+            }),
+        );
+    }
+
+    #[cfg(feature = "sparse-patchify-cuda")]
+    if backend_enabled(
+        jepa_backend_filter,
+        <burn_flex_gmm::cuda::DefaultCudaBackend as SparsePatchifyBenchBackend>::JEPA_BACKEND_LABEL,
+    ) {
+        #[cfg(feature = "cuda")]
+        if let Err(reason) = cuda_runtime_preflight() {
+            eprintln!("skipping {autogaze_backend}+sparse-patchify-cuda benchmark: {reason}");
+            return;
+        }
+
+        let name = format!(
+            "{autogaze_backend}+{}",
+            <burn_flex_gmm::cuda::DefaultCudaBackend as SparsePatchifyBenchBackend>::JEPA_BACKEND_LABEL
+        );
+        append_backend_rows(
+            rows,
+            run_optional(&name, || {
+                run_autogaze_backend::<B, burn_flex_gmm::cuda::DefaultCudaBackend>(
+                    autogaze_backend,
+                    autogaze_device.clone(),
+                    resolutions,
+                    densities,
+                    bench_config,
+                    warmups,
+                    reps,
+                )
+            }),
+        );
+    }
+}
+
+fn run_autogaze_backend<B, J>(
     autogaze_backend: &'static str,
     autogaze_device: B::Device,
     resolutions: &[Resolution],
+    densities: &[f32],
     bench_config: BenchConfig,
     warmups: usize,
     reps: usize,
@@ -271,19 +477,18 @@ fn run_autogaze_backend<B>(
 where
     B: Backend,
     B::Device: Clone,
+    J: SparsePatchifyBenchBackend,
+    J::Device: Default + Clone,
+    TemporalSparseJepaStream<J>: SparsePatchifyBenchStream<J>,
 {
     let autogaze = deterministic_autogaze_pipeline::<B>(&autogaze_device);
-    let jepa_device = <JepaBackend as BackendTypes>::Device::default();
+    let jepa_device = <J as BackendTypes>::Device::default();
     let mut rows = Vec::new();
 
     for &resolution in resolutions {
-        let grid = TokenGridShape::new(
-            FRAMES / TUBELET_SIZE,
-            resolution.height / PATCH_SIZE,
-            resolution.width / PATCH_SIZE,
-        );
+        let autogaze_image_grid = autogaze_image_token_grid(AUTOGAZE_CONNECTOR_TOKENS);
         let jepa_config = jepa_config();
-        let jepa = VJepa2_1Model::<JepaBackend>::new(&jepa_config, &jepa_device);
+        let jepa = VJepa2_1Model::<J>::new(&jepa_config, &jepa_device);
         let ag_values = deterministic_autogaze_values(resolution, FRAMES);
         let jepa_values = deterministic_jepa_values(resolution, FRAMES);
         let rolling_ag_values = deterministic_autogaze_values(resolution, TUBELET_SIZE);
@@ -295,7 +500,7 @@ where
             ),
             &autogaze_device,
         );
-        let jepa_video = Tensor::<JepaBackend, 5>::from_data(
+        let jepa_video = Tensor::<J, 5>::from_data(
             TensorData::new(
                 jepa_values,
                 [BATCH, CHANNELS, FRAMES, resolution.height, resolution.width],
@@ -315,7 +520,7 @@ where
             ),
             &autogaze_device,
         );
-        let rolling_jepa_video = Tensor::<JepaBackend, 5>::from_data(
+        let rolling_jepa_video = Tensor::<J, 5>::from_data(
             TensorData::new(
                 rolling_jepa_values,
                 [
@@ -328,58 +533,75 @@ where
             ),
             &jepa_device,
         );
-        <JepaBackend as Backend>::sync(&jepa_device).expect("jepa input upload sync");
+        <J as Backend>::sync(&jepa_device).expect("jepa input upload sync");
 
-        let dense_patchify_ms = measure_ms(warmups, reps, || {
-            let tokens = jepa.encoder.patch_embed.forward(jepa_video.clone());
-            let dims = tokens.shape().dims::<3>();
-            black_box(dims);
-            <JepaBackend as Backend>::sync(&jepa_device).expect("dense patchify sync");
-            dims[1]
-        });
+        bench_config.progress(format!(
+            "{autogaze_backend}+{} {} dense patchify",
+            J::JEPA_BACKEND_LABEL,
+            resolution.name
+        ));
+        let dense_patchify_ms = if bench_config.dense_patchify {
+            measure_ms(warmups, reps, || {
+                let tokens = jepa.encoder.patch_embed.forward(jepa_video.clone());
+                let dims = tokens.shape().dims::<3>();
+                black_box(dims);
+                <J as Backend>::sync(&jepa_device).expect("dense patchify sync");
+                dims[1]
+            })
+        } else {
+            0.0
+        };
 
-        for &target_density in DENSITIES {
-            let dense_tokens = grid.len();
-            let target_context_tokens = ((dense_tokens as f32) * target_density).ceil() as usize;
-            let target_context_tokens = target_context_tokens.max(1).min(dense_tokens);
-            let autogaze_top_k = density_top_k(grid, target_density);
-            let autogaze_budget = autogaze
-                .max_gaze_tokens_each_frame()
-                .max(autogaze_top_k.max(1));
-
-            let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
-            let frame_tokens = generated_frame_tokens(&generated, FRAMES, autogaze_top_k);
-            let context_mask = context_mask_from_autogaze_generated(
-                &generated,
+        for &target_density in densities {
+            bench_config.progress(format!(
+                "{autogaze_backend}+{} {} density={target_density:.4}",
+                J::JEPA_BACKEND_LABEL,
+                resolution.name
+            ));
+            let clip_plan = AutogazeSparseJepaWindowConfig::new(
                 FRAMES,
-                grid,
-                target_context_tokens,
-                autogaze_top_k,
+                TUBELET_SIZE,
+                PATCH_SIZE,
+                resolution.height,
+                resolution.width,
+                AUTOGAZE_CONNECTOR_TOKENS,
+                target_density,
+                TARGET_TOKENS,
+                autogaze.max_gaze_tokens_each_frame(),
             )
-            .expect("autogaze sparse context mask");
-            let target_mask =
-                target_mask_for_context(&context_mask, TARGET_TOKENS.min(dense_tokens));
-            let context_plan = SparsePatchifyPlan::<JepaBackend>::new(
+            .with_image_grid(autogaze_image_grid)
+            .build()
+            .expect("clip sparse window plan");
+            let dense_tokens = clip_plan.grid.len();
+
+            let generated = clip_plan.generate(&autogaze, ag_video.clone());
+            let projection = clip_plan
+                .project_generated_tokens(&generated)
+                .expect("autogaze sparse context mask");
+            let frame_tokens = projection.frame_tokens.clone();
+            let context_mask = projection.context_mask;
+            let target_mask = projection.target_mask;
+            let context_plan = SparsePatchifyPlan::<J>::new(
                 context_mask.clone(),
-                grid,
+                clip_plan.grid,
                 BATCH,
                 &jepa_device,
             )
             .expect("context patchify plan");
-            let predictor_plan = SparsePredictorPlan::<JepaBackend>::new(
+            let predictor_plan = SparsePredictorPlan::<J>::new(
                 &jepa_config,
                 context_mask.clone(),
                 target_mask.clone(),
-                grid,
+                clip_plan.grid,
                 BATCH,
                 &jepa_device,
             )
             .expect("predictor plan");
             <B as Backend>::sync(&autogaze_device).expect("autogaze sync");
-            <JepaBackend as Backend>::sync(&jepa_device).expect("plan sync");
+            <J as Backend>::sync(&jepa_device).expect("plan sync");
 
             let autogaze_generate_ms = measure_ms(warmups, reps, || {
-                let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+                let generated = clip_plan.generate(&autogaze, ag_video.clone());
                 black_box(generated_token_count(&generated));
                 <B as Backend>::sync(&autogaze_device).expect("autogaze generate sync");
                 generated.num_gazing_each_frame.len()
@@ -388,7 +610,7 @@ where
                 measure_autogaze_trace_ms(
                     &autogaze,
                     &ag_video,
-                    autogaze_top_k,
+                    clip_plan.top_k,
                     &autogaze_device,
                     warmups,
                     reps,
@@ -396,73 +618,103 @@ where
             } else {
                 0.0
             };
-            let sparse_project_plan_ms = measure_ms(warmups, reps, || {
-                let context_mask = context_mask_from_autogaze_generated(
-                    &generated,
-                    FRAMES,
-                    grid,
-                    target_context_tokens,
-                    autogaze_top_k,
-                )
-                .expect("project context mask");
-                let target_mask =
-                    target_mask_for_context(&context_mask, TARGET_TOKENS.min(dense_tokens));
-                let context_plan = SparsePatchifyPlan::<JepaBackend>::new(
+            let sparse_project_ms = measure_ms(warmups, reps, || {
+                let projection = clip_plan
+                    .project_generated_tokens(&generated)
+                    .expect("project context mask");
+                black_box(projection.frame_tokens.len());
+                black_box(projection.context_mask.len());
+                projection.target_mask.len()
+            });
+            let sparse_mask_project_ms = measure_ms(warmups, reps, || {
+                let masks = clip_plan
+                    .project_generated_masks(&generated)
+                    .expect("project context masks");
+                black_box(masks.context_mask.len());
+                masks.target_mask.len()
+            });
+            let sparse_plan_ms = measure_ms(warmups, reps, || {
+                let context_plan = SparsePatchifyPlan::<J>::new(
                     context_mask.clone(),
-                    grid,
+                    clip_plan.grid,
                     BATCH,
                     &jepa_device,
                 )
                 .expect("context plan");
-                let predictor_plan = SparsePredictorPlan::<JepaBackend>::new(
+                let predictor_plan = SparsePredictorPlan::<J>::new(
                     &jepa_config,
-                    context_mask,
-                    target_mask,
-                    grid,
+                    context_mask.clone(),
+                    target_mask.clone(),
+                    clip_plan.grid,
                     BATCH,
                     &jepa_device,
                 )
                 .expect("predictor plan");
                 black_box(context_plan.output_rows());
                 black_box(predictor_plan.sequence_indices.shape());
-                <JepaBackend as Backend>::sync(&jepa_device).expect("project plan sync");
+                <J as Backend>::sync(&jepa_device).expect("plan sync");
+                context_plan.output_rows()
+            });
+            let sparse_project_plan_ms = measure_ms(warmups, reps, || {
+                let projection = clip_plan
+                    .project_generated_tokens(&generated)
+                    .expect("project context mask");
+                let context_mask = projection.context_mask;
+                let target_mask = projection.target_mask;
+                let context_plan = SparsePatchifyPlan::<J>::new(
+                    context_mask.clone(),
+                    clip_plan.grid,
+                    BATCH,
+                    &jepa_device,
+                )
+                .expect("context plan");
+                let predictor_plan = SparsePredictorPlan::<J>::new(
+                    &jepa_config,
+                    context_mask,
+                    target_mask,
+                    clip_plan.grid,
+                    BATCH,
+                    &jepa_device,
+                )
+                .expect("predictor plan");
+                black_box(context_plan.output_rows());
+                black_box(predictor_plan.sequence_indices.shape());
+                <J as Backend>::sync(&jepa_device).expect("project plan sync");
                 context_plan.output_rows()
             });
             let sparse_patchify_ms = measure_ms(warmups, reps, || {
-                let tokens =
-                    sparse_patchify_tokens(&jepa, &jepa_config, jepa_video.clone(), &context_plan)
-                        .expect("sparse patchify tokens");
+                let tokens = sparse_patchify_tokens(&jepa, jepa_video.clone(), &context_plan)
+                    .expect("sparse patchify tokens");
                 let dims = tokens.shape().dims::<3>();
                 black_box(dims);
-                <JepaBackend as Backend>::sync(&jepa_device).expect("sparse patchify sync");
+                <J as Backend>::sync(&jepa_device).expect("sparse patchify sync");
                 dims[1]
             });
-            let context_tokens =
-                sparse_patchify_tokens(&jepa, &jepa_config, jepa_video.clone(), &context_plan)
-                    .expect("precompute sparse tokens");
-            <JepaBackend as Backend>::sync(&jepa_device).expect("precompute sparse tokens sync");
+            let context_tokens = sparse_patchify_tokens(&jepa, jepa_video.clone(), &context_plan)
+                .expect("precompute sparse tokens");
+            <J as Backend>::sync(&jepa_device).expect("precompute sparse tokens sync");
 
             let sparse_encoder_ms = measure_ms(warmups, reps, || {
                 let encoded = jepa.encoder.forward_sparse_tokens(
                     context_tokens.clone(),
                     BATCH,
-                    grid,
+                    clip_plan.grid,
                     context_mask.indices(),
                     true,
                 );
                 let dims = encoded.tokens.shape().dims::<3>();
                 black_box(dims);
-                <JepaBackend as Backend>::sync(&jepa_device).expect("sparse encoder sync");
+                <J as Backend>::sync(&jepa_device).expect("sparse encoder sync");
                 dims[1]
             });
             let encoded_context = jepa.encoder.forward_sparse_tokens(
                 context_tokens,
                 BATCH,
-                grid,
+                clip_plan.grid,
                 context_mask.indices(),
                 true,
             );
-            <JepaBackend as Backend>::sync(&jepa_device).expect("precompute encoded context sync");
+            <J as Backend>::sync(&jepa_device).expect("precompute encoded context sync");
 
             let predictor_ms = measure_ms(warmups, reps, || {
                 let output = jepa
@@ -471,197 +723,378 @@ where
                     .expect("predictor");
                 let dims = output.target_predictions.shape().dims::<3>();
                 black_box(dims);
-                <JepaBackend as Backend>::sync(&jepa_device).expect("predictor sync");
+                <J as Backend>::sync(&jepa_device).expect("predictor sync");
                 dims[1]
             });
             let sparse_jepa_ms = measure_ms(warmups, reps, || {
-                run_sparse_jepa_once(
-                    &jepa,
-                    &jepa_config,
-                    jepa_video.clone(),
-                    &context_plan,
-                    &predictor_plan,
-                )
-                .expect("sparse jepa");
-                <JepaBackend as Backend>::sync(&jepa_device).expect("sparse jepa sync");
+                run_sparse_jepa_once(&jepa, jepa_video.clone(), &context_plan, &predictor_plan)
+                    .expect("sparse jepa");
+                <J as Backend>::sync(&jepa_device).expect("sparse jepa sync");
             });
-            let stream_config = TemporalSparseJepaStreamConfig::new(
-                target_context_tokens,
-                TARGET_TOKENS.min(dense_tokens),
-                autogaze_image_token_grid(),
-            )
-            .with_keyframe_interval(16);
-            let mut temporal_stream = TemporalSparseJepaStream::<JepaBackend>::new(stream_config);
+            let stream_config = clip_plan.stream.with_keyframe_interval(16);
+            let mut temporal_stream = TemporalSparseJepaStream::<J>::new(stream_config);
             temporal_stream
-                .forward_frame_tokens_sparse_patchify_wgpu(
+                .forward_frame_tokens_sparse_patchify_bench(
                     &jepa,
                     jepa_video.clone(),
                     &frame_tokens,
                     0,
                 )
                 .expect("prime temporal stream");
-            <JepaBackend as Backend>::sync(&jepa_device).expect("prime temporal stream sync");
+            <J as Backend>::sync(&jepa_device).expect("prime temporal stream sync");
             let temporal_stream_ms = measure_ms(warmups, reps, || {
                 let output = temporal_stream
-                    .forward_frame_tokens_sparse_patchify_wgpu(
+                    .forward_frame_tokens_sparse_patchify_bench(
                         &jepa,
                         jepa_video.clone(),
                         &frame_tokens,
                         0,
                     )
                     .expect("temporal stream");
+                black_box(output.reused_encoder_plan);
                 black_box(output.reused_patchify_plan);
                 black_box(output.temporal.reused_predictor_plan);
-                <JepaBackend as Backend>::sync(&jepa_device).expect("temporal stream sync");
+                <J as Backend>::sync(&jepa_device).expect("temporal stream sync");
             });
-            let rolling_grid = TokenGridShape::new(
-                1,
-                resolution.height / PATCH_SIZE,
-                resolution.width / PATCH_SIZE,
-            );
-            let rolling_dense_tokens = rolling_grid.len();
-            let rolling_context_tokens =
-                ((rolling_dense_tokens as f32) * target_density).ceil() as usize;
-            let rolling_context_tokens = rolling_context_tokens.max(1).min(rolling_dense_tokens);
-            let rolling_target_tokens = TARGET_TOKENS.min(rolling_dense_tokens);
-            let rolling_generated =
-                autogaze.generate_with_limit(rolling_ag_video.clone(), autogaze_budget);
-            let rolling_frame_tokens =
-                generated_frame_tokens(&rolling_generated, TUBELET_SIZE, autogaze_top_k);
-            let rolling_stream_config = TemporalSparseJepaStreamConfig::new(
-                rolling_context_tokens,
-                rolling_target_tokens,
-                autogaze_image_token_grid(),
+            let mut temporal_mask_stream =
+                TemporalSparseJepaStream::<J>::new(clip_plan.stream.with_keyframe_interval(16));
+            temporal_mask_stream
+                .forward_masks_sparse_patchify_bench(
+                    &jepa,
+                    jepa_video.clone(),
+                    context_mask.clone(),
+                    target_mask.clone(),
+                    0,
+                )
+                .expect("prime temporal mask stream");
+            <J as Backend>::sync(&jepa_device).expect("prime temporal mask stream sync");
+            let temporal_mask_stream_ms = measure_ms(warmups, reps, || {
+                let output = temporal_mask_stream
+                    .forward_masks_sparse_patchify_bench(
+                        &jepa,
+                        jepa_video.clone(),
+                        context_mask.clone(),
+                        target_mask.clone(),
+                        0,
+                    )
+                    .expect("temporal mask stream");
+                black_box(output.reused_encoder_plan);
+                black_box(output.reused_patchify_plan);
+                black_box(output.temporal.reused_predictor_plan);
+                <J as Backend>::sync(&jepa_device).expect("temporal mask stream sync");
+            });
+            let rolling_plan = AutogazeSparseJepaWindowConfig::new(
+                TUBELET_SIZE,
+                TUBELET_SIZE,
+                PATCH_SIZE,
+                resolution.height,
+                resolution.width,
+                AUTOGAZE_CONNECTOR_TOKENS,
+                target_density,
+                TARGET_TOKENS,
+                autogaze.max_gaze_tokens_each_frame(),
             )
-            .with_keyframe_interval(16);
+            .with_image_grid(autogaze_image_grid)
+            .build()
+            .expect("rolling sparse window plan");
+            let rolling_generated = rolling_plan.generate(&autogaze, rolling_ag_video.clone());
+            let rolling_projection = rolling_plan
+                .project_generated_tokens(&rolling_generated)
+                .expect("rolling autogaze sparse context mask");
+            let rolling_frame_tokens = rolling_projection.frame_tokens;
+            let rolling_context_mask = rolling_projection.context_mask;
+            let rolling_target_mask = rolling_projection.target_mask;
+            let rolling_stream_config = rolling_plan.stream.with_keyframe_interval(16);
             let mut rolling_temporal_stream =
-                TemporalSparseJepaStream::<JepaBackend>::new(rolling_stream_config);
+                TemporalSparseJepaStream::<J>::new(rolling_stream_config);
             rolling_temporal_stream
-                .forward_frame_tokens_sparse_patchify_wgpu(
+                .forward_frame_tokens_sparse_patchify_bench(
                     &jepa,
                     rolling_jepa_video.clone(),
                     &rolling_frame_tokens,
                     0,
                 )
                 .expect("prime rolling temporal stream");
-            <JepaBackend as Backend>::sync(&jepa_device).expect("prime rolling stream sync");
+            <J as Backend>::sync(&jepa_device).expect("prime rolling stream sync");
             let rolling_temporal_stream_ms = measure_ms(warmups, reps, || {
                 let output = rolling_temporal_stream
-                    .forward_frame_tokens_sparse_patchify_wgpu(
+                    .forward_frame_tokens_sparse_patchify_bench(
                         &jepa,
                         rolling_jepa_video.clone(),
                         &rolling_frame_tokens,
                         0,
                     )
                     .expect("rolling temporal stream");
+                black_box(output.reused_encoder_plan);
                 black_box(output.reused_patchify_plan);
                 black_box(output.temporal.reused_predictor_plan);
-                <JepaBackend as Backend>::sync(&jepa_device).expect("rolling stream sync");
+                <J as Backend>::sync(&jepa_device).expect("rolling stream sync");
+            });
+            let mut rolling_temporal_mask_stream =
+                TemporalSparseJepaStream::<J>::new(rolling_plan.stream.with_keyframe_interval(16));
+            rolling_temporal_mask_stream
+                .forward_masks_sparse_patchify_bench(
+                    &jepa,
+                    rolling_jepa_video.clone(),
+                    rolling_context_mask.clone(),
+                    rolling_target_mask.clone(),
+                    0,
+                )
+                .expect("prime rolling temporal mask stream");
+            <J as Backend>::sync(&jepa_device).expect("prime rolling mask stream sync");
+            let rolling_temporal_mask_stream_ms = measure_ms(warmups, reps, || {
+                let output = rolling_temporal_mask_stream
+                    .forward_masks_sparse_patchify_bench(
+                        &jepa,
+                        rolling_jepa_video.clone(),
+                        rolling_context_mask.clone(),
+                        rolling_target_mask.clone(),
+                        0,
+                    )
+                    .expect("rolling temporal mask stream");
+                black_box(output.reused_encoder_plan);
+                black_box(output.reused_patchify_plan);
+                black_box(output.temporal.reused_predictor_plan);
+                <J as Backend>::sync(&jepa_device).expect("rolling mask stream sync");
+            });
+            let rolling_autogaze_generate_ms = measure_ms(warmups, reps, || {
+                let generated = rolling_plan.generate(&autogaze, rolling_ag_video.clone());
+                black_box(generated_token_count(&generated));
+                <B as Backend>::sync(&autogaze_device).expect("rolling autogaze generate sync");
+                generated.num_gazing_each_frame.len()
+            });
+            let mut rolling_autogaze_cache = AutoGazeStreamingCache::<B>::new(FRAMES);
+            rolling_plan.generate_streaming(
+                &autogaze,
+                rolling_ag_video.clone(),
+                &mut rolling_autogaze_cache,
+            );
+            <B as Backend>::sync(&autogaze_device)
+                .expect("prime rolling autogaze streaming cache sync");
+            let rolling_autogaze_streaming_generate_ms = measure_ms(warmups, reps, || {
+                let generated = rolling_plan.generate_streaming(
+                    &autogaze,
+                    rolling_ag_video.clone(),
+                    &mut rolling_autogaze_cache,
+                );
+                black_box(generated_token_count(&generated));
+                <B as Backend>::sync(&autogaze_device)
+                    .expect("rolling streaming autogaze generate sync");
+                generated.num_gazing_each_frame.len()
             });
             let e2e_pipeline_ms = measure_ms(warmups, reps, || {
-                let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
-                let context_mask = context_mask_from_autogaze_generated(
-                    &generated,
-                    FRAMES,
-                    grid,
-                    target_context_tokens,
-                    autogaze_top_k,
-                )
-                .expect("e2e context mask");
-                let target_mask =
-                    target_mask_for_context(&context_mask, TARGET_TOKENS.min(dense_tokens));
-                let context_plan = SparsePatchifyPlan::<JepaBackend>::new(
+                let generated = clip_plan.generate(&autogaze, ag_video.clone());
+                let projection = clip_plan
+                    .project_generated_tokens(&generated)
+                    .expect("e2e context mask");
+                let context_mask = projection.context_mask;
+                let target_mask = projection.target_mask;
+                let context_plan = SparsePatchifyPlan::<J>::new(
                     context_mask.clone(),
-                    grid,
+                    clip_plan.grid,
                     BATCH,
                     &jepa_device,
                 )
                 .expect("e2e context plan");
-                let predictor_plan = SparsePredictorPlan::<JepaBackend>::new(
+                let predictor_plan = SparsePredictorPlan::<J>::new(
                     &jepa_config,
                     context_mask,
                     target_mask,
-                    grid,
+                    clip_plan.grid,
                     BATCH,
                     &jepa_device,
                 )
                 .expect("e2e predictor plan");
-                run_sparse_jepa_once(
-                    &jepa,
-                    &jepa_config,
-                    jepa_video.clone(),
-                    &context_plan,
-                    &predictor_plan,
-                )
-                .expect("e2e sparse jepa");
+                run_sparse_jepa_once(&jepa, jepa_video.clone(), &context_plan, &predictor_plan)
+                    .expect("e2e sparse jepa");
                 <B as Backend>::sync(&autogaze_device).expect("e2e autogaze sync");
-                <JepaBackend as Backend>::sync(&jepa_device).expect("e2e jepa sync");
+                <J as Backend>::sync(&jepa_device).expect("e2e jepa sync");
             });
-            let mut temporal_e2e_stream =
-                TemporalSparseJepaStream::<JepaBackend>::new(stream_config);
+            let mut temporal_e2e_stream = TemporalSparseJepaStream::<J>::new(stream_config);
             temporal_e2e_stream
-                .forward_frame_tokens_sparse_patchify_wgpu(
+                .forward_frame_tokens_sparse_patchify_bench(
                     &jepa,
                     jepa_video.clone(),
                     &frame_tokens,
                     0,
                 )
                 .expect("prime e2e temporal stream");
-            <JepaBackend as Backend>::sync(&jepa_device).expect("prime e2e temporal stream sync");
+            <J as Backend>::sync(&jepa_device).expect("prime e2e temporal stream sync");
             let temporal_e2e_pipeline_ms = measure_ms(warmups, reps, || {
-                let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
-                let frame_tokens = generated_frame_tokens(&generated, FRAMES, autogaze_top_k);
+                let generated = clip_plan.generate(&autogaze, ag_video.clone());
+                let projection = clip_plan
+                    .project_generated_tokens(&generated)
+                    .expect("e2e temporal projection");
                 let output = temporal_e2e_stream
-                    .forward_frame_tokens_sparse_patchify_wgpu(
+                    .forward_frame_tokens_sparse_patchify_bench(
                         &jepa,
                         jepa_video.clone(),
-                        &frame_tokens,
+                        &projection.frame_tokens,
                         0,
                     )
                     .expect("e2e temporal stream");
+                black_box(output.reused_encoder_plan);
                 black_box(output.reused_patchify_plan);
                 black_box(output.temporal.reused_predictor_plan);
                 <B as Backend>::sync(&autogaze_device).expect("temporal e2e autogaze sync");
-                <JepaBackend as Backend>::sync(&jepa_device).expect("temporal e2e jepa sync");
+                <J as Backend>::sync(&jepa_device).expect("temporal e2e jepa sync");
+            });
+            let mut temporal_mask_e2e_stream = TemporalSparseJepaStream::<J>::new(stream_config);
+            temporal_mask_e2e_stream
+                .forward_masks_sparse_patchify_bench(
+                    &jepa,
+                    jepa_video.clone(),
+                    context_mask.clone(),
+                    target_mask.clone(),
+                    0,
+                )
+                .expect("prime e2e temporal mask stream");
+            <J as Backend>::sync(&jepa_device).expect("prime e2e temporal mask stream sync");
+            let temporal_mask_e2e_pipeline_ms = measure_ms(warmups, reps, || {
+                let generated = clip_plan.generate(&autogaze, ag_video.clone());
+                let masks = clip_plan
+                    .project_generated_masks(&generated)
+                    .expect("e2e temporal masks");
+                let output = temporal_mask_e2e_stream
+                    .forward_masks_sparse_patchify_bench(
+                        &jepa,
+                        jepa_video.clone(),
+                        masks.context_mask,
+                        masks.target_mask,
+                        0,
+                    )
+                    .expect("e2e temporal mask stream");
+                black_box(output.reused_encoder_plan);
+                black_box(output.reused_patchify_plan);
+                black_box(output.temporal.reused_predictor_plan);
+                <B as Backend>::sync(&autogaze_device).expect("temporal mask e2e autogaze sync");
+                <J as Backend>::sync(&jepa_device).expect("temporal mask e2e jepa sync");
             });
             let mut rolling_temporal_e2e_stream =
-                TemporalSparseJepaStream::<JepaBackend>::new(rolling_stream_config);
+                TemporalSparseJepaStream::<J>::new(rolling_stream_config);
             rolling_temporal_e2e_stream
-                .forward_frame_tokens_sparse_patchify_wgpu(
+                .forward_frame_tokens_sparse_patchify_bench(
                     &jepa,
                     rolling_jepa_video.clone(),
                     &rolling_frame_tokens,
                     0,
                 )
                 .expect("prime rolling e2e stream");
-            <JepaBackend as Backend>::sync(&jepa_device).expect("prime rolling e2e stream sync");
+            <J as Backend>::sync(&jepa_device).expect("prime rolling e2e stream sync");
             let rolling_temporal_e2e_pipeline_ms = measure_ms(warmups, reps, || {
-                let generated =
-                    autogaze.generate_with_limit(rolling_ag_video.clone(), autogaze_budget);
-                let frame_tokens = generated_frame_tokens(&generated, TUBELET_SIZE, autogaze_top_k);
+                let generated = rolling_plan.generate(&autogaze, rolling_ag_video.clone());
+                let projection = rolling_plan
+                    .project_generated_tokens(&generated)
+                    .expect("rolling e2e temporal projection");
                 let output = rolling_temporal_e2e_stream
-                    .forward_frame_tokens_sparse_patchify_wgpu(
+                    .forward_frame_tokens_sparse_patchify_bench(
                         &jepa,
                         rolling_jepa_video.clone(),
-                        &frame_tokens,
+                        &projection.frame_tokens,
                         0,
                     )
                     .expect("rolling e2e temporal stream");
+                black_box(output.reused_encoder_plan);
                 black_box(output.reused_patchify_plan);
                 black_box(output.temporal.reused_predictor_plan);
                 <B as Backend>::sync(&autogaze_device).expect("rolling e2e autogaze sync");
-                <JepaBackend as Backend>::sync(&jepa_device).expect("rolling e2e jepa sync");
+                <J as Backend>::sync(&jepa_device).expect("rolling e2e jepa sync");
+            });
+            let mut rolling_mask_temporal_e2e_stream =
+                TemporalSparseJepaStream::<J>::new(rolling_stream_config);
+            rolling_mask_temporal_e2e_stream
+                .forward_masks_sparse_patchify_bench(
+                    &jepa,
+                    rolling_jepa_video.clone(),
+                    rolling_context_mask.clone(),
+                    rolling_target_mask.clone(),
+                    0,
+                )
+                .expect("prime rolling mask e2e stream");
+            <J as Backend>::sync(&jepa_device).expect("prime rolling mask e2e stream sync");
+            let rolling_mask_temporal_e2e_pipeline_ms = measure_ms(warmups, reps, || {
+                let generated = rolling_plan.generate(&autogaze, rolling_ag_video.clone());
+                let masks = rolling_plan
+                    .project_generated_masks(&generated)
+                    .expect("rolling e2e temporal masks");
+                let output = rolling_mask_temporal_e2e_stream
+                    .forward_masks_sparse_patchify_bench(
+                        &jepa,
+                        rolling_jepa_video.clone(),
+                        masks.context_mask,
+                        masks.target_mask,
+                        0,
+                    )
+                    .expect("rolling mask e2e temporal stream");
+                black_box(output.reused_encoder_plan);
+                black_box(output.reused_patchify_plan);
+                black_box(output.temporal.reused_predictor_plan);
+                <B as Backend>::sync(&autogaze_device).expect("rolling mask e2e autogaze sync");
+                <J as Backend>::sync(&jepa_device).expect("rolling mask e2e jepa sync");
+            });
+            let mut rolling_streaming_autogaze_e2e_cache = AutoGazeStreamingCache::<B>::new(FRAMES);
+            rolling_plan.generate_streaming(
+                &autogaze,
+                rolling_ag_video.clone(),
+                &mut rolling_streaming_autogaze_e2e_cache,
+            );
+            let mut rolling_streaming_temporal_e2e_stream =
+                TemporalSparseJepaStream::<J>::new(rolling_stream_config);
+            rolling_streaming_temporal_e2e_stream
+                .forward_masks_sparse_patchify_bench(
+                    &jepa,
+                    rolling_jepa_video.clone(),
+                    rolling_context_mask.clone(),
+                    rolling_target_mask.clone(),
+                    0,
+                )
+                .expect("prime rolling streaming e2e stream");
+            <B as Backend>::sync(&autogaze_device)
+                .expect("prime rolling streaming e2e autogaze sync");
+            <J as Backend>::sync(&jepa_device).expect("prime rolling streaming e2e jepa sync");
+            let rolling_streaming_temporal_e2e_pipeline_ms = measure_ms(warmups, reps, || {
+                let generated = rolling_plan.generate_streaming(
+                    &autogaze,
+                    rolling_ag_video.clone(),
+                    &mut rolling_streaming_autogaze_e2e_cache,
+                );
+                let masks = rolling_plan
+                    .project_generated_masks(&generated)
+                    .expect("rolling streaming e2e temporal masks");
+                let output = rolling_streaming_temporal_e2e_stream
+                    .forward_masks_sparse_patchify_bench(
+                        &jepa,
+                        rolling_jepa_video.clone(),
+                        masks.context_mask,
+                        masks.target_mask,
+                        0,
+                    )
+                    .expect("rolling streaming e2e temporal stream");
+                black_box(output.reused_encoder_plan);
+                black_box(output.reused_patchify_plan);
+                black_box(output.temporal.reused_predictor_plan);
+                <B as Backend>::sync(&autogaze_device)
+                    .expect("rolling streaming e2e autogaze sync");
+                <J as Backend>::sync(&jepa_device).expect("rolling streaming e2e jepa sync");
             });
             let clips_per_sec = 1000.0 / e2e_pipeline_ms.max(f64::EPSILON);
             let frames_per_sec = clips_per_sec * FRAMES as f64;
             let temporal_clips_per_sec = 1000.0 / temporal_e2e_pipeline_ms.max(f64::EPSILON);
+            let temporal_mask_clips_per_sec =
+                1000.0 / temporal_mask_e2e_pipeline_ms.max(f64::EPSILON);
             let temporal_frames_per_sec = temporal_clips_per_sec * FRAMES as f64;
             let rolling_temporal_frames_per_sec =
                 (1000.0 / rolling_temporal_e2e_pipeline_ms.max(f64::EPSILON)) * TUBELET_SIZE as f64;
+            let rolling_mask_temporal_frames_per_sec = (1000.0
+                / rolling_mask_temporal_e2e_pipeline_ms.max(f64::EPSILON))
+                * TUBELET_SIZE as f64;
+            let rolling_streaming_temporal_frames_per_sec = (1000.0
+                / rolling_streaming_temporal_e2e_pipeline_ms.max(f64::EPSILON))
+                * TUBELET_SIZE as f64;
 
             let row = BenchRow {
                 autogaze_backend,
-                jepa_backend: "sparse-patchify-wgpu",
+                jepa_backend: J::JEPA_BACKEND_LABEL,
                 resolution: resolution.name,
                 width: resolution.width,
                 height: resolution.height,
@@ -669,11 +1102,16 @@ where
                 dense_tokens,
                 target_density,
                 actual_density: context_mask.len() as f32 / dense_tokens as f32,
-                autogaze_top_k,
+                autogaze_top_k: clip_plan.top_k,
                 context_tokens: context_mask.len(),
                 target_tokens: target_mask.len(),
                 autogaze_generate_ms,
+                rolling_autogaze_generate_ms,
+                rolling_autogaze_streaming_generate_ms,
                 autogaze_trace_ms,
+                sparse_project_ms,
+                sparse_mask_project_ms,
+                sparse_plan_ms,
                 sparse_project_plan_ms,
                 dense_patchify_ms,
                 sparse_patchify_ms,
@@ -681,15 +1119,23 @@ where
                 predictor_ms,
                 sparse_jepa_ms,
                 temporal_stream_ms,
+                temporal_mask_stream_ms,
                 rolling_temporal_stream_ms,
+                rolling_temporal_mask_stream_ms,
                 e2e_pipeline_ms,
                 temporal_e2e_pipeline_ms,
+                temporal_mask_e2e_pipeline_ms,
                 rolling_temporal_e2e_pipeline_ms,
+                rolling_mask_temporal_e2e_pipeline_ms,
+                rolling_streaming_temporal_e2e_pipeline_ms,
                 clips_per_sec,
                 frames_per_sec,
                 temporal_clips_per_sec,
+                temporal_mask_clips_per_sec,
                 temporal_frames_per_sec,
                 rolling_temporal_frames_per_sec,
+                rolling_mask_temporal_frames_per_sec,
+                rolling_streaming_temporal_frames_per_sec,
             };
             println!("{}", row.to_csv());
             rows.push(row);
@@ -699,14 +1145,16 @@ where
     rows
 }
 
-fn run_sparse_jepa_once(
-    jepa: &VJepa2_1Model<JepaBackend>,
-    config: &VJepaConfig,
-    video: Tensor<JepaBackend, 5>,
-    context_plan: &SparsePatchifyPlan<JepaBackend>,
-    predictor_plan: &SparsePredictorPlan<JepaBackend>,
-) -> anyhow::Result<()> {
-    let tokens = sparse_patchify_tokens(jepa, config, video, context_plan)?;
+fn run_sparse_jepa_once<J>(
+    jepa: &VJepa2_1Model<J>,
+    video: Tensor<J, 5>,
+    context_plan: &SparsePatchifyPlan<J>,
+    predictor_plan: &SparsePredictorPlan<J>,
+) -> anyhow::Result<()>
+where
+    J: SparsePatchifyBenchBackend,
+{
+    let tokens = sparse_patchify_tokens(jepa, video, context_plan)?;
     let encoded = jepa.encoder.forward_sparse_tokens(
         tokens,
         BATCH,
@@ -740,148 +1188,15 @@ fn median_ms(samples: &mut [Duration]) -> f64 {
     samples[mid].as_secs_f64() * 1000.0
 }
 
-fn density_top_k(grid: TokenGridShape, density: f32) -> usize {
-    let per_tubelet = grid.tokens_per_frame().max(1);
-    ((per_tubelet as f32) * density).ceil().clamp(1.0, 32.0) as usize
-}
-
-fn context_mask_from_autogaze_generated(
-    generated: &AutoGazeGenerateOutput,
-    frames: usize,
-    grid: TokenGridShape,
-    min_keep_tokens: usize,
-    top_k: usize,
-) -> anyhow::Result<SparseTokenMask> {
-    let target = min_keep_tokens.max(1).min(grid.len());
-    let frame_tokens = generated_frame_tokens(generated, frames, top_k);
-    sparse_mask_from_frame_token_indices(
-        grid,
-        TUBELET_SIZE,
-        autogaze_image_token_grid(),
-        &frame_tokens,
-        0,
-        target,
-    )
-}
-
-fn generated_frame_tokens(
-    generated: &AutoGazeGenerateOutput,
-    frames: usize,
-    top_k: usize,
-) -> Vec<Vec<usize>> {
-    let tokens = generated.gazing_pos.first();
-    let padded = generated.if_padded_gazing.first();
-    let mut cursor = 0usize;
-    (0..frames)
-        .map(|frame_idx| {
-            let frame_len = generated
-                .num_gazing_each_frame
-                .get(frame_idx)
-                .copied()
-                .unwrap_or(0);
-            let frame_offset = (frame_idx * AUTOGAZE_CONNECTOR_TOKENS) as i64;
-            let mut frame_tokens = Vec::with_capacity(top_k.min(frame_len));
-            for local_idx in 0..frame_len {
-                if frame_tokens.len() >= top_k {
-                    break;
-                }
-                let token_index = cursor + local_idx;
-                if padded
-                    .and_then(|flags| flags.get(token_index))
-                    .copied()
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
-                let Some(raw_token) = tokens.and_then(|tokens| tokens.get(token_index)).copied()
-                else {
-                    continue;
-                };
-                let token = raw_token - frame_offset;
-                if token < 0 {
-                    continue;
-                }
-                let token = token as usize;
-                if token < AUTOGAZE_CONNECTOR_TOKENS {
-                    frame_tokens.push(token);
-                }
-            }
-            cursor += frame_len;
-            frame_tokens
-        })
-        .collect()
-}
-
-fn autogaze_image_token_grid() -> SparseImageTokenGrid {
-    let grid = (AUTOGAZE_CONNECTOR_TOKENS as f32).sqrt() as usize;
-    assert_eq!(
-        grid * grid,
-        AUTOGAZE_CONNECTOR_TOKENS,
-        "benchmark AutoGaze connector token grid must be square"
-    );
-    SparseImageTokenGrid::new(grid, grid)
-}
-
-fn target_mask_for_context(context: &SparseTokenMask, target_keep: usize) -> SparseTokenMask {
-    let dense_len = context.dense_len();
-    let context_set = context.indices().iter().copied().collect::<BTreeSet<_>>();
-    let mut target = SparseTokenMask::evenly_spaced(dense_len, target_keep)
-        .indices()
-        .iter()
-        .copied()
-        .filter(|index| !context_set.contains(index))
-        .collect::<Vec<_>>();
-    if target.len() < target_keep.min(dense_len.saturating_sub(context.len()).max(1)) {
-        for index in 0..dense_len {
-            if !context_set.contains(&index) && !target.contains(&index) {
-                target.push(index);
-                if target.len() >= target_keep {
-                    break;
-                }
-            }
-        }
-    }
-    SparseTokenMask::new(target, dense_len).expect("target mask")
-}
-
-fn sparse_patchify_tokens(
-    model: &VJepa2_1Model<JepaBackend>,
-    config: &VJepaConfig,
-    video: Tensor<JepaBackend, 5>,
-    plan: &SparsePatchifyPlan<JepaBackend>,
-) -> anyhow::Result<Tensor<JepaBackend, 3>> {
-    let [batch, channels, frames, height, width] = video.shape().dims::<5>();
-    let patchify_config = burn_flex_gmm::SparsePatchify3dConfig {
-        in_channels: channels,
-        out_channels: config.encoder.embed_dim,
-        frames,
-        height,
-        width,
-        tubelet_size: config.tubelet_size,
-        patch_h: config.patch_size,
-        patch_w: config.patch_size,
-    };
-    let bias = model
-        .encoder
-        .patch_embed
-        .proj
-        .bias
-        .as_ref()
-        .map(|bias| bias.val())
-        .unwrap_or_else(|| {
-            Tensor::<JepaBackend, 1>::zeros([config.encoder.embed_dim], &video.device())
-        });
-    let rows = plan.output_rows();
-    let tokens = burn_flex_gmm::wgpu::sparse_patchify3d_forward_wgpu(
-        &patchify_config,
-        video,
-        plan.coords.clone(),
-        model.encoder.patch_embed.proj.weight.val(),
-        bias,
-    )
-    .map_err(anyhow::Error::msg)?
-    .reshape([batch, rows / batch, config.encoder.embed_dim]);
-    Ok(tokens)
+fn sparse_patchify_tokens<J>(
+    model: &VJepa2_1Model<J>,
+    video: Tensor<J, 5>,
+    plan: &SparsePatchifyPlan<J>,
+) -> anyhow::Result<Tensor<J, 3>>
+where
+    J: SparsePatchifyBenchBackend,
+{
+    J::sparse_patchify_tokens(model, video, plan)
 }
 
 fn deterministic_autogaze_pipeline<B: Backend>(device: &B::Device) -> AutoGazePipeline<B> {
@@ -1051,10 +1366,50 @@ fn backend_filter() -> Vec<String> {
         .collect()
 }
 
+fn jepa_backend_filter() -> Vec<String> {
+    env::var("BURN_JEPA_PIPELINE_JEPA_BACKENDS")
+        .unwrap_or_else(|_| "all".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+fn name_filter(name: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_else(|_| "all".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+fn density_cases() -> Vec<f32> {
+    let Ok(value) = env::var("BURN_JEPA_PIPELINE_BENCH_DENSITIES") else {
+        return DENSITIES.to_vec();
+    };
+    let densities = value
+        .split(',')
+        .filter_map(|value| value.trim().parse::<f32>().ok())
+        .filter(|density| density.is_finite() && *density > 0.0)
+        .map(|density| density.min(1.0))
+        .collect::<Vec<_>>();
+    if densities.is_empty() {
+        DENSITIES.to_vec()
+    } else {
+        densities
+    }
+}
+
 fn backend_enabled(filter: &[String], backend: &str) -> bool {
-    filter
-        .iter()
-        .any(|value| value == "all" || value == backend)
+    name_enabled(filter, backend)
+}
+
+fn name_enabled(filter: &[String], name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    filter.iter().any(|value| value == "all" || value == &name)
 }
 
 #[cfg(feature = "cuda")]
@@ -1152,12 +1507,12 @@ fn csv_string(rows: &[BenchRow]) -> String {
 
 impl BenchRow {
     fn csv_header() -> &'static str {
-        "autogaze_backend,jepa_backend,resolution,width,height,frames,dense_tokens,target_density,actual_density,autogaze_top_k,context_tokens,target_tokens,autogaze_generate_ms,autogaze_trace_ms,sparse_project_plan_ms,dense_patchify_ms,sparse_patchify_ms,sparse_encoder_ms,predictor_ms,sparse_jepa_ms,temporal_stream_ms,rolling_temporal_stream_ms,e2e_pipeline_ms,temporal_e2e_pipeline_ms,rolling_temporal_e2e_pipeline_ms,clips_per_sec,frames_per_sec,temporal_clips_per_sec,temporal_frames_per_sec,rolling_temporal_frames_per_sec"
+        "autogaze_backend,jepa_backend,resolution,width,height,frames,dense_tokens,target_density,actual_density,autogaze_top_k,context_tokens,target_tokens,autogaze_generate_ms,rolling_autogaze_generate_ms,rolling_autogaze_streaming_generate_ms,autogaze_trace_ms,sparse_project_ms,sparse_mask_project_ms,sparse_plan_ms,sparse_project_plan_ms,dense_patchify_ms,sparse_patchify_ms,sparse_encoder_ms,predictor_ms,sparse_jepa_ms,temporal_stream_ms,temporal_mask_stream_ms,rolling_temporal_stream_ms,rolling_temporal_mask_stream_ms,e2e_pipeline_ms,temporal_e2e_pipeline_ms,temporal_mask_e2e_pipeline_ms,rolling_temporal_e2e_pipeline_ms,rolling_mask_temporal_e2e_pipeline_ms,rolling_streaming_temporal_e2e_pipeline_ms,clips_per_sec,frames_per_sec,temporal_clips_per_sec,temporal_mask_clips_per_sec,temporal_frames_per_sec,rolling_temporal_frames_per_sec,rolling_mask_temporal_frames_per_sec,rolling_streaming_temporal_frames_per_sec"
     }
 
     fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            "{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
             self.autogaze_backend,
             self.jepa_backend,
             self.resolution,
@@ -1171,7 +1526,12 @@ impl BenchRow {
             self.context_tokens,
             self.target_tokens,
             self.autogaze_generate_ms,
+            self.rolling_autogaze_generate_ms,
+            self.rolling_autogaze_streaming_generate_ms,
             self.autogaze_trace_ms,
+            self.sparse_project_ms,
+            self.sparse_mask_project_ms,
+            self.sparse_plan_ms,
             self.sparse_project_plan_ms,
             self.dense_patchify_ms,
             self.sparse_patchify_ms,
@@ -1179,15 +1539,23 @@ impl BenchRow {
             self.predictor_ms,
             self.sparse_jepa_ms,
             self.temporal_stream_ms,
+            self.temporal_mask_stream_ms,
             self.rolling_temporal_stream_ms,
+            self.rolling_temporal_mask_stream_ms,
             self.e2e_pipeline_ms,
             self.temporal_e2e_pipeline_ms,
+            self.temporal_mask_e2e_pipeline_ms,
             self.rolling_temporal_e2e_pipeline_ms,
+            self.rolling_mask_temporal_e2e_pipeline_ms,
+            self.rolling_streaming_temporal_e2e_pipeline_ms,
             self.clips_per_sec,
             self.frames_per_sec,
             self.temporal_clips_per_sec,
+            self.temporal_mask_clips_per_sec,
             self.temporal_frames_per_sec,
-            self.rolling_temporal_frames_per_sec
+            self.rolling_temporal_frames_per_sec,
+            self.rolling_mask_temporal_frames_per_sec,
+            self.rolling_streaming_temporal_frames_per_sec
         )
     }
 }
