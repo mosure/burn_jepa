@@ -1,8 +1,14 @@
 use super::step::{TttPatchifyKind, TttRolloutKind};
-use crate::{SparseTokenMask, VJepaConfig, training::config::BurnJepaTrainConfig};
+use crate::training::config::BurnJepaTrainConfig;
+use crate::{SparseTokenMask, TttTargetMode, VJepaConfig, VJepaTttLayerProbeRecord, VJepaTttModel};
+use anyhow::Result;
+use burn::optim::GradientsParams;
+use burn::tensor::Tensor;
+use burn::tensor::backend::{AutodiffBackend, Backend};
 
 use crate::training::report::{
-    TttMaskMetrics, TttMemoryMetrics, TttRolloutMetrics, TttRolloutReportMode,
+    TttLayerUtilizationMetric, TttMaskMetrics, TttMemoryMetrics, TttRolloutMetrics,
+    TttRolloutReportMode, TttTargetSupervisionMetrics, TttUtilizationMetrics, tensor_scalar,
 };
 
 pub(super) fn mask_metrics_from_masks(
@@ -86,4 +92,177 @@ pub(super) fn rollout_metrics(
         full_grid_eval,
         autodiff_sparse_patchify: patchify == TttPatchifyKind::FrozenSparsePatchify,
     }
+}
+
+pub(super) fn target_supervision_metrics(
+    config: &BurnJepaTrainConfig,
+) -> TttTargetSupervisionMetrics {
+    match config.ttt.target {
+        TttTargetMode::TeacherFinal => TttTargetSupervisionMetrics {
+            mode: TttTargetMode::TeacherFinal,
+            train_adapter_target: "teacher_final_encoder_tokens",
+            deploy_adapter_target: "self_hidden_detached",
+            layer_alignment: "cross_depth_final_teacher_to_all_ttt_layers",
+            teacher_forced_eval: true,
+        },
+        TttTargetMode::SelfHidden => TttTargetSupervisionMetrics {
+            mode: TttTargetMode::SelfHidden,
+            train_adapter_target: "self_hidden_detached",
+            deploy_adapter_target: "self_hidden_detached",
+            layer_alignment: "layer_local_self_hidden",
+            teacher_forced_eval: false,
+        },
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct TttLayerGradientRms {
+    pub ttt_layer: usize,
+    pub target_proj_grad_rms: Option<f64>,
+    pub temporal_conv_grad_rms: Option<f64>,
+    pub out_proj_grad_rms: Option<f64>,
+}
+
+#[derive(Default)]
+struct UtilizationAccumulator {
+    encoder_layer: usize,
+    ttt_layer: usize,
+    samples: usize,
+    hidden_rms: f64,
+    memory_read_rms: f64,
+    adapter_delta_rms: f64,
+    fast_weight_rms: f64,
+    fast_update_rms: f64,
+}
+
+pub(super) fn ttt_utilization_metrics<B: Backend>(
+    config: &BurnJepaTrainConfig,
+    model: &VJepaTttModel<B>,
+    probes: Vec<VJepaTttLayerProbeRecord<B>>,
+    samples: usize,
+) -> Result<TttUtilizationMetrics> {
+    let layers = config.ttt.resolved_layers(model.config());
+    let mut accumulators = layers
+        .iter()
+        .enumerate()
+        .map(|(ttt_layer, &encoder_layer)| {
+            let mut acc = UtilizationAccumulator::default();
+            acc.encoder_layer = encoder_layer;
+            acc.ttt_layer = ttt_layer;
+            acc
+        })
+        .collect::<Vec<_>>();
+
+    for record in probes {
+        if let Some(acc) = accumulators.get_mut(record.ttt_layer) {
+            let hidden_rms = tensor_rms(record.probe.hidden)?;
+            let memory_read_rms = tensor_rms(record.probe.memory_read)?;
+            let adapter_delta_rms = tensor_rms(record.probe.adapter_delta)?;
+            let fast_weight_rms = tensor_rms(record.probe.fast_weight_after.clone())?;
+            let fast_update_rms =
+                tensor_rms(record.probe.fast_weight_after - record.probe.fast_weight_before)?;
+            acc.encoder_layer = record.encoder_layer;
+            acc.samples += samples.max(1);
+            acc.hidden_rms += hidden_rms;
+            acc.memory_read_rms += memory_read_rms;
+            acc.adapter_delta_rms += adapter_delta_rms;
+            acc.fast_weight_rms += fast_weight_rms;
+            acc.fast_update_rms += fast_update_rms;
+        }
+    }
+
+    let metrics = accumulators
+        .into_iter()
+        .map(|acc| {
+            let divisor = acc.samples.max(1) as f64 / samples.max(1) as f64;
+            let layer = &model.encoder.ttt_layers[acc.ttt_layer];
+            let target_proj_param_rms = layer
+                .target_proj
+                .as_ref()
+                .map(|proj| tensor_rms(proj.weight.val()))
+                .transpose()?;
+            let temporal_conv_param_rms = tensor_rms(layer.temporal_conv.weight.val())?;
+            let out_proj_param_rms = tensor_rms(layer.out_proj.weight.val())?;
+            let hidden_rms = acc.hidden_rms / divisor.max(1.0);
+            let adapter_delta_rms = acc.adapter_delta_rms / divisor.max(1.0);
+            Ok(TttLayerUtilizationMetric {
+                encoder_layer: acc.encoder_layer,
+                ttt_layer: acc.ttt_layer,
+                samples: acc.samples,
+                hidden_rms,
+                memory_read_rms: acc.memory_read_rms / divisor.max(1.0),
+                adapter_delta_rms,
+                adapter_delta_to_hidden: adapter_delta_rms / hidden_rms.max(1.0e-12),
+                fast_weight_rms: acc.fast_weight_rms / divisor.max(1.0),
+                fast_update_rms: acc.fast_update_rms / divisor.max(1.0),
+                target_proj_param_rms,
+                temporal_conv_param_rms,
+                out_proj_param_rms,
+                target_proj_grad_rms: None,
+                temporal_conv_grad_rms: None,
+                out_proj_grad_rms: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(TttUtilizationMetrics {
+        samples,
+        layers: metrics,
+    })
+}
+
+pub(super) fn ttt_gradient_metrics<B: AutodiffBackend>(
+    config: &BurnJepaTrainConfig,
+    model: &VJepaTttModel<B>,
+    grads: &GradientsParams,
+) -> Result<Vec<TttLayerGradientRms>> {
+    let layers = config.ttt.resolved_layers(model.config());
+    layers
+        .iter()
+        .enumerate()
+        .map(|(ttt_layer, _)| {
+            let layer = &model.encoder.ttt_layers[ttt_layer];
+            let target_proj_grad_rms = layer
+                .target_proj
+                .as_ref()
+                .and_then(|proj| grads.get::<B::InnerBackend, 2>(proj.weight.id))
+                .map(tensor_rms)
+                .transpose()?;
+            let temporal_conv_grad_rms = grads
+                .get::<B::InnerBackend, 3>(layer.temporal_conv.weight.id)
+                .map(tensor_rms)
+                .transpose()?;
+            let out_proj_grad_rms = grads
+                .get::<B::InnerBackend, 2>(layer.out_proj.weight.id)
+                .map(tensor_rms)
+                .transpose()?;
+            Ok(TttLayerGradientRms {
+                ttt_layer,
+                target_proj_grad_rms,
+                temporal_conv_grad_rms,
+                out_proj_grad_rms,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn merge_gradient_metrics(
+    utilization: &mut TttUtilizationMetrics,
+    gradients: &[TttLayerGradientRms],
+) {
+    for layer in &mut utilization.layers {
+        if let Some(grad) = gradients
+            .iter()
+            .find(|grad| grad.ttt_layer == layer.ttt_layer)
+        {
+            layer.target_proj_grad_rms = grad.target_proj_grad_rms;
+            layer.temporal_conv_grad_rms = grad.temporal_conv_grad_rms;
+            layer.out_proj_grad_rms = grad.out_proj_grad_rms;
+        }
+    }
+}
+
+fn tensor_rms<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Result<f64> {
+    let scalar = tensor_scalar(tensor.powf_scalar(2.0).mean().detach())?;
+    Ok(scalar.max(0.0).sqrt())
 }

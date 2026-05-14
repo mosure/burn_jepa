@@ -155,6 +155,8 @@ pub struct TrainingLoopConfig {
     pub eval_steps: usize,
     pub eval_batch_size: Option<usize>,
     pub eval_full_grid: bool,
+    pub eval_utilization_diagnostics: bool,
+    pub eval_temporal_diagnostics: bool,
     pub cache_teacher_tokens: bool,
     pub save_steps: usize,
 }
@@ -176,6 +178,8 @@ impl Default for TrainingLoopConfig {
             eval_steps: 0,
             eval_batch_size: None,
             eval_full_grid: true,
+            eval_utilization_diagnostics: false,
+            eval_temporal_diagnostics: false,
             cache_teacher_tokens: false,
             save_steps: 0,
         }

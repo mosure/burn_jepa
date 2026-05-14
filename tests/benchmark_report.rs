@@ -205,6 +205,20 @@ fn ttt_training_benchmark_has_sparse_density_training_step_matrix() {
         "sparsity sweep should exercise fixed-width per-sample sparse TTT rollout"
     );
     assert!(
+        bench.contains("ttt_sparse_patchify_sparsity_training_step_"),
+        "TTT Criterion benches should expose a flex-gmm sparse-patchify training-step group"
+    );
+    assert!(
+        compact.contains("student_frozen_sparse_patchify_rollout_batch("),
+        "sparse-patchify sweep should skip dense patch embedding in the sparse training rows"
+    );
+    assert!(
+        bench.contains(
+            "density_{}_sparse_patchify_b{batch_size}_tokens{keep_tokens}_of{dense_tokens}"
+        ),
+        "sparse-patchify rows should encode density, batch size, and token count in the benchmark id"
+    );
+    assert!(
         compact.contains("forward_single_frame_rollout("),
         "sparsity sweep should include the dense TTT rollout baseline"
     );

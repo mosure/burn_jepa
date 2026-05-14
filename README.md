@@ -176,6 +176,16 @@ finetuning. The TTT state is chunked by `ttt.chunk_tokens`, updated in sequence,
 and detached every `ttt.rollout_blocks` tubelets for block-rollout training.
 `ttt.target = "teacher_final"` uses detached teacher tubelet features for the
 fast-weight target; `ttt.target = "self_hidden"` uses current hidden states.
+Training/eval reports keep deployable student inference separate from
+teacher-forced diagnostics: `eval_loss`/`eval_cosine` are free-run metrics,
+while `teacher_forced_eval_*` and `teacher_forcing_*_gap` quantify privileged
+teacher-target adaptation. Reports also include per-layer TTT utilization
+metrics such as fast-weight update RMS, adapter residual RMS, memory-read RMS,
+parameter RMS, final-step gradient RMS, and state-reset/frozen-update temporal
+diagnostics, including reverse-order and deterministic shuffle-order probes.
+Those deeper probes are opt-in via `training.eval_utilization_diagnostics` and
+`training.eval_temporal_diagnostics` so large eval/benchmark runs keep the
+production sparse rollout cost unless the probes are explicitly requested.
 Set `loss.predictor_loss_weight > 0` to train the normal sparse JEPA predictor
 objective alongside feature distillation.
 The default TTT placement is `ttt.layer_placement = "first_last"`, which
@@ -323,7 +333,21 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo bench --bench ttt_training \
   --no-default-features --features ndarray,cuda \
   -- ttt_sparsity_training_step_cuda --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,wgpu,sparse-patchify-wgpu \
+  -- ttt_sparse_patchify_sparsity_training_step_wgpu --sample-size 10 --measurement-time 1 --warm-up-time 0.2
+
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,cuda,sparse-patchify-cuda \
+  -- ttt_sparse_patchify_sparsity_training_step_cuda --sample-size 10 --measurement-time 1 --warm-up-time 0.2
 ```
+
+Use `ttt_sparsity_training_step_*` to isolate sparse-token transformer/backward
+scaling. Use `ttt_sparse_patchify_sparsity_training_step_*` for the
+adapter-training pixel-skip path; sparse rows use flex-gmm sparse patchify
+instead of dense Burn patch embedding followed by gather.
 
 On the local ndarray backend this tiny smoke benchmark measured
 `ttt_single_frame_rollout_ndarray` at 4.7869 ms to 4.8055 ms.

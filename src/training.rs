@@ -17,7 +17,9 @@ pub use mask::{
 };
 pub use report::{
     DenseJepaTrainingReport, TttBackpropMetrics, TttDomainEvalMetric, TttEvalReport,
-    TttRolloutMetrics, TttRolloutReportMode, TttTrainingReport,
+    TttLayerUtilizationMetric, TttRolloutMetrics, TttRolloutReportMode,
+    TttTargetSupervisionMetrics, TttTemporalDiagnosticMetrics, TttTrainingReport,
+    TttUtilizationMetrics,
 };
 pub use ttt::{
     TttDistillationLoss, TttSparsePatchifyTrainingBackend, evaluate_ttt_distillation,

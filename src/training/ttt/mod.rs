@@ -66,6 +66,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     let mut train_stage = TttStageMetrics::default();
     let mut teacher_cache = BTreeMap::<String, burn::tensor::Tensor<B, 3>>::new();
     let mut observed_dense_tokens = None;
+    let mut final_grad_metrics = None;
     let rollout = step::rollout_kind(config);
     let patchify = step::patchify_kind::<B>(config, rollout)?;
 
@@ -138,6 +139,10 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
 
         let backward_start = Instant::now();
         let grads = GradientsParams::from_grads(loss.backward(), &model);
+        if step_number == config.training.max_steps && config.training.eval_utilization_diagnostics
+        {
+            final_grad_metrics = Some(metrics::ttt_gradient_metrics(config, &model, &grads)?);
+        }
         let backward_ms = backward_start.elapsed().as_millis();
         train_stage.backward_ms += backward_ms;
         train_stage.backward_optim_ms += backward_ms;
@@ -170,11 +175,17 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     let (
         eval_loss,
         eval_cosine,
+        teacher_forced_eval_loss,
+        teacher_forced_eval_cosine,
+        teacher_forcing_loss_gap,
+        teacher_forcing_cosine_gap,
         eval_full_loss,
         eval_full_cosine,
         eval_samples,
         eval_stage,
         eval_domains,
+        mut utilization,
+        temporal_diagnostics,
     ) = if config.training.eval_steps > 0 {
         let eval = eval::evaluate_ttt_dataset(
             &model,
@@ -186,11 +197,17 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         (
             Some(eval.loss),
             Some(eval.cosine),
+            eval.teacher_forced_loss,
+            eval.teacher_forced_cosine,
+            eval.teacher_forcing_loss_gap,
+            eval.teacher_forcing_cosine_gap,
             eval.full_loss,
             eval.full_cosine,
             eval.samples,
             eval.stage,
             eval.domains,
+            eval.utilization,
+            eval.temporal_diagnostics,
         )
     } else {
         (
@@ -198,11 +215,22 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
             0,
             TttStageMetrics::default(),
             Vec::new(),
+            None,
+            None,
         )
     };
+    if let (Some(utilization), Some(gradients)) =
+        (utilization.as_mut(), final_grad_metrics.as_ref())
+    {
+        metrics::merge_gradient_metrics(utilization, gradients);
+    }
     let eval_elapsed_ms = eval_start.elapsed().as_millis();
     let model_path = save_model_if_enabled(config, &model)?;
     let samples = config.training.max_steps * config.training.batch_size;
@@ -229,18 +257,37 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             mode: config.ttt.backprop_mode,
             truncate_blocks: config.ttt.backprop_truncate_blocks,
         },
+        target_supervision: metrics::target_supervision_metrics(config),
         pre_train_eval_loss: pre_train_eval.as_ref().map(|eval| eval.loss),
         pre_train_eval_cosine: pre_train_eval.as_ref().map(|eval| eval.cosine),
+        pre_train_teacher_forced_eval_loss: pre_train_eval
+            .as_ref()
+            .and_then(|eval| eval.teacher_forced_loss),
+        pre_train_teacher_forced_eval_cosine: pre_train_eval
+            .as_ref()
+            .and_then(|eval| eval.teacher_forced_cosine),
+        pre_train_teacher_forcing_loss_gap: pre_train_eval
+            .as_ref()
+            .and_then(|eval| eval.teacher_forcing_loss_gap),
+        pre_train_teacher_forcing_cosine_gap: pre_train_eval
+            .as_ref()
+            .and_then(|eval| eval.teacher_forcing_cosine_gap),
         pre_train_full_eval_loss: pre_train_eval.as_ref().and_then(|eval| eval.full_loss),
         pre_train_full_eval_cosine: pre_train_eval.as_ref().and_then(|eval| eval.full_cosine),
         eval_loss,
         eval_cosine,
+        teacher_forced_eval_loss,
+        teacher_forced_eval_cosine,
+        teacher_forcing_loss_gap,
+        teacher_forcing_cosine_gap,
         eval_full_loss,
         eval_full_cosine,
         eval_samples,
         train_stage,
         eval_stage,
         eval_domains,
+        utilization,
+        temporal_diagnostics,
         train_elapsed_ms,
         eval_elapsed_ms,
         elapsed_ms,
@@ -333,13 +380,20 @@ pub fn evaluate_ttt_model_file<B: step::TttSparsePatchifyTrainingBackend>(
         eval_samples,
         loss: eval.loss,
         cosine: eval.cosine,
+        teacher_forced_loss: eval.teacher_forced_loss,
+        teacher_forced_cosine: eval.teacher_forced_cosine,
+        teacher_forcing_loss_gap: eval.teacher_forcing_loss_gap,
+        teacher_forcing_cosine_gap: eval.teacher_forcing_cosine_gap,
         full_loss: eval.full_loss,
         full_cosine: eval.full_cosine,
         memory,
         mask: mask_metrics,
         rollout,
+        target_supervision: metrics::target_supervision_metrics(config),
         stage: eval.stage,
         domains: eval.domains,
+        utilization: eval.utilization,
+        temporal_diagnostics: eval.temporal_diagnostics,
         elapsed_ms,
         samples_per_second: samples_per_second(eval_samples, elapsed_ms),
         report_path,

@@ -92,15 +92,17 @@ pub use training::{
     BurnJepaTrainConfig, DenseJepaTrainingReport, DensePredictiveLoss, JepaTrainBackend,
     TrainModelConfig, TrainingAutogazeTokenSource, TrainingBatchingMode, TrainingImageTokenGrid,
     TrainingLoopConfig, TrainingMaskConfig, TttBackpropMetrics, TttDistillationConfig,
-    TttDistillationLoss, TttDomainEvalMetric, TttEvalReport, TttRolloutMetrics,
-    TttRolloutReportMode, TttSparsePatchifyTrainingBackend, TttSparsePatchifyTrainingMode,
-    TttSparseRolloutMode, TttTrainingReport, VJepaTrainingBatch, center_prior_frame_tokens,
-    dense_predictive_loss, evaluate_ttt_distillation, evaluate_ttt_model_file, train_dense_jepa,
-    train_ttt_distillation,
+    TttDistillationLoss, TttDomainEvalMetric, TttEvalReport, TttLayerUtilizationMetric,
+    TttRolloutMetrics, TttRolloutReportMode, TttSparsePatchifyTrainingBackend,
+    TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttTargetSupervisionMetrics,
+    TttTemporalDiagnosticMetrics, TttTrainingReport, TttUtilizationMetrics, VJepaTrainingBatch,
+    center_prior_frame_tokens, dense_predictive_loss, evaluate_ttt_distillation,
+    evaluate_ttt_model_file, train_dense_jepa, train_ttt_distillation,
 };
 pub use ttt::{
-    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttState, TttTargetMode,
-    VJepaTttEncoder, VJepaTttLayer, VJepaTttModel,
+    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttState,
+    TttStateResetMode, TttTargetMode, VJepaTttEncoder, VJepaTttLayer, VJepaTttLayerProbe,
+    VJepaTttLayerProbeRecord, VJepaTttModel,
 };
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;

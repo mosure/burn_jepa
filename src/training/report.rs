@@ -1,4 +1,4 @@
-use crate::TttBackpropMode;
+use crate::{TttBackpropMode, TttTargetMode};
 use anyhow::{Context, Result};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
@@ -55,13 +55,65 @@ pub struct TttStageMetrics {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct TttTargetSupervisionMetrics {
+    pub mode: TttTargetMode,
+    pub train_adapter_target: &'static str,
+    pub deploy_adapter_target: &'static str,
+    pub layer_alignment: &'static str,
+    pub teacher_forced_eval: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct TttDomainEvalMetric {
     pub domain: String,
     pub samples: usize,
     pub loss: f64,
     pub cosine: f64,
+    pub teacher_forced_loss: Option<f64>,
+    pub teacher_forced_cosine: Option<f64>,
+    pub teacher_forcing_loss_gap: Option<f64>,
+    pub teacher_forcing_cosine_gap: Option<f64>,
     pub full_loss: Option<f64>,
     pub full_cosine: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TttLayerUtilizationMetric {
+    pub encoder_layer: usize,
+    pub ttt_layer: usize,
+    pub samples: usize,
+    pub hidden_rms: f64,
+    pub memory_read_rms: f64,
+    pub adapter_delta_rms: f64,
+    pub adapter_delta_to_hidden: f64,
+    pub fast_weight_rms: f64,
+    pub fast_update_rms: f64,
+    pub target_proj_param_rms: Option<f64>,
+    pub temporal_conv_param_rms: f64,
+    pub out_proj_param_rms: f64,
+    pub target_proj_grad_rms: Option<f64>,
+    pub temporal_conv_grad_rms: Option<f64>,
+    pub out_proj_grad_rms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TttUtilizationMetrics {
+    pub samples: usize,
+    pub layers: Vec<TttLayerUtilizationMetric>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TttTemporalDiagnosticMetrics {
+    pub reset_each_frame_loss: Option<f64>,
+    pub reset_each_frame_cosine: Option<f64>,
+    pub reset_each_tubelet_loss: Option<f64>,
+    pub reset_each_tubelet_cosine: Option<f64>,
+    pub reverse_order_loss: Option<f64>,
+    pub reverse_order_cosine: Option<f64>,
+    pub shuffle_order_loss: Option<f64>,
+    pub shuffle_order_cosine: Option<f64>,
+    pub freeze_fast_update_loss: Option<f64>,
+    pub freeze_fast_update_cosine: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -94,18 +146,29 @@ pub struct TttTrainingReport {
     pub mask: Option<TttMaskMetrics>,
     pub rollout: TttRolloutMetrics,
     pub backprop: TttBackpropMetrics,
+    pub target_supervision: TttTargetSupervisionMetrics,
     pub pre_train_eval_loss: Option<f64>,
     pub pre_train_eval_cosine: Option<f64>,
+    pub pre_train_teacher_forced_eval_loss: Option<f64>,
+    pub pre_train_teacher_forced_eval_cosine: Option<f64>,
+    pub pre_train_teacher_forcing_loss_gap: Option<f64>,
+    pub pre_train_teacher_forcing_cosine_gap: Option<f64>,
     pub pre_train_full_eval_loss: Option<f64>,
     pub pre_train_full_eval_cosine: Option<f64>,
     pub eval_loss: Option<f64>,
     pub eval_cosine: Option<f64>,
+    pub teacher_forced_eval_loss: Option<f64>,
+    pub teacher_forced_eval_cosine: Option<f64>,
+    pub teacher_forcing_loss_gap: Option<f64>,
+    pub teacher_forcing_cosine_gap: Option<f64>,
     pub eval_full_loss: Option<f64>,
     pub eval_full_cosine: Option<f64>,
     pub eval_samples: usize,
     pub train_stage: TttStageMetrics,
     pub eval_stage: TttStageMetrics,
     pub eval_domains: Vec<TttDomainEvalMetric>,
+    pub utilization: Option<TttUtilizationMetrics>,
+    pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub train_elapsed_ms: u128,
     pub eval_elapsed_ms: u128,
     pub elapsed_ms: u128,
@@ -121,13 +184,20 @@ pub struct TttEvalReport {
     pub eval_samples: usize,
     pub loss: f64,
     pub cosine: f64,
+    pub teacher_forced_loss: Option<f64>,
+    pub teacher_forced_cosine: Option<f64>,
+    pub teacher_forcing_loss_gap: Option<f64>,
+    pub teacher_forcing_cosine_gap: Option<f64>,
     pub full_loss: Option<f64>,
     pub full_cosine: Option<f64>,
     pub memory: TttMemoryMetrics,
     pub mask: Option<TttMaskMetrics>,
     pub rollout: TttRolloutMetrics,
+    pub target_supervision: TttTargetSupervisionMetrics,
     pub stage: TttStageMetrics,
     pub domains: Vec<TttDomainEvalMetric>,
+    pub utilization: Option<TttUtilizationMetrics>,
+    pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub elapsed_ms: u128,
     pub samples_per_second: f64,
     pub report_path: PathBuf,

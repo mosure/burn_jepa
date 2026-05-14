@@ -15,10 +15,11 @@ rollouts approximate the pretrained 3D/tubelet V-JEPA encoder.
 - Initialization: adapter output projection is zero-initialized, so inserting a
   layer starts as a no-op residual path. The temporal target projection starts as
   an identity-style depthwise 1D filter plus optional identity linear projection.
-- Target mode: `ttt.target = "teacher_final"` updates fast weights from detached
-  teacher tubelet features, while `ttt.target = "self_hidden"` updates from the
-  current hidden states. The latter is useful for self-supervised continual
-  adaptation when teacher features are only used for the rollout loss.
+- Target mode: `ttt.target = "teacher_final"` trains fast weights from detached
+  final teacher tubelet features, while `ttt.target = "self_hidden"` updates
+  from the current hidden states. `teacher_final` is a cross-depth distillation
+  target when adapters are placed before the final block; reports label it as
+  `cross_depth_final_teacher_to_all_ttt_layers`.
 
 This is intentionally a Burn-native adapter instead of a literal mutation of an
 existing dense matrix. In-Place TTT's LLM recipe updates fast weights in the MLP
@@ -43,8 +44,10 @@ memory modules.
   teacher/student forward plumbing.
 - `src/training/ttt/loss.rs`: feature and predictor distillation losses plus
   eval cosine helpers.
-- `src/training/ttt/eval.rs`: evaluation loop and full-grid comparison pass.
-- `src/training/ttt/metrics.rs`: TTT memory and mask report metrics.
+- `src/training/ttt/eval.rs`: free-run evaluation loop, explicit
+  teacher-forced diagnostics, temporal ablations, and full-grid comparison pass.
+- `src/training/ttt/metrics.rs`: TTT memory, mask, target-supervision, and
+  per-layer utilization report metrics.
 - `src/training/dense.rs`: normal dense JEPA training loop.
 - `src/training/batch.rs`, `model_io.rs`, and `report.rs`: shared batch loading,
   checkpoint resolution, and report serialization helpers.
@@ -77,6 +80,37 @@ loss on top of feature distillation; the context/target masks come from
 `training.context_keep_ratio` field is used. The TTT training report records
 `initial_loss`, `best_loss`, and `final_loss`; smoke tests assert finite losses
 and a tiny synthetic convergence step.
+
+## Evaluation Semantics
+
+`eval_loss` and `eval_cosine` are deploy-style free-run metrics: the student
+rollout does not receive teacher tokens as adapter update targets. For
+`ttt.target = "teacher_final"`, reports also include
+`teacher_forced_eval_loss`, `teacher_forced_eval_cosine`, and the
+`teacher_forcing_*_gap` fields. Those teacher-forced fields are diagnostics for
+how much privileged teacher-target adaptation helps; they are not production
+student-inference metrics.
+
+Reports include `target_supervision` to make the adapter target explicit. In
+`teacher_final` mode the training target is final teacher tokens for every TTT
+insertion point, which is cross-depth matching for early adapters. In
+`self_hidden` mode the train and deploy update target is the detached current
+hidden state.
+
+The eval report also records per-layer `utilization` probes:
+`hidden_rms`, `memory_read_rms`, `adapter_delta_rms`,
+`adapter_delta_to_hidden`, `fast_weight_rms`, `fast_update_rms`, trainable
+parameter RMS, and the final-step gradient RMS when available. Temporal
+diagnostics compare free-run output with reset-each-frame, reset-each-tubelet,
+reverse-order, deterministic shuffle-order, and frozen-fast-update rollouts to
+show whether the adapter is using temporal state rather than only acting as a
+static residual.
+
+These deep probes are opt-in because they add extra rollout passes on the first
+eval batch. Set `training.eval_utilization_diagnostics = true` for per-layer
+probe metrics and `training.eval_temporal_diagnostics = true` for the
+reset/order/frozen-update ablations. Free-run, teacher-forced, and gap metrics
+are always reported when `eval_steps > 0`.
 
 ## Mask Config
 
@@ -300,6 +334,13 @@ the matching Cargo feature for GPU training/bench dispatch.
 Use `eval-ttt --no-full-grid` for production sparse-rollout throughput. Use
 `--full-grid` for slower parity diagnostics that run the sparse rollout and an
 additional dense student rollout for full-token loss/cosine.
+The primary eval fields remain free-run in both modes; teacher-forced results
+are only exposed through the explicit `teacher_forced_*` diagnostic fields.
+The deeper utilization and temporal ablations are controlled by
+`training.eval_utilization_diagnostics` and
+`training.eval_temporal_diagnostics`; leave them disabled for throughput
+benchmarks and large ablation matrices unless those probes are the measurement
+target.
 
 The Criterion TTT bench includes an explicit sparse-token training-step matrix:
 
@@ -316,6 +357,15 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo bench --bench ttt_training \
   --no-default-features --features ndarray,cuda \
   -- ttt_sparsity_training_step_cuda --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,wgpu,sparse-patchify-wgpu \
+  -- ttt_sparse_patchify_sparsity_training_step_wgpu --sample-size 10 --measurement-time 1 --warm-up-time 0.2
+
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,cuda,sparse-patchify-cuda \
+  -- ttt_sparse_patchify_sparsity_training_step_cuda --sample-size 10 --measurement-time 1 --warm-up-time 0.2
 ```
 
 Each `ttt_sparsity_training_step_*` sample includes sparse or dense student
@@ -325,6 +375,12 @@ extra `density_100pct_dense_*` row is the normal full-token baseline, while
 `density_100pct_sparse_*` isolates sparse-wrapper overhead when no tokens are
 actually skipped. The benchmark does not read scalar losses back to the host in
 the hot path.
+
+The `ttt_sparse_patchify_sparsity_training_step_*` groups measure the same full
+training-step surface, but route sparse rows through the flex-gmm frozen
+sparse-patchify bridge. Those rows skip dense image patch embedding before the
+TTT encoder and keep the benchmark on the pixel-skip path used by sparse
+adapter-only training when pretrained JEPA weights are frozen.
 
 Local short Criterion smoke from 2026-05-14, using a tiny 64px fixture with 32
 dense tokens and `--sample-size 10 --measurement-time 1 --warm-up-time 0.2`:
@@ -352,6 +408,25 @@ dense image patch embedding before sparse token gather, and the timed step
 includes adapter backward plus AdamW state updates. Teacher-token precompute is
 outside the timed loop. It is therefore a clean TTT forward+backward density
 sweep, not a full AutoGaze/flex-gmm pixel-skip E2E replacement.
+
+Pixel-skip sparse-patchify training-step smoke from the same fixture, using
+`--sample-size 10 --measurement-time 1 --warm-up-time 0.2`:
+
+| Backend | Batch | 10% sparse patchify | 50% sparse patchify | 100% sparse patchify | 100% dense | 10% vs dense |
+|---|---:|---:|---:|---:|---:|---:|
+| WGPU | 1 | 16.408 ms | 12.107 ms | 14.263 ms | 14.420 ms | noisy/outlier |
+| WGPU | 2 | 8.842 ms | 11.793 ms | 13.599 ms | 14.022 ms | 36.9% faster |
+| WGPU | 4 | 8.790 ms | 11.853 ms | 13.512 ms | 13.957 ms | 37.0% faster |
+| CUDA | 1 | 33.360 ms | 18.519 ms | 20.076 ms | 21.215 ms | noisy/outlier |
+| CUDA | 2 | 15.316 ms | 19.627 ms | 20.579 ms | 22.666 ms | 32.4% faster |
+| CUDA | 4 | 15.085 ms | 18.050 ms | 21.669 ms | 19.835 ms | 23.9% faster |
+
+Interpretation: the sparse-patchify lane closes the earlier benchmark gap. It
+now measures sparse pixel patchification, sparse encoder rollout, feature loss,
+backward, and AdamW in one timed sample. The remaining non-proportional scaling
+is expected because transformer dispatch, adapter backward, AdamW, and fixed
+kernel overhead remain in the timed loop; 100% sparse-patchify rows isolate the
+wrapper/kernel overhead when no pixels are skipped.
 
 ## Experiment Harness
 
@@ -398,21 +473,25 @@ as cold-runtime validation, not steady-state throughput.
 
 TTT layer-placement ablations from 2026-05-14:
 
-| Run | Checkpoint/Data | Layer Set | Layers | Variant | Trials | Eval Loss | Eval Cosine | Train Time | Samples/sec |
-|---|---|---|---|---|---:|---:|---:|---:|---:|
-| `real-cuda-224` | V-JEPA 2.1 ViT-B + real video windows | `encoder_first_last` | `[0, 11]` | `ttt_teacher_final` | 1 | 0.3791 | 0.8445 | 46.739 s | 0.171 |
-| `real-cuda-224` | V-JEPA 2.1 ViT-B + real video windows | `encoder_thirds` | `[3, 7, 11]` | `ttt_teacher_final` | 1 | 0.3800 | 0.8442 | 176.536 s | 0.045 |
-| `real-cuda-224` | V-JEPA 2.1 ViT-B + real video windows | `encoder_last` | `[11]` | `ttt_teacher_final` | 1 | 0.3863 | 0.8418 | 12.947 s | 0.618 |
-| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_thirds` | `[1, 2, 3]` | `ttt_teacher_final` | 4 | 1.1586 | 0.4207 | synthetic | synthetic |
-| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_first_last` | `[0, 3]` | `ttt_teacher_final` | 4 | 1.3336 | 0.3332 | synthetic | synthetic |
-| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_last` | `[3]` | `ttt_teacher_final` | 4 | 1.4493 | 0.2753 | synthetic | synthetic |
+| Run | Checkpoint/Data | Layer Set | Layers | Variant | Trials | Free-run loss | Free-run cosine | Teacher-forced loss | Teacher-forced cosine | Train time | Samples/sec |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `real-cuda-224-corrected` | V-JEPA 2.1 ViT-B + real video windows | `encoder_first_last` | `[0, 11]` | `ttt_teacher_final` | 1 | 0.6170 | 0.7575 | 0.3791 | 0.8445 | 160.865 s | 0.050 |
+| `real-cuda-224-corrected` | V-JEPA 2.1 ViT-B + real video windows | `encoder_last` | `[11]` | `ttt_teacher_final` | 1 | 0.6634 | 0.7524 | 0.3863 | 0.8418 | 13.123 s | 0.610 |
+| `real-cuda-224-previous` | V-JEPA 2.1 ViT-B + real video windows | `encoder_thirds` | `[3, 7, 11]` | `ttt_teacher_final` | 1 | not rerun | not rerun | 0.3800 | 0.8442 | 176.536 s | 0.045 |
+| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_thirds` | `[1, 2, 3]` | `ttt_teacher_final` | 4 | 1.1586 | 0.4207 | n/a | n/a | synthetic | synthetic |
+| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_first_last` | `[0, 3]` | `ttt_teacher_final` | 4 | 1.3336 | 0.3332 | n/a | n/a | synthetic | synthetic |
+| `ndarray-depth4-confirm` | synthetic tiny depth-4 | `encoder_last` | `[3]` | `ttt_teacher_final` | 4 | 1.4493 | 0.2753 | n/a | n/a | synthetic | synthetic |
 
-The real-checkpoint row is the default-selection gate. `first_last` matched the
-best short-run held-out sparse loss/cosine while cutting train time by roughly
-3.8x versus `thirds`. The synthetic depth-4 confirmation still prefers
-`thirds`, which is why it remains the documented high-capacity preset. In the
-same real CUDA smoke, `ttt_self_hidden` trailed `ttt_teacher_final` for every
-layer set, so smoke configs should keep `ttt.target = "teacher_final"`.
+The corrected real-checkpoint rerun shows why teacher-forced metrics must stay
+separate: `first_last` has free-run loss `0.6170`, while the old teacher-forced
+diagnostic is `0.3791`. `first_last` remains the best corrected free-run smoke
+among completed real rows, but its backward pass is the current bottleneck. The
+`thirds` corrected free-run row was intentionally not completed in the smoke
+rerun because the three-adapter backward path exceeded the interactive smoke
+budget; treat the previous `thirds` row as teacher-forced-only historical
+context until a dedicated longer run refreshes it. The synthetic depth-4
+confirmation still prefers `thirds`, which is why it remains the documented
+high-capacity preset.
 
 Real-checkpoint CUDA mask/memory ablations from 2026-05-14 used the published
 V-JEPA 2.1 ViT-B checkpoint fixture under

@@ -1,7 +1,7 @@
 use burn::tensor::Tensor;
 use burn_jepa::{
-    SparseMaskBatch, SparseTokenMask, TttEncoderConfig, VJepa2_1Model, VJepaTttModel,
-    apply_mask_batch, synthetic_video,
+    SparseMaskBatch, SparseTokenMask, TttEncoderConfig, TttSparsePatchifyTrainingBackend,
+    VJepa2_1Model, VJepaTttModel, apply_mask_batch, synthetic_video,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -289,6 +289,128 @@ fn bench_ttt_sparsity_training_step_matrix<B>(
     group.finish();
 }
 
+fn bench_ttt_sparse_patchify_sparsity_training_step_matrix<B>(
+    c: &mut Criterion,
+    backend_name: &str,
+    batch_sizes: &[usize],
+) where
+    B: TttSparsePatchifyTrainingBackend,
+{
+    use burn::module::Module;
+    use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+
+    if !B::frozen_sparse_patchify_batch_supported() {
+        eprintln!(
+            "skipping ttt_sparse_patchify_sparsity_training_step_{backend_name}: batched frozen sparse patchify is not supported"
+        );
+        return;
+    }
+
+    let mut group = c.benchmark_group(format!(
+        "ttt_sparse_patchify_sparsity_training_step_{backend_name}"
+    ));
+    for &batch_size in batch_sizes {
+        group.throughput(Throughput::Elements(batch_size as u64));
+
+        let device = Default::default();
+        let config = training_step_bench_config();
+        let dense_tokens = config.num_patches();
+        let video = synthetic_video_batch::<B>(&config, batch_size, &device);
+        let teacher = VJepa2_1Model::<B>::new(&config, &device).no_grad();
+        let teacher_tokens = teacher.encode_video(video.clone(), None).tokens.detach();
+
+        for case in SPARSITY_DENSITY_CASES {
+            let keep_tokens = keep_count_for_density(dense_tokens, case.density);
+            let mask = SparseMaskBatch::<B>::from_rows(
+                density_rows(dense_tokens, batch_size, case.density),
+                dense_tokens,
+                &device,
+            )
+            .expect("density sparse mask batch");
+            let sparse_teacher_tokens = apply_mask_batch(teacher_tokens.clone(), &mask);
+            let mut sparse_model = Some(
+                VJepaTttModel::from_model(
+                    VJepa2_1Model::<B>::new(&config, &device),
+                    TttEncoderConfig {
+                        layers: vec![0],
+                        chunk_tokens: 2,
+                        freeze_pretrained: true,
+                        ..TttEncoderConfig::default()
+                    },
+                    &device,
+                )
+                .expect("sparse patchify ttt model"),
+            );
+            let mut sparse_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+            group.bench_function(
+                format!(
+                    "density_{}_sparse_patchify_b{batch_size}_tokens{keep_tokens}_of{dense_tokens}",
+                    case.label
+                ),
+                |bench| {
+                    bench.iter(|| {
+                        let current = sparse_model.take().expect("model available");
+                        let mut state = current.fresh_state();
+                        let student =
+                            <B as TttSparsePatchifyTrainingBackend>::student_frozen_sparse_patchify_rollout_batch(
+                                &current,
+                                black_box(video.clone()),
+                                &mask,
+                                Some(teacher_tokens.clone()),
+                                &mut state,
+                            )
+                            .expect("frozen sparse patchify rollout");
+                        let loss = (student.tokens - sparse_teacher_tokens.clone())
+                            .powf_scalar(2.0)
+                            .mean();
+                        let grads = GradientsParams::from_grads(loss.backward(), &current);
+                        let next = sparse_optim.step(1.0e-3, current, grads);
+                        sparse_model = Some(next);
+                    });
+                },
+            );
+        }
+
+        let mut dense_model = Some(
+            VJepaTttModel::from_model(
+                VJepa2_1Model::<B>::new(&config, &device),
+                TttEncoderConfig {
+                    layers: vec![0],
+                    chunk_tokens: 2,
+                    freeze_pretrained: true,
+                    ..TttEncoderConfig::default()
+                },
+                &device,
+            )
+            .expect("dense ttt model"),
+        );
+        let mut dense_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+        group.bench_function(
+            format!("density_100pct_dense_b{batch_size}_tokens{dense_tokens}_of{dense_tokens}"),
+            |bench| {
+                bench.iter(|| {
+                    let current = dense_model.take().expect("model available");
+                    let mut state = current.fresh_state();
+                    let student = current
+                        .forward_single_frame_rollout(
+                            black_box(video.clone()),
+                            Some(teacher_tokens.clone()),
+                            &mut state,
+                        )
+                        .expect("dense rollout");
+                    let loss = (student.tokens - teacher_tokens.clone())
+                        .powf_scalar(2.0)
+                        .mean();
+                    let grads = GradientsParams::from_grads(loss.backward(), &current);
+                    let next = dense_optim.step(1.0e-3, current, grads);
+                    dense_model = Some(next);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn ttt_single_frame_rollout_ndarray(c: &mut Criterion) {
     type B = burn::backend::NdArray<f32>;
     let device = Default::default();
@@ -458,6 +580,22 @@ fn ttt_sparsity_training_step_matrix_cuda(c: &mut Criterion) {
 #[cfg(not(feature = "cuda"))]
 fn ttt_sparsity_training_step_matrix_cuda(_c: &mut Criterion) {}
 
+#[cfg(all(feature = "cuda", feature = "sparse-patchify-cuda"))]
+fn ttt_sparse_patchify_sparsity_training_step_matrix_cuda(c: &mut Criterion) {
+    if let Err(reason) =
+        burn_jepa::runtime::cuda_runtime_preflight(burn_jepa::runtime::CUDA_TRAIN_FORCE_ENV)
+    {
+        eprintln!("skipping ttt_sparse_patchify_sparsity_training_step_cuda: {reason}");
+        return;
+    }
+    bench_ttt_sparse_patchify_sparsity_training_step_matrix::<
+        burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>,
+    >(c, "cuda", &[1, 2, 4]);
+}
+
+#[cfg(not(all(feature = "cuda", feature = "sparse-patchify-cuda")))]
+fn ttt_sparse_patchify_sparsity_training_step_matrix_cuda(_c: &mut Criterion) {}
+
 #[cfg(feature = "wgpu")]
 fn ttt_training_step_matrix_wgpu(c: &mut Criterion) {
     bench_ttt_training_step_matrix::<burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>>(
@@ -481,6 +619,16 @@ fn ttt_sparsity_training_step_matrix_wgpu(c: &mut Criterion) {
 
 #[cfg(not(feature = "wgpu"))]
 fn ttt_sparsity_training_step_matrix_wgpu(_c: &mut Criterion) {}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+fn ttt_sparse_patchify_sparsity_training_step_matrix_wgpu(c: &mut Criterion) {
+    bench_ttt_sparse_patchify_sparsity_training_step_matrix::<
+        burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    >(c, "wgpu", &[1, 2, 4]);
+}
+
+#[cfg(not(feature = "sparse-patchify-wgpu"))]
+fn ttt_sparse_patchify_sparsity_training_step_matrix_wgpu(_c: &mut Criterion) {}
 
 #[cfg(feature = "webgpu")]
 fn ttt_training_step_matrix_webgpu(c: &mut Criterion) {
@@ -646,8 +794,10 @@ criterion_group!(
     ttt_sparsity_training_step_matrix_ndarray,
     ttt_training_step_matrix_cuda,
     ttt_sparsity_training_step_matrix_cuda,
+    ttt_sparse_patchify_sparsity_training_step_matrix_cuda,
     ttt_training_step_matrix_wgpu,
     ttt_sparsity_training_step_matrix_wgpu,
+    ttt_sparse_patchify_sparsity_training_step_matrix_wgpu,
     ttt_training_step_matrix_webgpu,
     ttt_sparsity_training_step_matrix_webgpu,
     ttt_single_frame_rollout_cuda,

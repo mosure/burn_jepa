@@ -1,5 +1,5 @@
 use super::config::{TttBackpropMode, TttEncoderConfig, TttTargetMode};
-use super::layer::VJepaTttLayer;
+use super::layer::{VJepaTttLayer, VJepaTttLayerProbe};
 use super::state::TttState;
 use crate::{
     SparseEncoderBatchPlan, SparseEncoderPlan, SparseMaskBatch, SparseTokenMask, TokenGridShape,
@@ -11,6 +11,21 @@ use anyhow::{Result, ensure};
 use burn::module::Module;
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
+
+#[derive(Clone, Debug)]
+pub struct VJepaTttLayerProbeRecord<B: Backend> {
+    pub encoder_layer: usize,
+    pub ttt_layer: usize,
+    pub probe: VJepaTttLayerProbe<B>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TttStateResetMode {
+    #[default]
+    Persistent,
+    EachFrame,
+    EachTubelet,
+}
 
 #[derive(Module, Debug)]
 pub struct VJepaTttEncoder<B: Backend> {
@@ -75,6 +90,14 @@ impl<B: Backend> VJepaTttEncoder<B> {
             && self.layer_indices.last().copied() == Some(layer_index)
     }
 
+    pub fn target_mode(&self) -> TttTargetMode {
+        self.target_mode
+    }
+
+    pub fn ttt_layer_indices(&self) -> &[usize] {
+        &self.layer_indices
+    }
+
     pub fn forward_video(
         &self,
         video: Tensor<B, 5>,
@@ -117,6 +140,18 @@ impl<B: Backend> VJepaTttEncoder<B> {
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
     ) -> Result<VJepaEncoderOutput<B>> {
+        self.forward_image_with_state_impl(image, mask, target_tokens, state, true, None)
+    }
+
+    fn forward_image_with_state_impl(
+        &self,
+        image: Tensor<B, 4>,
+        mask: Option<&SparseTokenMask>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        update_fast_weight: bool,
+        probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
+    ) -> Result<VJepaEncoderOutput<B>> {
         let [batch, channels, height, width] = image.shape().dims::<4>();
         let grid = TokenGridShape::new(
             1,
@@ -127,7 +162,17 @@ impl<B: Backend> VJepaTttEncoder<B> {
             .base
             .image_patch_embed
             .forward(image.reshape([batch, channels, 1, height, width]));
-        self.forward_tokens(tokens, batch, grid, mask, false, target_tokens, state)
+        self.forward_tokens_with_options(
+            tokens,
+            batch,
+            grid,
+            mask,
+            false,
+            target_tokens,
+            state,
+            update_fast_weight,
+            probes,
+        )
     }
 
     pub fn forward_single_frame_rollout(
@@ -136,7 +181,15 @@ impl<B: Backend> VJepaTttEncoder<B> {
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
     ) -> Result<VJepaEncoderOutput<B>> {
-        self.forward_single_frame_rollout_impl(video, None, target_tokens, state)
+        self.forward_single_frame_rollout_impl(
+            video,
+            None,
+            target_tokens,
+            state,
+            true,
+            TttStateResetMode::Persistent,
+            None,
+        )
     }
 
     pub fn forward_single_frame_rollout_sparse(
@@ -146,7 +199,15 @@ impl<B: Backend> VJepaTttEncoder<B> {
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
     ) -> Result<VJepaEncoderOutput<B>> {
-        self.forward_single_frame_rollout_impl(video, Some(mask), target_tokens, state)
+        self.forward_single_frame_rollout_impl(
+            video,
+            Some(mask),
+            target_tokens,
+            state,
+            true,
+            TttStateResetMode::Persistent,
+            None,
+        )
     }
 
     pub fn forward_single_frame_rollout_sparse_batch(
@@ -159,7 +220,61 @@ impl<B: Backend> VJepaTttEncoder<B> {
         if let Some(mask) = mask.uniform_mask() {
             return self.forward_single_frame_rollout_sparse(video, mask, target_tokens, state);
         }
-        self.forward_single_frame_rollout_batch_impl(video, mask, target_tokens, state)
+        self.forward_single_frame_rollout_batch_impl(
+            video,
+            mask,
+            target_tokens,
+            state,
+            true,
+            TttStateResetMode::Persistent,
+            None,
+        )
+    }
+
+    pub fn forward_single_frame_rollout_with_diagnostics(
+        &self,
+        video: Tensor<B, 5>,
+        mask: Option<&SparseMaskBatch<B>>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        update_fast_weight: bool,
+        reset_mode: TttStateResetMode,
+        probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        match mask {
+            Some(mask) => {
+                if let Some(mask) = mask.uniform_mask() {
+                    self.forward_single_frame_rollout_impl(
+                        video,
+                        Some(mask),
+                        target_tokens,
+                        state,
+                        update_fast_weight,
+                        reset_mode,
+                        probes,
+                    )
+                } else {
+                    self.forward_single_frame_rollout_batch_impl(
+                        video,
+                        mask,
+                        target_tokens,
+                        state,
+                        update_fast_weight,
+                        reset_mode,
+                        probes,
+                    )
+                }
+            }
+            None => self.forward_single_frame_rollout_impl(
+                video,
+                None,
+                target_tokens,
+                state,
+                update_fast_weight,
+                reset_mode,
+                probes,
+            ),
+        }
     }
 
     fn forward_single_frame_rollout_impl(
@@ -168,6 +283,9 @@ impl<B: Backend> VJepaTttEncoder<B> {
         mask: Option<&SparseTokenMask>,
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
+        update_fast_weight: bool,
+        reset_mode: TttStateResetMode,
+        mut probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
     ) -> Result<VJepaEncoderOutput<B>> {
         let [batch, channels, frames, height, width] = video.shape().dims::<5>();
         let tubelet = self.config.tubelet_size.max(1);
@@ -195,6 +313,11 @@ impl<B: Backend> VJepaTttEncoder<B> {
         let mut outputs = Vec::with_capacity(grid.depth);
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
+            if reset_mode == TttStateResetMode::EachFrame
+                || (reset_mode == TttStateResetMode::EachTubelet && frame % tubelet == 0)
+            {
+                *state = self.fresh_state();
+            }
             let frame_mask = mask
                 .map(|mask| sparse_rollout_frame_mask(mask, grid, tubelet_index))
                 .transpose()?
@@ -219,8 +342,14 @@ impl<B: Backend> VJepaTttEncoder<B> {
                 batch,
                 &video.device(),
             );
-            let encoded =
-                self.forward_image_with_state(image, frame_mask.as_ref(), target_frame, state)?;
+            let encoded = self.forward_image_with_state_impl(
+                image,
+                frame_mask.as_ref(),
+                target_frame,
+                state,
+                update_fast_weight,
+                probes.as_mut().map(|records| &mut **records),
+            )?;
             if frame % tubelet == tubelet - 1 {
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
@@ -252,6 +381,9 @@ impl<B: Backend> VJepaTttEncoder<B> {
         mask: &SparseMaskBatch<B>,
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
+        update_fast_weight: bool,
+        reset_mode: TttStateResetMode,
+        mut probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
     ) -> Result<VJepaEncoderOutput<B>> {
         let [batch, channels, frames, height, width] = video.shape().dims::<5>();
         let tubelet = self.config.tubelet_size.max(1);
@@ -278,6 +410,11 @@ impl<B: Backend> VJepaTttEncoder<B> {
         let mut outputs = Vec::with_capacity(grid.depth);
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
+            if reset_mode == TttStateResetMode::EachFrame
+                || (reset_mode == TttStateResetMode::EachTubelet && frame % tubelet == 0)
+            {
+                *state = self.fresh_state();
+            }
             let Some(frame_mask) =
                 sparse_rollout_frame_mask_batch(mask, grid, tubelet_index, &device)?
             else {
@@ -305,11 +442,13 @@ impl<B: Backend> VJepaTttEncoder<B> {
             let tokens = apply_mask_batch(tokens, &frame_mask);
             let encoder_plan =
                 SparseEncoderBatchPlan::new(&self.config, frame_mask, frame_grid, false, &device)?;
-            let encoded = self.forward_sparse_tokens_with_batch_plan(
+            let encoded = self.forward_sparse_tokens_with_batch_plan_options(
                 tokens,
                 &encoder_plan,
                 target_frame,
                 state,
+                update_fast_weight,
+                probes.as_mut().map(|records| &mut **records),
             )?;
             if frame % tubelet == tubelet - 1 {
                 outputs.push(encoded.tokens);
@@ -352,6 +491,32 @@ impl<B: Backend> VJepaTttEncoder<B> {
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
     ) -> Result<VJepaEncoderOutput<B>> {
+        self.forward_tokens_with_options(
+            tokens,
+            batch,
+            grid,
+            mask,
+            video,
+            target_tokens,
+            state,
+            true,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_tokens_with_options(
+        &self,
+        tokens: Tensor<B, 3>,
+        batch: usize,
+        grid: TokenGridShape,
+        mask: Option<&SparseTokenMask>,
+        video: bool,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        update_fast_weight: bool,
+        probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
+    ) -> Result<VJepaEncoderOutput<B>> {
         let device = tokens.device();
         let mask = mask
             .cloned()
@@ -362,15 +527,34 @@ impl<B: Backend> VJepaTttEncoder<B> {
         } else {
             tokens
         };
-        self.forward_sparse_tokens_impl(tokens, &plan, target_tokens, state)
+        self.forward_sparse_tokens_impl_options(
+            tokens,
+            &plan,
+            target_tokens,
+            state,
+            update_fast_weight,
+            probes,
+        )
     }
 
     fn forward_sparse_tokens_impl(
+        &self,
+        tokens: Tensor<B, 3>,
+        plan: &SparseEncoderPlan<B>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.forward_sparse_tokens_impl_options(tokens, plan, target_tokens, state, true, None)
+    }
+
+    fn forward_sparse_tokens_impl_options(
         &self,
         mut tokens: Tensor<B, 3>,
         plan: &SparseEncoderPlan<B>,
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
+        update_fast_weight: bool,
+        mut probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
     ) -> Result<VJepaEncoderOutput<B>> {
         ensure!(
             state.layers.len() == self.ttt_layers.len(),
@@ -420,11 +604,27 @@ impl<B: Backend> VJepaTttEncoder<B> {
                     TttTargetMode::TeacherFinal => target_tokens.clone(),
                     TttTargetMode::SelfHidden => None,
                 };
-                x = self.ttt_layers[ttt_index].forward(
-                    x,
-                    layer_target,
-                    &mut state.layers[ttt_index],
-                );
+                x = if let Some(records) = probes.as_mut() {
+                    let (next, probe) = self.ttt_layers[ttt_index].forward_with_probe(
+                        x,
+                        layer_target,
+                        &mut state.layers[ttt_index],
+                        update_fast_weight,
+                    );
+                    records.push(VJepaTttLayerProbeRecord {
+                        encoder_layer: layer_index,
+                        ttt_layer: ttt_index,
+                        probe,
+                    });
+                    next
+                } else {
+                    self.ttt_layers[ttt_index].forward_with_options(
+                        x,
+                        layer_target,
+                        &mut state.layers[ttt_index],
+                        update_fast_weight,
+                    )
+                };
                 if self.should_early_exit_after_layer(layer_index) {
                     break;
                 }
@@ -452,10 +652,29 @@ impl<B: Backend> VJepaTttEncoder<B> {
 
     pub fn forward_sparse_tokens_with_batch_plan(
         &self,
+        tokens: Tensor<B, 3>,
+        plan: &SparseEncoderBatchPlan<B>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.forward_sparse_tokens_with_batch_plan_options(
+            tokens,
+            plan,
+            target_tokens,
+            state,
+            true,
+            None,
+        )
+    }
+
+    fn forward_sparse_tokens_with_batch_plan_options(
+        &self,
         mut tokens: Tensor<B, 3>,
         plan: &SparseEncoderBatchPlan<B>,
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
+        update_fast_weight: bool,
+        mut probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
     ) -> Result<VJepaEncoderOutput<B>> {
         ensure!(
             state.layers.len() == self.ttt_layers.len(),
@@ -505,11 +724,27 @@ impl<B: Backend> VJepaTttEncoder<B> {
                     TttTargetMode::TeacherFinal => target_tokens.clone(),
                     TttTargetMode::SelfHidden => None,
                 };
-                x = self.ttt_layers[ttt_index].forward(
-                    x,
-                    layer_target,
-                    &mut state.layers[ttt_index],
-                );
+                x = if let Some(records) = probes.as_mut() {
+                    let (next, probe) = self.ttt_layers[ttt_index].forward_with_probe(
+                        x,
+                        layer_target,
+                        &mut state.layers[ttt_index],
+                        update_fast_weight,
+                    );
+                    records.push(VJepaTttLayerProbeRecord {
+                        encoder_layer: layer_index,
+                        ttt_layer: ttt_index,
+                        probe,
+                    });
+                    next
+                } else {
+                    self.ttt_layers[ttt_index].forward_with_options(
+                        x,
+                        layer_target,
+                        &mut state.layers[ttt_index],
+                        update_fast_weight,
+                    )
+                };
                 if self.should_early_exit_after_layer(layer_index) {
                     break;
                 }

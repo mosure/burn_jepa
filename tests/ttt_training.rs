@@ -420,6 +420,8 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
     config.training.max_steps = 3;
     config.training.batch_size = 2;
     config.training.eval_steps = 1;
+    config.training.eval_utilization_diagnostics = true;
+    config.training.eval_temporal_diagnostics = true;
     config.training.learning_rate = 5.0e-3;
     config.dataset.synthetic_len = 1;
     let report = train_ttt_distillation::<AB>(&config, &device).expect("training smoke");
@@ -434,6 +436,34 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
     assert!(report.pre_train_eval_cosine.is_some());
     assert!(report.eval_loss.is_some());
     assert!(report.eval_cosine.is_some());
+    assert_eq!(report.target_supervision.mode, TttTargetMode::TeacherFinal);
+    assert!(report.teacher_forced_eval_loss.is_some_and(f64::is_finite));
+    assert!(report.teacher_forcing_loss_gap.is_some_and(f64::is_finite));
+    let utilization = report
+        .utilization
+        .as_ref()
+        .expect("TTT eval should report utilization probes");
+    assert_eq!(utilization.layers.len(), report.memory.layers.len());
+    assert!(utilization.layers.iter().all(|layer| {
+        layer.hidden_rms.is_finite()
+            && layer.memory_read_rms.is_finite()
+            && layer.adapter_delta_rms.is_finite()
+            && layer.fast_weight_rms.is_finite()
+            && layer.fast_update_rms.is_finite()
+            && layer.temporal_conv_param_rms.is_finite()
+            && layer.out_proj_param_rms.is_finite()
+            && (layer.target_proj_grad_rms.is_some()
+                || layer.temporal_conv_grad_rms.is_some()
+                || layer.out_proj_grad_rms.is_some())
+    }));
+    let temporal = report
+        .temporal_diagnostics
+        .as_ref()
+        .expect("TTT eval should report temporal diagnostics");
+    assert!(temporal.reset_each_frame_loss.is_some_and(f64::is_finite));
+    assert!(temporal.reverse_order_loss.is_some_and(f64::is_finite));
+    assert!(temporal.shuffle_order_loss.is_some_and(f64::is_finite));
+    assert!(temporal.freeze_fast_update_loss.is_some_and(f64::is_finite));
     assert!(
         report.best_loss < report.initial_loss,
         "tiny training run should improve at least one step: initial={} best={} final={}",
@@ -460,6 +490,7 @@ fn ttt_sparse_rollout_training_smoke_uses_target_mask() {
     config.training.max_steps = 1;
     config.training.batch_size = 1;
     config.training.eval_steps = 1;
+    config.training.eval_utilization_diagnostics = true;
     config.training.sparse_rollout = TttSparseRolloutMode::TargetMask;
     config.training.mask = Some(burn_jepa::TrainingMaskConfig::PrecomputedMasks {
         context_indices: vec![0, 2, 5, 7],
@@ -476,6 +507,12 @@ fn ttt_sparse_rollout_training_smoke_uses_target_mask() {
     assert!(!report.rollout.autodiff_sparse_patchify);
     assert!(report.final_loss.is_finite());
     assert!(report.eval_loss.is_some_and(f64::is_finite));
+    assert!(report.teacher_forced_eval_loss.is_some_and(f64::is_finite));
+    assert!(
+        report
+            .teacher_forcing_cosine_gap
+            .is_some_and(f64::is_finite)
+    );
     assert!(report.eval_full_loss.is_some_and(f64::is_finite));
 }
 
@@ -634,7 +671,14 @@ fn ttt_training_supports_self_hidden_target_predictor_loss_and_reload() {
     });
     config.loss.predictor_loss_weight = 0.25;
     config.ttt.target = TttTargetMode::SelfHidden;
+    config.training.eval_steps = 1;
+    config.training.eval_utilization_diagnostics = true;
+    config.training.eval_temporal_diagnostics = true;
     let report = train_ttt_distillation::<AB>(&config, &device).expect("training smoke");
+    assert_eq!(report.target_supervision.mode, TttTargetMode::SelfHidden);
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
+    assert!(report.teacher_forced_eval_loss.is_none());
+    assert!(report.teacher_forcing_loss_gap.is_none());
     let model_path = report.model_path.expect("saved TTT model path");
     assert!(
         model_path.exists(),
