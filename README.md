@@ -304,6 +304,22 @@ The TTT rollout benchmark measures the same single-frame recurrent path used by
 cargo bench --bench ttt_training -- --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 
+The `ttt_sparsity_training_step_*` Criterion groups are the training-step
+sparsity matrix. They sweep 10%, 50%, and 100% sparse token input, plus the
+normal dense 100% baseline, and each sample includes student rollout, loss,
+backward, and the optimizer step:
+
+```sh
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray \
+  -- ttt_sparsity_training_step_ndarray --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,cuda \
+  -- ttt_sparsity_training_step_cuda --sample-size 10 --measurement-time 1 --warm-up-time 1
+```
+
 On the local ndarray backend this tiny smoke benchmark measured
 `ttt_single_frame_rollout_ndarray` at 4.7869 ms to 4.8055 ms.
 

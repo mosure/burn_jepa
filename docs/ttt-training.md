@@ -284,6 +284,58 @@ Use `eval-ttt --no-full-grid` for production sparse-rollout throughput. Use
 `--full-grid` for slower parity diagnostics that run the sparse rollout and an
 additional dense student rollout for full-token loss/cosine.
 
+The Criterion TTT bench includes an explicit sparse-token training-step matrix:
+
+```sh
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray \
+  -- ttt_sparsity_training_step_ndarray --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,wgpu \
+  -- ttt_sparsity_training_step_wgpu --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,cuda \
+  -- ttt_sparsity_training_step_cuda --sample-size 10 --measurement-time 1 --warm-up-time 1
+```
+
+Each `ttt_sparsity_training_step_*` sample includes sparse or dense student
+rollout, feature loss, backward, and AdamW. The sparse rows use fixed-width
+per-sample `SparseMaskBatch` inputs at 10%, 50%, and 100% token density. The
+extra `density_100pct_dense_*` row is the normal full-token baseline, while
+`density_100pct_sparse_*` isolates sparse-wrapper overhead when no tokens are
+actually skipped. The benchmark does not read scalar losses back to the host in
+the hot path.
+
+Local short Criterion smoke from 2026-05-14, using a tiny 64px fixture with 32
+dense tokens and `--sample-size 10 --measurement-time 1 --warm-up-time 0.2`:
+
+| Backend | Batch | 10% sparse | 50% sparse | 100% sparse | 100% dense | 10% vs dense |
+|---|---:|---:|---:|---:|---:|---:|
+| ndarray | 1 | 9.633 ms | 10.211 ms | 10.830 ms | 10.836 ms | 11.1% faster |
+| ndarray | 2 | 18.418 ms | 19.175 ms | 20.039 ms | 20.082 ms | 8.3% faster |
+| ndarray | 4 | 35.308 ms | 36.676 ms | 37.861 ms | 38.109 ms | 7.4% faster |
+| ndarray | 8 | 68.756 ms | 71.575 ms | 73.748 ms | 74.324 ms | 7.5% faster |
+| WGPU | 1 | 16.157 ms | 18.652 ms | 21.820 ms | 20.996 ms | 23.0% faster |
+| WGPU | 2 | 14.712 ms | 18.652 ms | 21.557 ms | 19.321 ms | 23.9% faster |
+| WGPU | 4 | 15.814 ms | 18.121 ms | 20.258 ms | 19.781 ms | 20.1% faster |
+| WebGPU | 1 | 16.990 ms | 20.866 ms | 23.048 ms | 21.322 ms | 20.3% faster |
+| WebGPU | 2 | 13.989 ms | 18.678 ms | 23.234 ms | 22.074 ms | 36.6% faster |
+| WebGPU | 4 | 15.504 ms | 18.751 ms | 22.818 ms | 22.696 ms | 31.7% faster |
+| CUDA | 1 | 34.516 ms | 18.221 ms | 21.663 ms | 19.408 ms | noisy/outlier |
+| CUDA | 2 | 15.068 ms | 18.425 ms | 21.974 ms | 18.798 ms | 19.8% faster |
+| CUDA | 4 | 14.627 ms | 18.267 ms | 21.281 ms | 20.809 ms | 29.7% faster |
+
+Interpretation: the sparse TTT path now shows the expected latency ordering in
+the training step, especially on WGPU/WebGPU and CUDA batch 2+. The gain is not
+proportional to token count because this Criterion lane still uses Burn autodiff
+dense image patch embedding before sparse token gather, and the timed step
+includes adapter backward plus AdamW state updates. Teacher-token precompute is
+outside the timed loop. It is therefore a clean TTT forward+backward density
+sweep, not a full AutoGaze/flex-gmm pixel-skip E2E replacement.
+
 ## Experiment Harness
 
 The `experiment` CLI runs the TTT direction as a reproducible trial matrix. It

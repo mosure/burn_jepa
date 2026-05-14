@@ -173,6 +173,52 @@ fn benchmark_trace_config_is_opt_in_and_disabled_path_avoids_tensor_clone() {
 }
 
 #[test]
+fn ttt_training_benchmark_has_sparse_density_training_step_matrix() {
+    let bench = include_str!("../benches/ttt_training.rs");
+    let compact = compact_source(bench);
+
+    assert!(bench.contains("SPARSITY_DENSITY_CASES"));
+    assert!(bench.contains("label: \"10pct\""));
+    assert!(bench.contains("density: 0.10"));
+    assert!(bench.contains("label: \"50pct\""));
+    assert!(bench.contains("density: 0.50"));
+    assert!(bench.contains("label: \"100pct\""));
+    assert!(bench.contains("density: 1.00"));
+    assert!(
+        bench.contains("ttt_sparsity_training_step_"),
+        "TTT Criterion benches should expose an explicit sparsity sweep group"
+    );
+    assert!(
+        bench.contains("Throughput::Elements"),
+        "Criterion output should include sample-throughput context"
+    );
+    assert!(
+        bench.contains("density_{}_sparse_b{batch_size}_tokens{keep_tokens}_of{dense_tokens}"),
+        "sparse rows should encode density, batch size, and token count in the benchmark id"
+    );
+    assert!(
+        bench.contains("density_100pct_dense_b{batch_size}_tokens{dense_tokens}_of{dense_tokens}"),
+        "matrix should include a normal dense full-token baseline"
+    );
+    assert!(
+        compact.contains("forward_single_frame_rollout_sparse_batch("),
+        "sparsity sweep should exercise fixed-width per-sample sparse TTT rollout"
+    );
+    assert!(
+        compact.contains("forward_single_frame_rollout("),
+        "sparsity sweep should include the dense TTT rollout baseline"
+    );
+    assert!(
+        compact.contains("loss.backward()"),
+        "matrix should measure a full training step, not only forward latency"
+    );
+    assert!(
+        compact.contains("sparse_optim.step(") && compact.contains("dense_optim.step("),
+        "matrix should include optimizer updates for sparse and dense rows"
+    );
+}
+
+#[test]
 fn e2e_benchmark_reuses_library_projection_and_patchify_core() {
     let bench = include_str!("../benches/autogaze_sparse_jepa_pipeline.rs");
 
