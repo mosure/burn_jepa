@@ -336,30 +336,15 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
         );
     }
 
-    if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY") {
+    if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY")
+        && real_hf_micro_forward_available(&checkpoint_dir)
+    {
         let torch_output = real_hf_micro_forward(&checkpoint_dir);
-        let context = SparseTokenMask::new(vec![0], 1).expect("micro context");
-        let target = SparseTokenMask::new(vec![0], 1).expect("micro target");
-        let dense = model.encode_video(real_micro_parity_video(&config), None);
-        let predictor = model
-            .predictor
-            .forward_sparse(
-                dense.tokens.clone(),
-                &context,
-                &target,
-                dense.grid,
-                env_usize("BURN_JEPA_VJEPA21_MASK_INDEX", 1),
-            )
-            .expect("real checkpoint micro predictor parity");
-        let burn_predictions = predictor
-            .target_predictions
-            .to_data()
-            .to_vec::<f32>()
-            .expect("real burn prediction values");
-        let burn_targets = apply_token_mask(dense.tokens, target.to_tensor(1, &device))
-            .to_data()
-            .to_vec::<f32>()
-            .expect("real burn target values");
+        let (burn_predictions, burn_targets) = real_burn_micro_forward(
+            &model,
+            &config,
+            env_usize("BURN_JEPA_VJEPA21_MASK_INDEX", 1),
+        );
         let prediction_diff = max_abs_diff(&burn_predictions, &torch_output.predictions);
         let target_diff = max_abs_diff(&burn_targets, &torch_output.targets);
         eprintln!(
@@ -369,6 +354,19 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
             prediction_diff <= 5.0e-4 && target_diff <= 5.0e-4,
             "real V-JEPA micro parity exceeded tolerance: prediction_diff={prediction_diff:e}, target_diff={target_diff:e}"
         );
+    } else if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY") {
+        eprintln!(
+            "skipping HF micro parity because this checkpoint is not a Hugging Face VJEPA2 fixture; running Burn real-weight micro forward smoke instead"
+        );
+        let (burn_predictions, burn_targets) = real_burn_micro_forward(
+            &model,
+            &config,
+            env_usize("BURN_JEPA_VJEPA21_MASK_INDEX", 1),
+        );
+        assert!(!burn_predictions.is_empty());
+        assert!(!burn_targets.is_empty());
+        assert!(burn_predictions.iter().all(|value| value.is_finite()));
+        assert!(burn_targets.iter().all(|value| value.is_finite()));
     } else if env_bool("BURN_JEPA_VJEPA21_FORWARD_SMOKE") {
         let context = SparseTokenMask::evenly_spaced(
             config.num_patches(),
@@ -394,6 +392,43 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
         assert_eq!(output.predictions.shape().dims::<3>()[1], target.len());
         assert_eq!(output.targets.shape().dims::<3>()[1], target.len());
     }
+}
+
+fn real_burn_micro_forward(
+    model: &VJepa2_1Model<B>,
+    config: &VJepaConfig,
+    mask_index: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let device = Default::default();
+    let context = SparseTokenMask::new(vec![0], 1).expect("micro context");
+    let target = SparseTokenMask::new(vec![0], 1).expect("micro target");
+    let dense = model.encode_video(real_micro_parity_video(config), None);
+    let predictor = model
+        .predictor
+        .forward_sparse(
+            dense.tokens.clone(),
+            &context,
+            &target,
+            dense.grid,
+            mask_index,
+        )
+        .expect("real checkpoint micro predictor forward");
+    let burn_predictions = predictor
+        .target_predictions
+        .to_data()
+        .to_vec::<f32>()
+        .expect("real burn prediction values");
+    let burn_targets = apply_token_mask(dense.tokens, target.to_tensor(1, &device))
+        .to_data()
+        .to_vec::<f32>()
+        .expect("real burn target values");
+    (burn_predictions, burn_targets)
+}
+
+fn real_hf_micro_forward_available(checkpoint_dir: &std::path::Path) -> bool {
+    ["model.safetensors", "pytorch_model.bin"]
+        .iter()
+        .any(|name| checkpoint_dir.join(name).exists())
 }
 
 fn parity_config() -> VJepaConfig {

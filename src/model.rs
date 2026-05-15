@@ -1053,8 +1053,6 @@ impl<B: Backend> VJepaPredictor<B> {
             context_len == context_mask.len(),
             "context token shape does not match context mask"
         );
-        let pred_dim = self.config.predictor.embed_dim;
-
         let mut context = self.predictor_embed.forward(context_tokens);
         if let Some(position_embed) = &plan.context_position_embed {
             context = context + position_embed.clone();
@@ -1063,7 +1061,7 @@ impl<B: Backend> VJepaPredictor<B> {
         let target_len = target_mask.len();
         let token = self.mask_tokens[mask_index % self.mask_tokens.len()]
             .val()
-            .reshape([1, 1, pred_dim])
+            .reshape([1, 1, self.config.predictor.embed_dim])
             .repeat_dim(0, batch)
             .repeat_dim(1, target_len);
         let target = if let Some(position_embed) = &plan.target_position_embed {

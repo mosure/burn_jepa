@@ -70,8 +70,8 @@ impl VJepaLoadOptions {
             .unwrap_or_default()
         {
             "pt" | "pth" => {
-                let mut store =
-                    PytorchStore::from_file(&weights_path).allow_partial(self.allow_partial);
+                let mut store = PytorchStore::from_file(&weights_path)
+                    .allow_partial(self.allow_partial || self.upstream_vjepa21_names);
                 if let Some(key) = &self.pytorch_top_level_key {
                     store = store.with_top_level_key(key);
                 }
@@ -148,6 +148,21 @@ impl VJepaLoadOptions {
                     report.missing.join(", ")
                 );
             }
+        } else if self.upstream_vjepa21_names && is_pytorch_checkpoint(&weights_path) {
+            zero_encoder_modality_embeddings(&mut model);
+            report.missing.retain(|missing| {
+                let path = missing
+                    .split_once(':')
+                    .map(|(path, _)| path)
+                    .unwrap_or(missing.as_str());
+                !is_known_upstream_vjepa21_pytorch_ignored_missing(path)
+            });
+            if !self.allow_partial && !report.missing.is_empty() {
+                bail!(
+                    "missing V-JEPA tensors after upstream PyTorch adapter: {}",
+                    report.missing.join(", ")
+                );
+            }
         }
         Ok((model, config, report))
     }
@@ -186,7 +201,8 @@ fn load_nested_upstream_vjepa21_pytorch<B: Backend>(
 
 fn zero_encoder_modality_embeddings<B: Backend>(model: &mut VJepa2_1Model<B>) {
     // Official nested Meta checkpoints store these as [1, 1, D], while this
-    // port stores [1, D]. Keep skipped modality embeddings deterministic.
+    // port initializes them randomly. Keep skipped modality embeddings
+    // deterministic when a checkpoint omits or filters them.
     let video = model.encoder.video_mod_embed.val();
     let [video_rows, video_dim] = video.shape().dims::<2>();
     let video_device = video.device();
@@ -202,6 +218,24 @@ fn zero_encoder_modality_embeddings<B: Backend>(model: &mut VJepa2_1Model<B>) {
         [image_rows, image_dim],
         &image_device,
     ));
+}
+
+fn is_pytorch_checkpoint(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default(),
+        "pt" | "pth"
+    )
+}
+
+fn is_known_upstream_vjepa21_pytorch_ignored_missing(path: &str) -> bool {
+    path == "encoder.image_mod_embed"
+        || path == "encoder.video_mod_embed"
+        || path
+            .strip_prefix("predictor.mask_tokens.")
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .is_some()
 }
 
 fn is_hf_vjepa2_config(config: &VJepaConfig) -> bool {
@@ -487,6 +521,42 @@ fn transpose_2d(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 fn apply_upstream_key_remapping_safetensors(store: SafetensorsStore) -> SafetensorsStore {
     store
         .with_key_remapping(r"^module\.", "")
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.patch_embed_img\.",
+            "encoder.image_patch_embed.",
+        )
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.patch_embed\.",
+            "encoder.patch_embed.",
+        )
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.blocks\.(\d+)\.",
+            "encoder.blocks.$1.",
+        )
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.norms_block\.(\d+)\.",
+            "encoder.norms_block.$1.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_embed\.",
+            "predictor.predictor_embed.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_blocks\.(\d+)\.",
+            "predictor.blocks.$1.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_norm\.",
+            "predictor.norm.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_proj\.",
+            "predictor.target_proj.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_proj_context\.",
+            "predictor.context_proj.",
+        )
         .with_key_remapping(r"^ema_encoder\.", "encoder.")
         .with_key_remapping(r"^target_encoder\.", "encoder.")
         .with_key_remapping(r"^backbone\.", "encoder.")
@@ -504,12 +574,54 @@ fn apply_upstream_key_remapping_safetensors(store: SafetensorsStore) -> Safetens
         .with_key_remapping(r"^predictor\.layer\.(\d+)\.", "predictor.blocks.$1.")
         .with_key_remapping(r"^predictor\.layernorm\.", "predictor.norm.")
         .with_key_remapping(r"^predictor\.proj\.", "predictor.target_proj.")
+        .with_key_remapping(r"\.norm\.weight$", ".norm.gamma")
+        .with_key_remapping(r"\.norm\.bias$", ".norm.beta")
+        .with_key_remapping(r"\.norm([12])\.weight$", ".norm$1.gamma")
+        .with_key_remapping(r"\.norm([12])\.bias$", ".norm$1.beta")
+        .with_key_remapping(r"\.norms_block\.(\d+)\.weight$", ".norms_block.$1.gamma")
+        .with_key_remapping(r"\.norms_block\.(\d+)\.bias$", ".norms_block.$1.beta")
         .with_key_remapping(r"\.attention\.proj\.", ".attn.proj.")
 }
 
 fn apply_upstream_key_remapping_pytorch(store: PytorchStore) -> PytorchStore {
     store
         .with_key_remapping(r"^module\.", "")
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.patch_embed_img\.",
+            "encoder.image_patch_embed.",
+        )
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.patch_embed\.",
+            "encoder.patch_embed.",
+        )
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.blocks\.(\d+)\.",
+            "encoder.blocks.$1.",
+        )
+        .with_key_remapping(
+            r"^encoder\.module\.backbone\.norms_block\.(\d+)\.",
+            "encoder.norms_block.$1.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_embed\.",
+            "predictor.predictor_embed.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_blocks\.(\d+)\.",
+            "predictor.blocks.$1.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_norm\.",
+            "predictor.norm.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_proj\.",
+            "predictor.target_proj.",
+        )
+        .with_key_remapping(
+            r"^predictor\.module\.backbone\.predictor_proj_context\.",
+            "predictor.context_proj.",
+        )
         .with_key_remapping(r"^ema_encoder\.", "encoder.")
         .with_key_remapping(r"^target_encoder\.", "encoder.")
         .with_key_remapping(r"^backbone\.", "encoder.")
@@ -527,6 +639,12 @@ fn apply_upstream_key_remapping_pytorch(store: PytorchStore) -> PytorchStore {
         .with_key_remapping(r"^predictor\.layer\.(\d+)\.", "predictor.blocks.$1.")
         .with_key_remapping(r"^predictor\.layernorm\.", "predictor.norm.")
         .with_key_remapping(r"^predictor\.proj\.", "predictor.target_proj.")
+        .with_key_remapping(r"\.norm\.weight$", ".norm.gamma")
+        .with_key_remapping(r"\.norm\.bias$", ".norm.beta")
+        .with_key_remapping(r"\.norm([12])\.weight$", ".norm$1.gamma")
+        .with_key_remapping(r"\.norm([12])\.bias$", ".norm$1.beta")
+        .with_key_remapping(r"\.norms_block\.(\d+)\.weight$", ".norms_block.$1.gamma")
+        .with_key_remapping(r"\.norms_block\.(\d+)\.bias$", ".norms_block.$1.beta")
         .with_key_remapping(r"\.attention\.proj\.", ".attn.proj.")
 }
 

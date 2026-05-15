@@ -557,11 +557,15 @@ and full-grid loss/cosine `0.2358 / 0.9025`.
 Real-AutoGaze cross-domain pilot from 2026-05-14 used 19 clips across `cisco`,
 `nature`, and `screen`, generating 83 masked windows from the local
 `nvidia/AutoGaze` checkpoint. On the 20-window held-out eval split, dense
-single-frame no-TTT measured loss/cosine `0.2734 / 0.8849`; the prior TTT
-adapter measured `0.2657 / 0.8885`; and a 512-step real-mask continuation
-measured `0.2531 / 0.8938`. Split training timings showed `backward_ms = 657s`
-and `optimizer_ms = 19.5s`, so the bottleneck is autodiff backward through the
-sparse TTT rollout rather than AdamW optimizer updates.
+single-frame no-TTT measured loss/cosine `0.2734 / 0.8849`. The current
+512-step real-mask continuation checkpoint at
+`target/burn-jepa-real-autogaze-cross-domain/real-autogaze-context-continue-512/ttt-model.mpk`
+measured sparse free-run loss/cosine `0.2444 / 0.8969` at `0.95` samples/sec
+with `--batch-size 4 --no-full-grid`; the slower full-grid diagnostic measured
+full loss/cosine `0.2088 / 0.9129` at `0.73` samples/sec. Split training timings
+from the larger continuation runs showed backward dominates optimizer time, so
+the next throughput work is still reducing autodiff backward through the sparse
+TTT rollout rather than swapping AdamW.
 
 Sparse rollout smoke after this change:
 
