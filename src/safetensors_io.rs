@@ -5,7 +5,7 @@ use burn::nn::Linear;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_store::{
-    ApplyResult, ModuleSnapshot, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore,
+    ApplyResult, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore,
 };
 use safetensors::{Dtype, SafeTensors};
 use std::collections::BTreeSet;
@@ -70,34 +70,48 @@ impl VJepaLoadOptions {
             .unwrap_or_default()
         {
             "pt" | "pth" => {
-                let mut store = PytorchStore::from_file(&weights_path)
-                    .allow_partial(self.allow_partial || self.upstream_vjepa21_names);
-                if let Some(key) = &self.pytorch_top_level_key {
-                    store = store.with_top_level_key(key);
-                }
-                if self.upstream_vjepa21_names {
-                    store = apply_upstream_key_remapping_pytorch(store);
-                }
-                let result = model
-                    .load_from(&mut store)
-                    .with_context(|| format!("load weights from {}", weights_path.display()))?;
                 if self.upstream_vjepa21_names
                     && self.pytorch_top_level_key.is_none()
-                    && result.applied.is_empty()
+                    && config.model_type == "vjepa2_1"
                 {
-                    load_nested_upstream_vjepa21_pytorch(
-                        &mut model,
-                        &weights_path,
-                        self.allow_partial,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "load nested upstream V-JEPA checkpoint from {}",
-                            weights_path.display()
-                        )
-                    })?
+                    load_official_upstream_vjepa21_pytorch(&mut model, &weights_path).with_context(
+                        || {
+                            format!(
+                                "load official upstream V-JEPA checkpoint from {}",
+                                weights_path.display()
+                            )
+                        },
+                    )?
                 } else {
-                    result
+                    let mut store = PytorchStore::from_file(&weights_path)
+                        .allow_partial(self.allow_partial || self.upstream_vjepa21_names);
+                    if let Some(key) = &self.pytorch_top_level_key {
+                        store = store.with_top_level_key(key);
+                    }
+                    if self.upstream_vjepa21_names {
+                        store = apply_upstream_key_remapping_pytorch(store);
+                    }
+                    let result = model
+                        .load_from(&mut store)
+                        .with_context(|| format!("load weights from {}", weights_path.display()))?;
+                    if self.upstream_vjepa21_names
+                        && self.pytorch_top_level_key.is_none()
+                        && result.applied.is_empty()
+                    {
+                        load_nested_upstream_vjepa21_pytorch(
+                            &mut model,
+                            &weights_path,
+                            self.allow_partial,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "load nested upstream V-JEPA checkpoint from {}",
+                                weights_path.display()
+                            )
+                        })?
+                    } else {
+                        result
+                    }
                 }
             }
             _ => {
@@ -149,7 +163,26 @@ impl VJepaLoadOptions {
                 );
             }
         } else if self.upstream_vjepa21_names && is_pytorch_checkpoint(&weights_path) {
-            zero_encoder_modality_embeddings(&mut model);
+            let missing_encoder_modality = report.missing.iter().any(|missing| {
+                let path = missing
+                    .split_once(':')
+                    .map(|(path, _)| path)
+                    .unwrap_or(missing.as_str());
+                path == "encoder.image_mod_embed" || path == "encoder.video_mod_embed"
+            });
+            let missing_predictor_modality = report.missing.iter().any(|missing| {
+                let path = missing
+                    .split_once(':')
+                    .map(|(path, _)| path)
+                    .unwrap_or(missing.as_str());
+                path == "predictor.image_mod_embed" || path == "predictor.video_mod_embed"
+            });
+            if missing_encoder_modality {
+                zero_encoder_modality_embeddings(&mut model);
+            }
+            if missing_predictor_modality {
+                zero_predictor_modality_embeddings(&mut model);
+            }
             report.missing.retain(|missing| {
                 let path = missing
                     .split_once(':')
@@ -166,6 +199,164 @@ impl VJepaLoadOptions {
         }
         Ok((model, config, report))
     }
+}
+
+fn load_official_upstream_vjepa21_pytorch<B: Backend>(
+    model: &mut VJepa2_1Model<B>,
+    weights_path: &Path,
+) -> Result<ApplyResult> {
+    let mut result = ApplyResult {
+        applied: Vec::new(),
+        skipped: Vec::new(),
+        missing: Vec::new(),
+        unused: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    let (encoder, encoder_key) = load_upstream_encoder_pytorch(model, weights_path)?;
+    extend_apply_result(&mut result, encoder, "encoder.");
+    apply_upstream_encoder_modality_embeddings(model, weights_path, encoder_key, &mut result)?;
+
+    let mut predictor_store = PytorchStore::from_file(weights_path)
+        .allow_partial(true)
+        .with_top_level_key("predictor");
+    predictor_store = apply_upstream_nested_predictor_key_remapping_pytorch(predictor_store);
+    let predictor = model
+        .load_from(&mut predictor_store)
+        .context("load upstream predictor")?;
+    ensure!(
+        !predictor.applied.is_empty(),
+        "official upstream V-JEPA checkpoint did not contain predictor tensors"
+    );
+    extend_apply_result(&mut result, predictor, "predictor.");
+    apply_upstream_predictor_modality_embeddings(model, weights_path, &mut result)?;
+
+    Ok(result)
+}
+
+fn load_upstream_encoder_pytorch<B: Backend>(
+    model: &mut VJepa2_1Model<B>,
+    weights_path: &Path,
+) -> Result<(ApplyResult, &'static str)> {
+    for key in ["ema_encoder", "target_encoder", "encoder"] {
+        let mut store = PytorchStore::from_file(weights_path)
+            .allow_partial(true)
+            .with_top_level_key(key);
+        store = apply_upstream_nested_encoder_key_remapping_pytorch(store);
+        let result = model
+            .load_from(&mut store)
+            .with_context(|| format!("load upstream {key}"))?;
+        if !result.applied.is_empty() {
+            return Ok((result, key));
+        }
+    }
+    bail!("official upstream V-JEPA checkpoint did not contain encoder tensors")
+}
+
+fn apply_upstream_encoder_modality_embeddings<B: Backend>(
+    model: &mut VJepa2_1Model<B>,
+    weights_path: &Path,
+    encoder_key: &str,
+    result: &mut ApplyResult,
+) -> Result<()> {
+    let mut store = PytorchStore::from_file(weights_path)
+        .allow_partial(true)
+        .with_top_level_key(encoder_key);
+    apply_upstream_param2(
+        &mut store,
+        "module.backbone.video_mod_embed",
+        &mut model.encoder.video_mod_embed,
+        "encoder.video_mod_embed",
+        result,
+    )?;
+    apply_upstream_param2(
+        &mut store,
+        "module.backbone.img_mod_embed",
+        &mut model.encoder.image_mod_embed,
+        "encoder.image_mod_embed",
+        result,
+    )?;
+    result
+        .missing
+        .retain(|(path, _)| path != "encoder.video_mod_embed" && path != "encoder.image_mod_embed");
+    Ok(())
+}
+
+fn apply_upstream_predictor_modality_embeddings<B: Backend>(
+    model: &mut VJepa2_1Model<B>,
+    weights_path: &Path,
+    result: &mut ApplyResult,
+) -> Result<()> {
+    let mut store = PytorchStore::from_file(weights_path)
+        .allow_partial(true)
+        .with_top_level_key("predictor");
+    apply_upstream_param2(
+        &mut store,
+        "module.backbone.video_mod_embed",
+        &mut model.predictor.video_mod_embed,
+        "predictor.video_mod_embed",
+        result,
+    )?;
+    apply_upstream_param2(
+        &mut store,
+        "module.backbone.img_mod_embed",
+        &mut model.predictor.image_mod_embed,
+        "predictor.image_mod_embed",
+        result,
+    )?;
+    result.missing.retain(|(path, _)| {
+        path != "predictor.video_mod_embed" && path != "predictor.image_mod_embed"
+    });
+    Ok(())
+}
+
+fn apply_upstream_param2<B: Backend>(
+    store: &mut PytorchStore,
+    upstream_name: &str,
+    param: &mut Param<Tensor<B, 2>>,
+    burn_name: &str,
+    result: &mut ApplyResult,
+) -> Result<()> {
+    let Some(snapshot) = store
+        .get_snapshot(upstream_name)
+        .with_context(|| format!("read upstream tensor {upstream_name}"))?
+    else {
+        return Ok(());
+    };
+    let data = snapshot
+        .to_data()
+        .with_context(|| format!("materialize upstream tensor {upstream_name}"))?;
+    let values = data
+        .to_vec::<f32>()
+        .with_context(|| format!("decode upstream tensor {upstream_name}"))?;
+    let current = param.val();
+    let [rows, dim] = current.shape().dims::<2>();
+    ensure!(
+        values.len() == rows * dim,
+        "tensor {upstream_name} has {} values, expected {} for {burn_name}",
+        values.len(),
+        rows * dim
+    );
+    let device = current.device();
+    *param = Param::from_tensor(Tensor::from_data(
+        TensorData::new(values, [rows, dim]),
+        &device,
+    ));
+    result.applied.push(burn_name.to_string());
+    Ok(())
+}
+
+fn extend_apply_result(target: &mut ApplyResult, result: ApplyResult, missing_scope: &str) {
+    target.applied.extend(result.applied);
+    target.skipped.extend(result.skipped);
+    target.unused.extend(result.unused);
+    target.errors.extend(result.errors);
+    target.missing.extend(
+        result
+            .missing
+            .into_iter()
+            .filter(|(path, _)| path.starts_with(missing_scope)),
+    );
 }
 
 fn load_nested_upstream_vjepa21_pytorch<B: Backend>(
@@ -220,6 +411,24 @@ fn zero_encoder_modality_embeddings<B: Backend>(model: &mut VJepa2_1Model<B>) {
     ));
 }
 
+fn zero_predictor_modality_embeddings<B: Backend>(model: &mut VJepa2_1Model<B>) {
+    let video = model.predictor.video_mod_embed.val();
+    let [video_rows, video_dim] = video.shape().dims::<2>();
+    let video_device = video.device();
+    model.predictor.video_mod_embed = Param::from_tensor(Tensor::<B, 2>::zeros(
+        [video_rows, video_dim],
+        &video_device,
+    ));
+
+    let image = model.predictor.image_mod_embed.val();
+    let [image_rows, image_dim] = image.shape().dims::<2>();
+    let image_device = image.device();
+    model.predictor.image_mod_embed = Param::from_tensor(Tensor::<B, 2>::zeros(
+        [image_rows, image_dim],
+        &image_device,
+    ));
+}
+
 fn is_pytorch_checkpoint(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -232,6 +441,8 @@ fn is_pytorch_checkpoint(path: &Path) -> bool {
 fn is_known_upstream_vjepa21_pytorch_ignored_missing(path: &str) -> bool {
     path == "encoder.image_mod_embed"
         || path == "encoder.video_mod_embed"
+        || path == "predictor.image_mod_embed"
+        || path == "predictor.video_mod_embed"
         || path
             .strip_prefix("predictor.mask_tokens.")
             .and_then(|suffix| suffix.parse::<usize>().ok())
@@ -285,6 +496,27 @@ fn apply_hf_vjepa2_fused_safetensors<B: Backend>(
         .push("encoder.image_mod_embed (zero HF compatibility)".to_string());
     satisfied.insert("encoder.video_mod_embed".to_string());
     satisfied.insert("encoder.image_mod_embed".to_string());
+
+    set_param2(
+        &mut model.predictor.video_mod_embed,
+        vec![0.0; config.predictor.embed_dim],
+        [1, config.predictor.embed_dim],
+        device,
+    );
+    set_param2(
+        &mut model.predictor.image_mod_embed,
+        vec![0.0; config.predictor.embed_dim],
+        [1, config.predictor.embed_dim],
+        device,
+    );
+    report
+        .applied
+        .push("predictor.video_mod_embed (zero HF compatibility)".to_string());
+    report
+        .applied
+        .push("predictor.image_mod_embed (zero HF compatibility)".to_string());
+    satisfied.insert("predictor.video_mod_embed".to_string());
+    satisfied.insert("predictor.image_mod_embed".to_string());
 
     for (index, block) in model.encoder.blocks.iter_mut().enumerate() {
         set_qkv(
@@ -664,6 +896,32 @@ fn apply_upstream_nested_encoder_key_remapping_pytorch(store: PytorchStore) -> P
         .with_key_remapping(r"\.norm([12])\.bias$", ".norm$1.beta")
         .with_key_remapping(r"\.norms_block\.(\d+)\.weight$", ".norms_block.$1.gamma")
         .with_key_remapping(r"\.norms_block\.(\d+)\.bias$", ".norms_block.$1.beta")
+}
+
+fn apply_upstream_nested_predictor_key_remapping_pytorch(store: PytorchStore) -> PytorchStore {
+    store
+        .with_key_remapping(
+            r"^module\.backbone\.predictor_embed\.",
+            "predictor.predictor_embed.",
+        )
+        .with_key_remapping(
+            r"^module\.backbone\.predictor_blocks\.(\d+)\.",
+            "predictor.blocks.$1.",
+        )
+        .with_key_remapping(r"^module\.backbone\.predictor_norm\.", "predictor.norm.")
+        .with_key_remapping(
+            r"^module\.backbone\.predictor_proj\.",
+            "predictor.target_proj.",
+        )
+        .with_key_remapping(
+            r"^module\.backbone\.predictor_proj_context\.",
+            "predictor.context_proj.",
+        )
+        .with_key_remapping(r"\.norm\.weight$", ".norm.gamma")
+        .with_key_remapping(r"\.norm\.bias$", ".norm.beta")
+        .with_key_remapping(r"\.norm([12])\.weight$", ".norm$1.gamma")
+        .with_key_remapping(r"\.norm([12])\.bias$", ".norm$1.beta")
+        .with_key_remapping(r"\.attention\.proj\.", ".attn.proj.")
 }
 
 pub fn load_config_from_hf_dir(dir: impl AsRef<Path>, name: &str) -> Result<VJepaConfig> {

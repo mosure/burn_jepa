@@ -297,11 +297,12 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
     let checkpoint_dir = std::path::PathBuf::from(checkpoint_dir);
     let device = Default::default();
     let allow_partial = env_bool("BURN_JEPA_VJEPA21_ALLOW_PARTIAL");
+    let weights_name =
+        env::var("BURN_JEPA_VJEPA21_WEIGHTS").unwrap_or_else(|_| "model.safetensors".to_string());
     let (model, config, report) = VJepaLoadOptions {
         config_name: env::var("BURN_JEPA_VJEPA21_CONFIG")
             .unwrap_or_else(|_| "config.json".to_string()),
-        weights_name: env::var("BURN_JEPA_VJEPA21_WEIGHTS")
-            .unwrap_or_else(|_| "model.safetensors".to_string()),
+        weights_name: weights_name.clone(),
         allow_partial,
         ..VJepaLoadOptions::default()
     }
@@ -353,6 +354,28 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
         assert!(
             prediction_diff <= 5.0e-4 && target_diff <= 5.0e-4,
             "real V-JEPA micro parity exceeded tolerance: prediction_diff={prediction_diff:e}, target_diff={target_diff:e}"
+        );
+    } else if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY") && is_pytorch_weights_name(&weights_name)
+    {
+        let torch_output = real_vjepa21_torchhub_micro_forward(
+            &checkpoint_dir,
+            &weights_name,
+            &config,
+            torchhub_model_name(&config),
+        );
+        let (burn_predictions, burn_targets) = real_torchhub_burn_micro_forward(
+            &model,
+            &config,
+            env_usize("BURN_JEPA_VJEPA21_MASK_INDEX", 1),
+        );
+        let prediction_diff = max_abs_diff(&burn_predictions, &torch_output.predictions);
+        let target_diff = max_abs_diff(&burn_targets, &torch_output.targets);
+        eprintln!(
+            "real V-JEPA 2.1 torchhub micro parity prediction_diff={prediction_diff:e} target_diff={target_diff:e}"
+        );
+        assert!(
+            prediction_diff <= 5.0e-4 && target_diff <= 5.0e-4,
+            "real V-JEPA 2.1 torchhub micro parity exceeded tolerance: prediction_diff={prediction_diff:e}, target_diff={target_diff:e}"
         );
     } else if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY") {
         eprintln!(
@@ -425,6 +448,32 @@ fn real_burn_micro_forward(
     (burn_predictions, burn_targets)
 }
 
+fn real_torchhub_burn_micro_forward(
+    model: &VJepa2_1Model<B>,
+    config: &VJepaConfig,
+    mask_index: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let device = Default::default();
+    let context = SparseTokenMask::new(vec![0, 2], 4).expect("torchhub micro context");
+    let target = SparseTokenMask::new(vec![1, 3], 4).expect("torchhub micro target");
+    let dense = model.encode_video(real_torchhub_micro_parity_video(config), None);
+    let context_tokens = apply_token_mask(dense.tokens.clone(), context.to_tensor(1, &device));
+    let predictor = model
+        .predictor
+        .forward_sparse(context_tokens, &context, &target, dense.grid, mask_index)
+        .expect("real torchhub checkpoint micro predictor forward");
+    let burn_predictions = predictor
+        .target_predictions
+        .to_data()
+        .to_vec::<f32>()
+        .expect("real torchhub burn prediction values");
+    let burn_targets = apply_token_mask(dense.tokens, target.to_tensor(1, &device))
+        .to_data()
+        .to_vec::<f32>()
+        .expect("real torchhub burn target values");
+    (burn_predictions, burn_targets)
+}
+
 fn real_hf_micro_forward_available(checkpoint_dir: &std::path::Path) -> bool {
     ["model.safetensors", "pytorch_model.bin"]
         .iter()
@@ -447,7 +496,7 @@ fn parity_config() -> VJepaConfig {
             mlp_ratio: 2.0,
             layer_norm_eps: 1.0e-6,
             use_rope: true,
-            interpolate_rope: true,
+            interpolate_rope: false,
             modality_embedding: false,
             n_output_distillation: 1,
         },
@@ -461,6 +510,7 @@ fn parity_config() -> VJepaConfig {
             return_all_tokens: false,
             layer_norm_eps: 1.0e-6,
             use_rope: true,
+            modality_embedding: false,
         },
         preprocess: VJepaPreprocessConfig::default(),
     }
@@ -550,6 +600,21 @@ fn real_micro_parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
     )
 }
 
+fn real_torchhub_micro_parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
+    let device = Default::default();
+    let frames = config.tubelet_size.max(1);
+    let height = config.patch_size.max(1) * 2;
+    let width = config.patch_size.max(1) * 2;
+    let len = config.in_channels * frames * height * width;
+    let values = (0..len)
+        .map(|i| ((i % 31) as f32 - 15.0) / 23.0)
+        .collect::<Vec<_>>();
+    Tensor::<B, 5>::from_data(
+        TensorData::new(values, [1, config.in_channels, frames, height, width]),
+        &device,
+    )
+}
+
 fn real_hf_micro_forward(checkpoint_dir: &std::path::Path) -> TorchParityOutput {
     if Command::new("python3")
         .arg("-c")
@@ -578,6 +643,63 @@ fn real_hf_micro_forward(checkpoint_dir: &std::path::Path) -> TorchParityOutput 
     );
     serde_json::from_slice(&std::fs::read(&output_path).expect("read real HF fixture output"))
         .expect("parse real HF fixture output")
+}
+
+fn real_vjepa21_torchhub_micro_forward(
+    checkpoint_dir: &std::path::Path,
+    weights_name: &str,
+    config: &VJepaConfig,
+    model_name: &str,
+) -> TorchParityOutput {
+    if Command::new("python3")
+        .arg("-c")
+        .arg("import torch, timm, einops")
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
+    {
+        panic!("BURN_JEPA_VJEPA21_FORWARD_PARITY requires python3 torch, timm, and einops");
+    }
+    let tempdir = tempfile::tempdir().expect("real torchhub parity tempdir");
+    let output_path = tempdir.path().join("real-vjepa21-torchhub-output.json");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/vjepa21_torchhub_real_micro_forward.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .arg(checkpoint_dir)
+        .arg(weights_name)
+        .arg(model_name)
+        .arg(config.num_frames.to_string())
+        .arg(&output_path)
+        .output()
+        .expect("run real torchhub V-JEPA 2.1 micro fixture");
+    assert!(
+        output.status.success(),
+        "real torchhub V-JEPA 2.1 micro fixture failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&std::fs::read(&output_path).expect("read real torchhub fixture output"))
+        .expect("parse real torchhub fixture output")
+}
+
+fn is_pytorch_weights_name(weights_name: &str) -> bool {
+    matches!(
+        std::path::Path::new(weights_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default(),
+        "pt" | "pth"
+    )
+}
+
+fn torchhub_model_name(config: &VJepaConfig) -> &'static str {
+    match (config.encoder.embed_dim, config.encoder.depth) {
+        (1024, 24) => "vjepa2_1_vit_large_384",
+        (1408, 40) => "vjepa2_1_vit_giant_384",
+        (1664, 48) => "vjepa2_1_vit_gigantic_384",
+        _ => "vjepa2_1_vit_base_384",
+    }
 }
 
 fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {

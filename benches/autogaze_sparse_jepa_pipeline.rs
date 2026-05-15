@@ -1280,6 +1280,7 @@ fn jepa_config() -> VJepaConfig {
             return_all_tokens: false,
             layer_norm_eps: 1.0e-6,
             use_rope: true,
+            modality_embedding: true,
         },
         preprocess: Default::default(),
         variant: VJepaModelVariant::VitBase384,

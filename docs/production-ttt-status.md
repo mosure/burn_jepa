@@ -10,18 +10,19 @@ external parity/data requirements.
 - Base V-JEPA fixture:
   `/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/model.pt`
 - TTT adapter:
-  `target/burn-jepa-real-autogaze-cross-domain/real-autogaze-context-continue-512/ttt-model.mpk`
-- Sparse policy: real AutoGaze precomputed context masks, 314 / 1568 context
-  tokens, 79 / 1568 target tokens.
-- Eval split: 20 held-out windows across `cisco`, `mixed`, and `screen`.
+  `target/burn-jepa-production-ttt-vjepa21-official/autogaze-sparse-224-context-1024/ttt-model.mpk`
+- Sparse policy: AutoGaze-style sparse context masks, 314 / 1568 context
+  tokens, 78 / 1568 target tokens.
+- Eval split: 164 held-out open-set windows from
+  `target/burn-jepa-production-ttt-large/data/eval.jsonl`.
 
 ## Loader Gate
 
-The official Meta `.pt` fixture uses flattened upstream names such as
-`encoder.module.backbone.blocks.*` and `predictor.module.backbone.*`. The Burn
-loader maps those prefixes directly, filters only the known rank-incompatible
-singleton modality / predictor mask-token parameters, and keeps strict missing
-checks for everything else.
+The official Meta `.pt` fixture uses top-level `ema_encoder` and `predictor`
+modules with nested `module.backbone.*` parameter names. The Burn loader maps
+those prefixes directly, loads the official V-JEPA 2.1 encoder/predictor
+modality embeddings, keeps predictor mask tokens zero-initialized, and keeps
+strict missing checks for everything else.
 
 ```sh
 BURN_JEPA_VJEPA21_CHECKPOINT_DIR=/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384 \
@@ -34,66 +35,64 @@ cargo test --no-default-features --features ndarray \
 
 Current result:
 
-- `applied=308 missing=0 skipped=0 errors=0`
-- HF micro parity is skipped for this fixture because it is not saved as
-  `model.safetensors` or `pytorch_model.bin`.
-- The fallback Burn real-weight micro forward smoke verifies finite predictor
-  and target outputs.
-
-Exact upstream numerical parity still requires either the Meta reference
-inference path or an HF-compatible real checkpoint fixture.
+- `applied=312 missing=0 skipped=0 errors=0`
+- Official torch.hub reference:
+  `torch.hub.load("facebookresearch/vjepa2", "vjepa2_1_vit_base_384", pretrained=False, num_frames=16)`
+- Micro parity: prediction max abs diff `1.006e-4`, target max abs diff
+  `1.034e-5`.
 
 ## Held-Out Eval
 
 Sparse production rollout:
 
 ```sh
-BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
-  --config target/burn-jepa-real-autogaze-cross-domain/configs/eval-real-autogaze-new.toml \
-  --model target/burn-jepa-real-autogaze-cross-domain/real-autogaze-context-continue-512/ttt-model.mpk \
-  --steps 5 --batch-size 4 --no-full-grid
+  --config target/burn-jepa-production-ttt-vjepa21-official/configs/autogaze-sparse-224-context-eval-trained-fast.toml \
+  --model target/burn-jepa-production-ttt-vjepa21-official/autogaze-sparse-224-context-1024/ttt-model.mpk \
+  --steps 11 --batch-size 16 --no-full-grid
 ```
 
 Result:
 
-- Sparse free-run loss/cosine: `0.2444 / 0.8969`
-- Throughput: `0.95` samples/sec
-- Stage time: teacher `4273 ms`, student `12627 ms`, loss `409 ms`
-- Domain split:
-  - `cisco`: `0.2594 / 0.8910`
-  - `mixed`: `0.2101 / 0.9112`
-  - `screen`: `0.2465 / 0.8956`
+- Sparse free-run loss/cosine: `0.3021 / 0.8746`
+- Throughput: `5.91` samples/sec over 164 windows
+- Stage time: teacher `6828 ms`, student `12542 ms`, loss `687 ms`
+- Zero-init same-loader baseline: `0.4544 / 0.8076`
+- Loss reduction vs zero-init: `33.5%`; cosine gain: `+0.0670`
 
 Full-grid diagnostic:
 
 ```sh
-BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
-  --config target/burn-jepa-real-autogaze-cross-domain/configs/eval-real-autogaze-new-full10.toml \
-  --model target/burn-jepa-real-autogaze-cross-domain/real-autogaze-context-continue-512/ttt-model.mpk \
-  --steps 5 --batch-size 4 --full-grid
+  --config target/burn-jepa-production-ttt-vjepa21-official/configs/autogaze-sparse-224-context-eval-trained-full32.toml \
+  --model target/burn-jepa-production-ttt-vjepa21-official/autogaze-sparse-224-context-1024/ttt-model.mpk \
+  --steps 2 --batch-size 16 --full-grid
 ```
 
 Result:
 
-- Sparse target loss/cosine: `0.2444 / 0.8969`
-- Full-grid loss/cosine: `0.2088 / 0.9129`
-- Throughput: `0.73` samples/sec
+- Sparse target loss/cosine: `0.3028 / 0.8746`
+- Full-grid loss/cosine: `0.2552 / 0.8948`
+- Throughput: `1.23` samples/sec over 32 windows
 
-The comparable single-frame no-TTT baseline reports sparse loss/cosine
-`0.2734 / 0.8849`, so the current TTT adapter improves held-out sparse loss by
-about `10.6%` and cosine by `0.0120`.
+Training behavior:
+
+- 1024 CUDA steps, 1024 samples, 20.0% sparse-context density.
+- Initial loss `0.3672`, best loss `0.1482`, final loss `0.2383`.
+- Throughput `0.448` samples/sec.
+- Runtime bottleneck remains backward/optimizer: `2070.8 s` of `2286.3 s`
+  elapsed.
 
 ## Production Verdict
 
-The direction is viable: real AutoGaze sparse masks, real V-JEPA 2.1 weights,
-ragged sparse rollout, and adapter checkpoint reload all work together on CUDA.
-The adapter gives a measurable held-out quality gain over the dense single-frame
-baseline while preserving the deployable free-run sparse path.
+The direction is viable: exact official V-JEPA 2.1 torch.hub parity, sparse
+rollout, sparse patchify, adapter training, checkpoint reload, and CUDA/WebGPU
+smokes all work together. The fresh official-2.1 adapter gives a clear
+held-out quality gain over a same-loader zero-init TTT baseline while preserving
+the deployable free-run sparse path.
 
-It is not yet a final production model. The remaining gates are larger
-open-set training/eval, exact upstream numerical parity against a real reference
-fixture, and throughput work on the sparse TTT backward/runtime path.
+It is not yet a final production model. The remaining gate is throughput and
+scale: train on a larger, more diverse real AutoGaze-mask corpus, run
+cross-domain eval, and reduce sparse TTT backward/optimizer cost.

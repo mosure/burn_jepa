@@ -264,6 +264,8 @@ impl<B: Backend> SparseEncoderPlan<B> {
             batch,
             device,
             config.encoder.use_rope,
+            config.encoder.interpolate_rope,
+            config.patch_size,
         );
         Ok(Self {
             mask,
@@ -311,6 +313,8 @@ impl<B: Backend> SparseEncoderBatchPlan<B> {
             config.encoder.embed_dim / config.encoder.num_heads.max(1),
             device,
             config.encoder.use_rope,
+            config.encoder.interpolate_rope,
+            config.patch_size,
         );
         ensure!(
             positions.indices.shape().dims::<2>() == [batch, token_count],
@@ -925,13 +929,20 @@ impl<B: Backend> SparsePredictorPlan<B> {
             .iter()
             .map(|&index| merged_indices[index])
             .collect::<Vec<_>>();
+        let position_grid = if config.predictor.use_rope {
+            config.token_grid()
+        } else {
+            grid
+        };
         let positions = token_sequence_position::<B>(
             &sorted_indices,
-            grid,
+            position_grid,
             config.predictor.embed_dim / config.predictor.num_heads.max(1),
             batch,
             device,
             config.predictor.use_rope,
+            false,
+            config.patch_size,
         );
         let context_position_embed = (!config.predictor.use_rope).then(|| {
             position_tensor::<B>(
@@ -974,6 +985,8 @@ pub struct VJepaPredictor<B: Backend> {
     pub norm: LayerNorm<B>,
     pub target_proj: Linear<B>,
     pub context_proj: Option<Linear<B>>,
+    pub video_mod_embed: Param<Tensor<B, 2>>,
+    pub image_mod_embed: Param<Tensor<B, 2>>,
     #[module(skip)]
     config: VJepaConfig,
     #[module(skip)]
@@ -1010,6 +1023,16 @@ impl<B: Backend> VJepaPredictor<B> {
             context_proj: predictor
                 .return_all_tokens
                 .then(|| LinearConfig::new(pred_dim, output_dim).init(device)),
+            video_mod_embed: Param::from_tensor(Tensor::<B, 2>::random(
+                [1, pred_dim],
+                Distribution::Normal(0.0, 1.0e-6),
+                device,
+            )),
+            image_mod_embed: Param::from_tensor(Tensor::<B, 2>::random(
+                [1, pred_dim],
+                Distribution::Normal(0.0, 1.0e-6),
+                device,
+            )),
             config: config.clone(),
             return_all_tokens: predictor.return_all_tokens,
         }
@@ -1071,6 +1094,16 @@ impl<B: Backend> VJepaPredictor<B> {
         };
         let mut sequence = Tensor::cat(vec![context, target], 1);
         sequence = gather_with_indices(sequence, plan.sort_order.clone());
+        if self.config.predictor.modality_embedding {
+            let token_count = context_len + target_len;
+            let embed = self
+                .video_mod_embed
+                .val()
+                .reshape([1, 1, self.config.predictor.embed_dim])
+                .repeat_dim(0, batch)
+                .repeat_dim(1, token_count);
+            sequence = sequence + embed;
+        }
 
         for block in &self.blocks {
             sequence = block.forward(sequence, Some(&plan.positions));
@@ -1340,9 +1373,19 @@ fn token_sequence_position<B: Backend>(
     batch: usize,
     device: &B::Device,
     use_rope: bool,
+    interpolate_rope: bool,
+    patch_size: usize,
 ) -> TokenSequencePosition<B> {
     let (rope_sin, rope_cos) = if use_rope {
-        let (sin, cos) = rotary_sin_cos_tensors::<B>(indices, grid, head_dim, batch, device);
+        let (sin, cos) = rotary_sin_cos_tensors::<B>(
+            indices,
+            grid,
+            head_dim,
+            batch,
+            device,
+            interpolate_rope,
+            patch_size,
+        );
         (Some(sin), Some(cos))
     } else {
         (None, None)
@@ -1360,6 +1403,8 @@ fn token_sequence_position_rows<B: Backend>(
     head_dim: usize,
     device: &B::Device,
     use_rope: bool,
+    interpolate_rope: bool,
+    patch_size: usize,
 ) -> TokenSequencePosition<B> {
     let batch = rows.len();
     let token_count = rows.first().map(Vec::len).unwrap_or(0);
@@ -1370,7 +1415,14 @@ fn token_sequence_position_rows<B: Backend>(
     let indices =
         Tensor::<B, 2, Int>::from_data(TensorData::new(values, [batch, token_count]), device);
     let (rope_sin, rope_cos) = if use_rope {
-        let (sin, cos) = rotary_sin_cos_tensors_rows::<B>(rows, grid, head_dim, device);
+        let (sin, cos) = rotary_sin_cos_tensors_rows::<B>(
+            rows,
+            grid,
+            head_dim,
+            device,
+            interpolate_rope,
+            patch_size,
+        );
         (Some(sin), Some(cos))
     } else {
         (None, None)
@@ -1388,15 +1440,19 @@ fn rotary_sin_cos_tensors<B: Backend>(
     head_dim: usize,
     batch: usize,
     device: &B::Device,
+    interpolate_rope: bool,
+    patch_size: usize,
 ) -> (Tensor<B, 3>, Tensor<B, 3>) {
     let axis_dim = 2 * ((head_dim / 3) / 2);
     let mut sin = Vec::with_capacity(indices.len() * head_dim);
     let mut cos = Vec::with_capacity(indices.len() * head_dim);
     for &index in indices {
         let (frame, row, col) = crate::token_index_to_coords(index, grid);
+        let row = rope_spatial_position(row, grid.height, patch_size, interpolate_rope);
+        let col = rope_spatial_position(col, grid.width, patch_size, interpolate_rope);
         append_rotary_axis(&mut sin, &mut cos, axis_dim, frame as f32);
-        append_rotary_axis(&mut sin, &mut cos, axis_dim, row as f32);
-        append_rotary_axis(&mut sin, &mut cos, axis_dim, col as f32);
+        append_rotary_axis(&mut sin, &mut cos, axis_dim, row);
+        append_rotary_axis(&mut sin, &mut cos, axis_dim, col);
         let used = axis_dim * 3;
         for _ in used..head_dim {
             sin.push(0.0);
@@ -1415,6 +1471,8 @@ fn rotary_sin_cos_tensors_rows<B: Backend>(
     grid: TokenGridShape,
     head_dim: usize,
     device: &B::Device,
+    interpolate_rope: bool,
+    patch_size: usize,
 ) -> (Tensor<B, 3>, Tensor<B, 3>) {
     let axis_dim = 2 * ((head_dim / 3) / 2);
     let token_count = rows.first().map(Vec::len).unwrap_or(0);
@@ -1423,9 +1481,11 @@ fn rotary_sin_cos_tensors_rows<B: Backend>(
     for row in rows {
         for &index in row {
             let (frame, row, col) = crate::token_index_to_coords(index, grid);
+            let row = rope_spatial_position(row, grid.height, patch_size, interpolate_rope);
+            let col = rope_spatial_position(col, grid.width, patch_size, interpolate_rope);
             append_rotary_axis(&mut sin, &mut cos, axis_dim, frame as f32);
-            append_rotary_axis(&mut sin, &mut cos, axis_dim, row as f32);
-            append_rotary_axis(&mut sin, &mut cos, axis_dim, col as f32);
+            append_rotary_axis(&mut sin, &mut cos, axis_dim, row);
+            append_rotary_axis(&mut sin, &mut cos, axis_dim, col);
             let used = axis_dim * 3;
             for _ in used..head_dim {
                 sin.push(0.0);
@@ -1442,6 +1502,27 @@ fn rotary_sin_cos_tensors_rows<B: Backend>(
         device,
     );
     (sin, cos)
+}
+
+fn rope_spatial_position(
+    index: usize,
+    axis_len: usize,
+    patch_size: usize,
+    interpolate_rope: bool,
+) -> f32 {
+    if !interpolate_rope || axis_len <= 1 {
+        return index as f32;
+    }
+    let pretrained = rope_pretrained_grid_size(patch_size);
+    index as f32 * (pretrained - 1.0) / (axis_len as f32 - 1.0)
+}
+
+fn rope_pretrained_grid_size(patch_size: usize) -> f32 {
+    match patch_size {
+        14 => 18.0,
+        16 => 16.0,
+        patch => 256.0 / patch.max(1) as f32,
+    }
 }
 
 fn append_rotary_axis(sin: &mut Vec<f32>, cos: &mut Vec<f32>, dim: usize, pos: f32) {
@@ -1517,5 +1598,25 @@ mod tests {
             out.predictor.target_predictions.shape().dims::<3>(),
             [1, 4, 32]
         );
+    }
+
+    #[test]
+    fn rope_interpolation_matches_vjepa21_spatial_scale() {
+        assert_eq!(rope_pretrained_grid_size(16), 16.0);
+        assert_eq!(rope_spatial_position(23, 24, 16, true), 15.0);
+        assert_eq!(rope_spatial_position(1, 24, 16, false), 1.0);
+        assert_eq!(rope_spatial_position(0, 1, 16, true), 0.0);
+    }
+
+    #[test]
+    fn rope_axis_uses_upstream_pairwise_frequency_repeat() {
+        let mut sin = Vec::new();
+        let mut cos = Vec::new();
+        append_rotary_axis(&mut sin, &mut cos, 8, 1.0);
+        assert_eq!(sin.len(), 8);
+        assert_eq!(cos.len(), 8);
+        assert_eq!(sin[0], sin[1]);
+        assert_ne!(sin[0], sin[2]);
+        assert_eq!(cos[6], cos[7]);
     }
 }

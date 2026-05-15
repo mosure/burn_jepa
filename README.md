@@ -411,26 +411,25 @@ V-JEPA 2.1 checkpoint parity should be run with a local checkpoint fixture befor
 claiming production weight parity. `tests/numerical_parity.rs` includes an
 env-gated loader smoke for that fixture. The loader maps Transformers-style
 VJEPA2 configs, fuses HF query/key/value tensors into the Burn `qkv` layout, and
-strict-loads flattened upstream `.pt` / `.pth` checkpoints that use
-`encoder.module.backbone` and `predictor.module.backbone` prefixes:
+strict-loads official upstream `.pt` / `.pth` checkpoints that use
+`ema_encoder`, `target_encoder`, `encoder`, and `predictor` top-level modules:
 
 ```sh
 BURN_JEPA_VJEPA21_CHECKPOINT_DIR=/path/to/vjepa2_1 \
 BURN_JEPA_VJEPA21_WEIGHTS=model.pt \
+BURN_JEPA_VJEPA21_FORWARD_PARITY=1 \
 cargo test --test numerical_parity real_vjepa_checkpoint_loads_when_fixture_is_set -- --ignored
 ```
 
 Set `BURN_JEPA_VJEPA21_FORWARD_SMOKE=1` to also run a sparse forward smoke after
 loading. Set `BURN_JEPA_VJEPA21_FORWARD_PARITY=1` to compare a one-token
-real-checkpoint micro forward against the installed Hugging Face `VJEPA2Model`;
-this keeps the real-weight parity check small enough for CPU-only machines. If
-the local checkpoint is the official Meta `.pt` layout rather than an
-HF-compatible `model.safetensors` / `pytorch_model.bin` fixture, the same flag
-runs a Burn real-weight micro forward smoke instead. Official `.pt` checkpoints
-store singleton modality and predictor mask-token tensors in a rank that differs
-from this crate's persisted Burn layout; the loader zeroes encoder modality
-embeddings deterministically and leaves predictor mask tokens at their Burn
-initialization so adapter checkpoints remain backward compatible.
+real-checkpoint micro forward against the installed Hugging Face `VJEPA2Model`
+for HF-compatible fixtures or against the official `facebookresearch/vjepa2`
+torch.hub V-JEPA 2.1 entrypoints for Meta `.pt` fixtures. Official `.pt`
+checkpoints store singleton modality and mask-token tensors in a rank that
+differs from this crate's persisted Burn layout; the loader reshapes the
+encoder/predictor modality embeddings into the Burn module layout and leaves
+zero-initialized predictor mask tokens at their Burn initialization.
 CUDA pipeline throughput is exposed by the benchmark harness, but it requires a
 CUDA-capable device at runtime.
 Set `BURN_JEPA_RUN_CUDA_SPARSE_PATCHIFY=1` to run the opt-in CUDA sparse

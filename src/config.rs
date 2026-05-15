@@ -121,6 +121,7 @@ impl VJepaConfig {
                 return_all_tokens: true,
                 layer_norm_eps: 1.0e-6,
                 use_rope: true,
+                modality_embedding: true,
             },
             preprocess: VJepaPreprocessConfig::default(),
         }
@@ -196,6 +197,7 @@ impl VJepaConfig {
                 return_all_tokens: false,
                 layer_norm_eps: value_f64(value, "layer_norm_eps", 1.0e-6),
                 use_rope: true,
+                modality_embedding: false,
             },
             preprocess: VJepaPreprocessConfig::default(),
         }
@@ -313,6 +315,7 @@ pub struct VJepaPredictorConfig {
     pub return_all_tokens: bool,
     pub layer_norm_eps: f64,
     pub use_rope: bool,
+    pub modality_embedding: bool,
 }
 
 impl Default for VJepaPredictorConfig {
@@ -327,6 +330,7 @@ impl Default for VJepaPredictorConfig {
             return_all_tokens: true,
             layer_norm_eps: 1.0e-6,
             use_rope: true,
+            modality_embedding: true,
         }
     }
 }
