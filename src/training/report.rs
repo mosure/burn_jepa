@@ -1,4 +1,4 @@
-use crate::{TttBackpropMode, TttTargetMode};
+use crate::{TttBackpropMode, TttMemoryUpdateSource, TttSupervisionMode, TttTargetMode};
 use anyhow::{Context, Result};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
@@ -30,6 +30,12 @@ pub struct TttMemoryMetrics {
 pub struct TttMaskMetrics {
     pub context_tokens: usize,
     pub target_tokens: usize,
+    pub context_min_tokens: usize,
+    pub context_max_tokens: usize,
+    pub context_mean_tokens: f32,
+    pub target_min_tokens: usize,
+    pub target_max_tokens: usize,
+    pub target_mean_tokens: f32,
     pub dense_tokens: usize,
     pub context_density: f32,
     pub target_density: f32,
@@ -57,6 +63,9 @@ pub struct TttStageMetrics {
 #[derive(Clone, Debug, Serialize)]
 pub struct TttTargetSupervisionMetrics {
     pub mode: TttTargetMode,
+    pub memory_update: TttMemoryUpdateSource,
+    pub supervision: TttSupervisionMode,
+    pub hybrid_final_steps: usize,
     pub train_adapter_target: &'static str,
     pub deploy_adapter_target: &'static str,
     pub layer_alignment: &'static str,

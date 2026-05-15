@@ -6,7 +6,7 @@ use crate::training::report::{
     TttDomainEvalMetric, TttStageMetrics, TttTemporalDiagnosticMetrics, TttUtilizationMetrics,
     tensor_scalar,
 };
-use crate::{TttStateResetMode, TttTargetMode};
+use crate::{TttMemoryUpdateSource, TttStateResetMode, TttSupervisionMode};
 use crate::{VJepa2_1Model, VJepaTttModel, dataset_from_config};
 use anyhow::Result;
 use burn::tensor::Tensor;
@@ -66,10 +66,12 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
     let mut full_samples = 0usize;
     let mut stage = TttStageMetrics::default();
     let mut domains = BTreeMap::<String, DomainTotals>::new();
-    let mut teacher_cache = BTreeMap::<String, burn::tensor::Tensor<B, 3>>::new();
+    let mut teacher_cache = BTreeMap::<String, step::TeacherTokenTargets<B>>::new();
     let mut utilization = None;
     let mut temporal_diagnostics = None;
-    let teacher_forced_eval = config.ttt.target == TttTargetMode::TeacherFinal;
+    let teacher_forced_eval =
+        config.ttt.memory_update == TttMemoryUpdateSource::TeacherForcedDiagnostic;
+    let capture_layers = config.ttt.capture_layers(model.config());
     for step_index in 0..steps {
         let start_index = step_index * eval_batch_size;
         let batch_size = if start_index < dataset.len() {
@@ -91,6 +93,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             batch.teacher.clone(),
             &batch.metadata,
             start_index,
+            &capture_layers,
             config.training.cache_teacher_tokens,
             &mut teacher_cache,
             &mut stage,
@@ -103,7 +106,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             step::student_eval_rollout(
                 model,
                 batch.student.clone(),
-                teacher_tokens.clone(),
+                teacher_tokens.final_tokens.clone(),
                 masks.as_ref(),
                 rollout,
                 patchify,
@@ -144,15 +147,16 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             model,
             config,
             &student.free_run,
-            teacher_tokens.clone(),
+            &teacher_tokens,
             masks.as_ref(),
             rollout,
             batch_size,
             device,
+            TttSupervisionMode::FinalTeacher,
         )?;
         let primary_cosine = loss::primary_cosine(
             student.free_run.tokens.clone(),
-            teacher_tokens.clone(),
+            teacher_tokens.final_tokens.clone(),
             masks.as_ref().map(|masks| match rollout {
                 TttRolloutKind::Dense | TttRolloutKind::SparseTarget => &masks.target,
                 TttRolloutKind::SparseContext => &masks.context,
@@ -173,17 +177,18 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
                     model,
                     config,
                     teacher_forced,
-                    teacher_tokens.clone(),
+                    &teacher_tokens,
                     masks.as_ref(),
                     rollout,
                     batch_size,
                     device,
+                    TttSupervisionMode::FinalTeacher,
                 )?
                 .detach(),
             )?;
             let batch_teacher_forced_cosine = loss::primary_cosine(
                 teacher_forced.tokens.clone(),
-                teacher_tokens.clone(),
+                teacher_tokens.final_tokens.clone(),
                 masks.as_ref().map(|masks| match rollout {
                     TttRolloutKind::Dense | TttRolloutKind::SparseTarget => &masks.target,
                     TttRolloutKind::SparseContext => &masks.context,
@@ -204,14 +209,15 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             let full_feature_loss = loss::primary_feature_loss(
                 config,
                 full_student_tokens.clone(),
-                teacher_tokens.clone(),
+                teacher_tokens.final_tokens.clone(),
                 None,
                 TttRolloutKind::Dense,
                 batch_size,
                 device,
             );
             let batch_full_loss = tensor_scalar(full_feature_loss.detach())?;
-            let batch_full_cosine = loss::tensor_cosine(full_student_tokens, teacher_tokens)?;
+            let batch_full_cosine =
+                loss::tensor_cosine(full_student_tokens, teacher_tokens.final_tokens.clone())?;
             total_full_loss += batch_full_loss * batch_size as f64;
             total_full_cosine += batch_full_cosine * batch_size as f64;
             full_samples += batch_size;
@@ -290,7 +296,7 @@ fn eval_temporal_diagnostics<B: step::TttSparsePatchifyTrainingBackend>(
     model: &VJepaTttModel<B>,
     config: &BurnJepaTrainConfig,
     video: burn::tensor::Tensor<B, 5>,
-    teacher_tokens: burn::tensor::Tensor<B, 3>,
+    teacher_tokens: step::TeacherTokenTargets<B>,
     masks: Option<&step::ResolvedTttMasks<B>>,
     rollout: TttRolloutKind,
     batch_size: usize,
@@ -423,7 +429,7 @@ fn diagnostic_loss_cosine<B: step::TttSparsePatchifyTrainingBackend>(
     model: &VJepaTttModel<B>,
     config: &BurnJepaTrainConfig,
     student: crate::VJepaEncoderOutput<B>,
-    teacher_tokens: burn::tensor::Tensor<B, 3>,
+    teacher_tokens: step::TeacherTokenTargets<B>,
     masks: Option<&step::ResolvedTttMasks<B>>,
     rollout: TttRolloutKind,
     batch_size: usize,
@@ -434,17 +440,18 @@ fn diagnostic_loss_cosine<B: step::TttSparsePatchifyTrainingBackend>(
             model,
             config,
             &student,
-            teacher_tokens.clone(),
+            &teacher_tokens,
             masks,
             rollout,
             batch_size,
             device,
+            TttSupervisionMode::FinalTeacher,
         )?
         .detach(),
     )?;
     let cosine = loss::primary_cosine(
         student.tokens,
-        teacher_tokens,
+        teacher_tokens.final_tokens,
         masks.map(|masks| match rollout {
             TttRolloutKind::Dense | TttRolloutKind::SparseTarget => &masks.target,
             TttRolloutKind::SparseContext => &masks.context,

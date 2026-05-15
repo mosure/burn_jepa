@@ -100,9 +100,9 @@ pub use training::{
     evaluate_ttt_model_file, train_dense_jepa, train_ttt_distillation,
 };
 pub use ttt::{
-    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttState,
-    TttStateResetMode, TttTargetMode, VJepaTttEncoder, VJepaTttLayer, VJepaTttLayerProbe,
-    VJepaTttLayerProbeRecord, VJepaTttModel,
+    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttMemoryUpdateSource,
+    TttState, TttStateResetMode, TttSupervisionMode, TttTargetMode, VJepaTttEncoder, VJepaTttLayer,
+    VJepaTttLayerProbe, VJepaTttLayerProbeRecord, VJepaTttModel,
 };
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;

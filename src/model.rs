@@ -225,6 +225,7 @@ impl<B: Backend> TransformerBlock<B> {
 pub struct VJepaEncoderOutput<B: Backend> {
     pub tokens: Tensor<B, 3>,
     pub hierarchical: Vec<Tensor<B, 3>>,
+    pub captured_layers: Vec<usize>,
     pub token_indices: Tensor<B, 2, Int>,
     pub grid: TokenGridShape,
 }
@@ -301,7 +302,7 @@ impl<B: Backend> SparseEncoderBatchPlan<B> {
         let batch = mask.batch();
         let token_count = mask.len();
         let dim = config.encoder.embed_dim;
-        let rows = mask.rows();
+        let rows = mask.padded_rows();
         let position_embed =
             (!config.encoder.use_rope).then(|| position_tensor_rows::<B>(&rows, grid, dim, device));
         let positions = token_sequence_position_rows::<B>(
@@ -410,7 +411,30 @@ impl<B: Backend> VJepaEncoder<B> {
             width / self.config.patch_size.max(1),
         );
         let tokens = self.patch_embed.forward(video);
-        self.forward_tokens(tokens, batch, grid, mask, true)
+        self.forward_tokens_capture_layers(
+            tokens,
+            batch,
+            grid,
+            mask,
+            true,
+            &self.hierarchical_layers,
+        )
+    }
+
+    pub fn forward_video_capture_layers(
+        &self,
+        video: Tensor<B, 5>,
+        mask: Option<&SparseTokenMask>,
+        capture_layers: &[usize],
+    ) -> VJepaEncoderOutput<B> {
+        let [batch, _channels, frames, height, width] = video.shape().dims::<5>();
+        let grid = TokenGridShape::new(
+            frames / self.config.tubelet_size.max(1),
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        let tokens = self.patch_embed.forward(video);
+        self.forward_tokens_capture_layers(tokens, batch, grid, mask, true, capture_layers)
     }
 
     pub fn forward_video_with_plan(
@@ -456,16 +480,24 @@ impl<B: Backend> VJepaEncoder<B> {
         );
         let image = image.reshape([batch, channels, 1, height, width]);
         let tokens = self.image_patch_embed.forward(image);
-        self.forward_tokens(tokens, batch, grid, mask, false)
+        self.forward_tokens_capture_layers(
+            tokens,
+            batch,
+            grid,
+            mask,
+            false,
+            &self.hierarchical_layers,
+        )
     }
 
-    fn forward_tokens(
+    fn forward_tokens_capture_layers(
         &self,
         tokens: Tensor<B, 3>,
         batch: usize,
         grid: TokenGridShape,
         mask: Option<&SparseTokenMask>,
         video: bool,
+        capture_layers: &[usize],
     ) -> VJepaEncoderOutput<B> {
         let device = tokens.device();
         let mask = mask
@@ -478,7 +510,7 @@ impl<B: Backend> VJepaEncoder<B> {
         } else {
             tokens
         };
-        self.forward_sparse_tokens_with_plan(tokens, &plan)
+        self.forward_sparse_tokens_with_plan_capture_layers(tokens, &plan, capture_layers)
             .expect("encoder plan matches generated token shape")
     }
 
@@ -501,8 +533,17 @@ impl<B: Backend> VJepaEncoder<B> {
 
     pub fn forward_sparse_tokens_with_plan(
         &self,
+        tokens: Tensor<B, 3>,
+        plan: &SparseEncoderPlan<B>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.forward_sparse_tokens_with_plan_capture_layers(tokens, plan, &self.hierarchical_layers)
+    }
+
+    pub fn forward_sparse_tokens_with_plan_capture_layers(
+        &self,
         mut tokens: Tensor<B, 3>,
         plan: &SparseEncoderPlan<B>,
+        capture_layers: &[usize],
     ) -> Result<VJepaEncoderOutput<B>> {
         let [batch, token_count, dim] = tokens.shape().dims::<3>();
         ensure!(
@@ -532,16 +573,18 @@ impl<B: Backend> VJepaEncoder<B> {
             tokens = tokens + embed;
         }
 
-        let mut hierarchical = Vec::with_capacity(self.norms_block.len());
+        let capture_layers = normalized_capture_layers(capture_layers, self.blocks.len());
+        let mut hierarchical = Vec::with_capacity(capture_layers.len());
         let mut x = tokens;
         for (layer_index, block) in self.blocks.iter().enumerate() {
             x = block.forward(x, Some(&plan.positions));
-            if let Some(norm_index) = self
-                .hierarchical_layers
-                .iter()
-                .position(|&index| index == layer_index)
-            {
-                hierarchical.push(self.norms_block[norm_index].forward(x.clone()));
+            if capture_layers.binary_search(&layer_index).is_ok() {
+                hierarchical.push(layer_norm_for_capture(
+                    &self.norms_block,
+                    &self.hierarchical_layers,
+                    layer_index,
+                    x.clone(),
+                ));
             }
         }
         let tokens = if let Some(norm) = self.norms_block.last() {
@@ -552,6 +595,7 @@ impl<B: Backend> VJepaEncoder<B> {
         Ok(VJepaEncoderOutput {
             tokens,
             hierarchical,
+            captured_layers: capture_layers,
             token_indices: plan.positions.indices.clone(),
             grid: plan.grid,
         })
@@ -590,16 +634,19 @@ impl<B: Backend> VJepaEncoder<B> {
             tokens = tokens + embed;
         }
 
-        let mut hierarchical = Vec::with_capacity(self.norms_block.len());
+        let capture_layers =
+            normalized_capture_layers(&self.hierarchical_layers, self.blocks.len());
+        let mut hierarchical = Vec::with_capacity(capture_layers.len());
         let mut x = tokens;
         for (layer_index, block) in self.blocks.iter().enumerate() {
             x = block.forward(x, Some(&plan.positions));
-            if let Some(norm_index) = self
-                .hierarchical_layers
-                .iter()
-                .position(|&index| index == layer_index)
-            {
-                hierarchical.push(self.norms_block[norm_index].forward(x.clone()));
+            if capture_layers.binary_search(&layer_index).is_ok() {
+                hierarchical.push(layer_norm_for_capture(
+                    &self.norms_block,
+                    &self.hierarchical_layers,
+                    layer_index,
+                    x.clone(),
+                ));
             }
         }
         let tokens = if let Some(norm) = self.norms_block.last() {
@@ -610,9 +657,34 @@ impl<B: Backend> VJepaEncoder<B> {
         Ok(VJepaEncoderOutput {
             tokens,
             hierarchical,
+            captured_layers: capture_layers,
             token_indices: plan.positions.indices.clone(),
             grid: plan.grid,
         })
+    }
+}
+
+fn normalized_capture_layers(layers: &[usize], depth: usize) -> Vec<usize> {
+    let mut layers = layers
+        .iter()
+        .copied()
+        .filter(|&layer| layer < depth)
+        .collect::<Vec<_>>();
+    layers.sort_unstable();
+    layers.dedup();
+    layers
+}
+
+fn layer_norm_for_capture<B: Backend>(
+    norms: &[LayerNorm<B>],
+    norm_layers: &[usize],
+    layer_index: usize,
+    x: Tensor<B, 3>,
+) -> Tensor<B, 3> {
+    if let Some(norm_index) = norm_layers.iter().position(|&index| index == layer_index) {
+        norms[norm_index].forward(x)
+    } else {
+        x
     }
 }
 

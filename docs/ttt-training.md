@@ -15,11 +15,15 @@ rollouts approximate the pretrained 3D/tubelet V-JEPA encoder.
 - Initialization: adapter output projection is zero-initialized, so inserting a
   layer starts as a no-op residual path. The temporal target projection starts as
   an identity-style depthwise 1D filter plus optional identity linear projection.
-- Target mode: `ttt.target = "teacher_final"` trains fast weights from detached
-  final teacher tubelet features, while `ttt.target = "self_hidden"` updates
-  from the current hidden states. `teacher_final` is a cross-depth distillation
-  target when adapters are placed before the final block; reports label it as
-  `cross_depth_final_teacher_to_all_ttt_layers`.
+- Memory update source: `ttt.memory_update = "self_hidden"` is the deployable
+  default and updates fast weights from detached current hidden states.
+  `ttt.memory_update = "teacher_forced_diagnostic"` is privileged and should be
+  used only when measuring the teacher-forced gap.
+- Supervision mode: `ttt.supervision = "final_teacher"` matches final 3D
+  teacher tubelet features, `ttt.supervision = "layer_local_teacher"` matches
+  same-depth teacher features at each configured TTT layer, and
+  `ttt.supervision = "hybrid"` runs layer-local training before a shorter final
+  teacher finetune controlled by `ttt.hybrid_final_steps`.
 
 This is intentionally a Burn-native adapter instead of a literal mutation of an
 existing dense matrix. In-Place TTT's LLM recipe updates fast weights in the MLP
@@ -30,8 +34,8 @@ memory modules.
 
 ## Code Organization
 
-- `src/ttt/config.rs`: adapter placement, rollout, target-mode,
-  backprop-mode, and freeze config.
+- `src/ttt/config.rs`: adapter placement, rollout, memory-update source,
+  supervision mode, backprop-mode, and freeze config.
 - `src/ttt/state.rs`: per-layer fast-weight state and detach behavior.
 - `src/ttt/layer.rs`: zero-init TTT adapter layer and fast-weight update.
 - `src/ttt/encoder.rs`: V-JEPA encoder wrapper and single-frame rollout path.
@@ -61,11 +65,10 @@ training imports.
 For each training sample:
 
 1. Load student and teacher video tensors in `[B, C, T, H, W]` layout.
-2. Run the teacher video through the 3D encoder and detach the final tubelet
-   tokens.
+2. Run the teacher video through the 3D encoder and detach final plus optional
+   same-depth layer tokens.
 3. Roll the student over single frames, updating TTT state frame by frame.
-4. Compare the collected student tubelet tokens to the teacher tubelet tokens
-   with feature MSE.
+4. Compare the student to the selected teacher objective with feature MSE.
 5. Backpropagate through the student rollout and update the configured trainable
    modules with AdamW.
 
@@ -84,18 +87,20 @@ and a tiny synthetic convergence step.
 ## Evaluation Semantics
 
 `eval_loss` and `eval_cosine` are deploy-style free-run metrics: the student
-rollout does not receive teacher tokens as adapter update targets. For
-`ttt.target = "teacher_final"`, reports also include
+rollout does not receive teacher tokens as adapter update targets. When
+`ttt.memory_update = "teacher_forced_diagnostic"`, reports also include
 `teacher_forced_eval_loss`, `teacher_forced_eval_cosine`, and the
 `teacher_forcing_*_gap` fields. Those teacher-forced fields are diagnostics for
 how much privileged teacher-target adaptation helps; they are not production
 student-inference metrics.
 
-Reports include `target_supervision` to make the adapter target explicit. In
-`teacher_final` mode the training target is final teacher tokens for every TTT
-insertion point, which is cross-depth matching for early adapters. In
-`self_hidden` mode the train and deploy update target is the detached current
-hidden state.
+Reports include `target_supervision` to make memory updates and supervision
+explicit. `memory_update` describes what updates fast weights, while
+`supervision` describes the loss objective. This avoids conflating
+teacher-forced diagnostics with deployable sparse student inference.
+The legacy `ttt.target` field still deserializes for old configs, but
+`print-config` omits its default value; new configs should use
+`ttt.memory_update` and `ttt.supervision`.
 
 The eval report also records per-layer `utilization` probes:
 `hidden_rms`, `memory_read_rms`, `adapter_delta_rms`,
@@ -251,9 +256,15 @@ batching = "fixed_width_masks"   # group equal-width per-sample masks
 `fixed_width_masks` supports different mask indices per sample when each row has
 the same context/target token count. The encoder and loss gather from batched
 `[batch, tokens]` index tensors, and the CUDA sparse-patchify bridge can consume
-fixed-width per-sample coordinate plans. Ragged per-sample masks remain the
-future fallback for variable token counts inside the same batch; until then,
-bucket data by token count or keep `batch_size = 1` for fully ragged masks.
+fixed-width per-sample coordinate plans.
+
+Ragged per-sample masks are accepted for TTT training/eval. Internally the
+rollout groups samples by per-tubelet token-count shape, runs exact-token
+transformer calls for each bucket, then pads only the returned tensors. Padding
+does not enter attention or fast-weight updates; the feature loss and cosine
+diagnostics use a valid-token mask so padded positions do not affect metrics.
+Ragged sparse patchify uses the same bucketed strategy on CUDA/WGPU, so
+masked-out pixels are still skipped, with one sparse patchify call per bucket.
 
 ## Block Rollout
 
@@ -267,12 +278,19 @@ without forcing the entire stream history into one autodiff graph.
 - `final_feature`: default full final-feature distillation objective.
 - `truncated_final`: same objective, but uses
   `ttt.backprop_truncate_blocks` for the rollout detach cadence.
-- `layer_local`: experimental early-exit objective that stops after the last
-  configured TTT layer. This intentionally shortens the frozen tail in the
-  backward graph and should be compared against `final_feature` for quality.
+- `layer_local`: early-exit execution used by
+  `ttt.supervision = "layer_local_teacher"` and the pre-finetune part of
+  `"hybrid"`. It stops after the last configured TTT layer for that phase and
+  compares same-depth teacher features instead of final teacher tokens.
 
-Set `training.cache_teacher_tokens = true` to cache detached teacher features
-inside a run. Reports include `teacher_cache_hits` and
+For multi-layer TTT across the encoder, prefer `ttt.supervision = "hybrid"`.
+The training loop uses layer-local early-exit steps first, then switches to
+full final-feature passthrough for the last `ttt.hybrid_final_steps`. Eval and
+model-file evaluation force full-encoder free-run rollout so layer-local
+training speedups do not hide deploy-time quality regressions.
+
+Set `training.cache_teacher_tokens = true` to cache detached final and
+layer-local teacher features inside a run. Reports include `teacher_cache_hits` and
 `teacher_cache_misses` in train/eval stage metrics.
 
 ## TTT Layer Placement

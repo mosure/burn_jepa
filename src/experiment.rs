@@ -1,8 +1,9 @@
 use crate::{
     BurnJepaTrainConfig, JepaDataset, JepaDatasetConfig, JepaDatasetKind, JepaManifestRow,
     JepaTensorBatch, JepaTrainBackend, SparseTokenMask, TokenGridShape, TttLayerPlacement,
-    TttTargetMode, VJepa2_1Model, VJepaConfig, VJepaLoadOptions, VJepaTttModel, apply_token_mask,
-    dataset_from_config, load_jepa_tensor_batch, train_ttt_distillation, video_token_grid,
+    TttMemoryUpdateSource, TttTargetMode, VJepa2_1Model, VJepaConfig, VJepaLoadOptions,
+    VJepaTttModel, apply_token_mask, dataset_from_config, load_jepa_tensor_batch,
+    train_ttt_distillation, video_token_grid,
 };
 use anyhow::{Context, Result, bail, ensure};
 use burn::module::Module;
@@ -785,6 +786,11 @@ fn train_ttt_trial<B: crate::TttSparsePatchifyTrainingBackend>(
     train_config.ttt.target = match trial.model_variant {
         ExperimentModelVariant::TttTeacherFinal => TttTargetMode::TeacherFinal,
         ExperimentModelVariant::TttSelfHidden => TttTargetMode::SelfHidden,
+        _ => unreachable!("non-TTT variant routed to train_ttt_trial"),
+    };
+    train_config.ttt.memory_update = match trial.model_variant {
+        ExperimentModelVariant::TttTeacherFinal => TttMemoryUpdateSource::TeacherForcedDiagnostic,
+        ExperimentModelVariant::TttSelfHidden => TttMemoryUpdateSource::SelfHidden,
         _ => unreachable!("non-TTT variant routed to train_ttt_trial"),
     };
     let output_dir = config.output_dir.join(trial_id(trial));

@@ -2,10 +2,11 @@ use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::{Tensor, TensorData};
 use burn_jepa::{
-    BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseTokenMask,
-    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttRolloutReportMode,
-    TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttTargetMode, VJepa2_1Model,
-    VJepaTttLayer, VJepaTttModel, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
+    BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseMaskBatch,
+    SparseTokenMask, TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState,
+    TttMemoryUpdateSource, TttRolloutReportMode, TttSparsePatchifyTrainingMode,
+    TttSparseRolloutMode, TttSupervisionMode, TttTargetMode, VJepa2_1Model, VJepaTttLayer,
+    VJepaTttModel, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
     train_ttt_distillation,
 };
 
@@ -25,8 +26,19 @@ fn ttt_default_layer_placement_is_first_last() {
 
 #[test]
 fn ttt_training_config_round_trips_through_public_training_namespace() {
+    let default_toml = burn_jepa::training::BurnJepaTrainConfig::default()
+        .to_toml_string()
+        .expect("serialize default config");
+    assert!(
+        !default_toml.contains("target ="),
+        "legacy ttt.target should stay out of default print-config output"
+    );
+
     let mut config = burn_jepa::training::BurnJepaTrainConfig::default();
     config.ttt.target = TttTargetMode::SelfHidden;
+    config.ttt.memory_update = TttMemoryUpdateSource::TeacherForcedDiagnostic;
+    config.ttt.supervision = TttSupervisionMode::Hybrid;
+    config.ttt.hybrid_final_steps = 2;
     config.ttt.backprop_mode = TttBackpropMode::LayerLocal;
     config.training.max_steps = 3;
     config.training.batch_size = 2;
@@ -35,6 +47,9 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     let toml = config.to_toml_string().expect("serialize config");
     assert!(toml.contains("[ttt]"));
     assert!(toml.contains("target = \"self_hidden\""));
+    assert!(toml.contains("memory_update = \"teacher_forced_diagnostic\""));
+    assert!(toml.contains("supervision = \"hybrid\""));
+    assert!(toml.contains("hybrid_final_steps = 2"));
     assert!(toml.contains("backprop_mode = \"layer_local\""));
     assert!(toml.contains("[loss]"));
 
@@ -46,6 +61,12 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     let _loss_config: burn_jepa::TttDistillationConfig = parsed.loss.clone();
 
     assert_eq!(parsed.ttt.target, TttTargetMode::SelfHidden);
+    assert_eq!(
+        parsed.ttt.memory_update,
+        TttMemoryUpdateSource::TeacherForcedDiagnostic
+    );
+    assert_eq!(parsed.ttt.supervision, TttSupervisionMode::Hybrid);
+    assert_eq!(parsed.ttt.hybrid_final_steps, 2);
     assert_eq!(parsed.ttt.backprop_mode, TttBackpropMode::LayerLocal);
     assert_eq!(parsed.training.max_steps, 3);
     assert_eq!(parsed.training.batch_size, 2);
@@ -306,6 +327,28 @@ fn manifest_precomputed_masks_reject_mixed_batch_masks() {
 }
 
 #[test]
+fn sparse_mask_batch_represents_ragged_rows_with_valid_mask() {
+    let device = Default::default();
+    let mask = SparseMaskBatch::<B>::from_rows(vec![vec![0, 2, 4], vec![1]], 6, &device)
+        .expect("ragged mask");
+
+    assert!(mask.is_ragged());
+    assert_eq!(mask.batch(), 2);
+    assert_eq!(mask.len(), 3);
+    assert_eq!(mask.valid_token_count(), 4);
+    assert_eq!(mask.rows(), vec![vec![0, 2, 4], vec![1]]);
+    assert_eq!(mask.padded_rows(), vec![vec![0, 2, 4], vec![1, 1, 1]]);
+
+    let valid = mask
+        .valid_token_mask(&device)
+        .expect("ragged valid mask")
+        .into_data()
+        .to_vec::<f32>()
+        .expect("valid mask values");
+    assert_eq!(valid, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
+}
+
+#[test]
 fn ttt_zero_initialized_adapter_preserves_video_encoder_output() {
     let device = Default::default();
     let layer = VJepaTttLayer::<B>::new(
@@ -437,8 +480,16 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
     assert!(report.eval_loss.is_some());
     assert!(report.eval_cosine.is_some());
     assert_eq!(report.target_supervision.mode, TttTargetMode::TeacherFinal);
-    assert!(report.teacher_forced_eval_loss.is_some_and(f64::is_finite));
-    assert!(report.teacher_forcing_loss_gap.is_some_and(f64::is_finite));
+    assert_eq!(
+        report.target_supervision.memory_update,
+        TttMemoryUpdateSource::SelfHidden
+    );
+    assert_eq!(
+        report.target_supervision.supervision,
+        TttSupervisionMode::FinalTeacher
+    );
+    assert!(report.teacher_forced_eval_loss.is_none());
+    assert!(report.teacher_forcing_loss_gap.is_none());
     let utilization = report
         .utilization
         .as_ref()
@@ -507,13 +558,93 @@ fn ttt_sparse_rollout_training_smoke_uses_target_mask() {
     assert!(!report.rollout.autodiff_sparse_patchify);
     assert!(report.final_loss.is_finite());
     assert!(report.eval_loss.is_some_and(f64::is_finite));
-    assert!(report.teacher_forced_eval_loss.is_some_and(f64::is_finite));
-    assert!(
-        report
-            .teacher_forcing_cosine_gap
-            .is_some_and(f64::is_finite)
-    );
+    assert!(report.teacher_forced_eval_loss.is_none());
+    assert!(report.teacher_forcing_cosine_gap.is_none());
     assert!(report.eval_full_loss.is_some_and(f64::is_finite));
+}
+
+#[test]
+fn ttt_teacher_forced_eval_is_explicitly_opt_in() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-teacher-forced-diagnostic");
+    config.ttt.memory_update = TttMemoryUpdateSource::TeacherForcedDiagnostic;
+    config.training.max_steps = 1;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 1;
+    config.dataset.synthetic_len = 1;
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("teacher-forced smoke");
+
+    assert_eq!(
+        report.target_supervision.memory_update,
+        TttMemoryUpdateSource::TeacherForcedDiagnostic
+    );
+    assert!(report.target_supervision.teacher_forced_eval);
+    assert!(report.teacher_forced_eval_loss.is_some_and(f64::is_finite));
+    assert!(report.teacher_forcing_loss_gap.is_some_and(f64::is_finite));
+}
+
+#[test]
+fn ttt_layer_local_supervision_trains_against_same_depth_teacher_features() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-layer-local");
+    config.ttt.layer_placement = TttLayerPlacement::First;
+    config.ttt.supervision = TttSupervisionMode::LayerLocalTeacher;
+    config.training.max_steps = 1;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 1;
+    config.dataset.synthetic_len = 1;
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("layer-local smoke");
+
+    assert_eq!(
+        report.target_supervision.supervision,
+        TttSupervisionMode::LayerLocalTeacher
+    );
+    assert_eq!(
+        report.target_supervision.layer_alignment,
+        "same_depth_layer_teacher_loss"
+    );
+    assert!(report.final_loss.is_finite());
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
+    assert!(report.teacher_forced_eval_loss.is_none());
+}
+
+#[test]
+fn ttt_hybrid_supervision_runs_layer_local_then_final_teacher_steps() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-hybrid");
+    config.ttt.layer_placement = TttLayerPlacement::First;
+    config.ttt.supervision = TttSupervisionMode::Hybrid;
+    config.ttt.hybrid_final_steps = 1;
+    config.training.max_steps = 2;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 1;
+    config.dataset.synthetic_len = 1;
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("hybrid smoke");
+
+    assert_eq!(
+        report.target_supervision.supervision,
+        TttSupervisionMode::Hybrid
+    );
+    assert_eq!(
+        report.target_supervision.layer_alignment,
+        "layer_local_pretrain_then_final_teacher_finetune"
+    );
+    assert_eq!(report.target_supervision.hybrid_final_steps, 1);
+    assert_eq!(report.loss_trace.len(), 2);
+    assert!(report.final_loss.is_finite());
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
 }
 
 #[test]
@@ -586,6 +717,88 @@ fn ttt_manifest_fixed_width_masks_train_with_batch_size_two() {
     assert_eq!(report.samples, 2);
     assert_eq!(report.rollout.mode, TttRolloutReportMode::SparseContext);
     assert_eq!(report.rollout.student_tokens, 4);
+    assert!(report.final_loss.is_finite());
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
+}
+
+#[test]
+fn ttt_manifest_ragged_masks_train_with_batch_size_two() {
+    let device = Default::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let frame_dir = temp.path().join("frames");
+    std::fs::create_dir_all(&frame_dir).expect("frame dir");
+    let mut frame_paths = Vec::new();
+    for frame in 0..4 {
+        let path = frame_dir.join(format!("frame-{frame}.png"));
+        let image = image::RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([
+                ((x + y + frame * 7) % 255) as u8,
+                ((x * 3 + frame) % 255) as u8,
+                ((y * 5 + frame * 11) % 255) as u8,
+            ])
+        });
+        image.save(&path).expect("save frame");
+        frame_paths.push(path);
+    }
+    let manifest = temp.path().join("manifest-ragged.jsonl");
+    let frame_paths = frame_paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let rows = [
+        serde_json::json!({
+            "clip_id": "a",
+            "frames": frame_paths.clone(),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+        serde_json::json!({
+            "clip_id": "b",
+            "frames": frame_paths.clone(),
+            "precomputed_context_indices": [2, 6, 7],
+            "precomputed_target_indices": [0]
+        }),
+    ];
+    std::fs::write(
+        &manifest,
+        rows.iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write manifest");
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    config.model.output_dir = temp.path().join("ttt-ragged-batch");
+    config.dataset.kind = burn_jepa::JepaDatasetKind::Manifest;
+    config.dataset.sample_kind = burn_jepa::JepaSampleKind::Video;
+    config.dataset.train_manifest = Some(manifest.clone());
+    config.dataset.eval_manifest = Some(manifest);
+    config.dataset.synthetic_len = 2;
+    config.training.max_steps = 1;
+    config.training.batch_size = 2;
+    config.training.eval_steps = 1;
+    config.training.eval_batch_size = Some(2);
+    config.training.sparse_rollout = TttSparseRolloutMode::ContextMask;
+    config.training.mask = Some(burn_jepa::TrainingMaskConfig::ManifestPrecomputedMasks);
+
+    let report =
+        train_ttt_distillation::<AB>(&config, &device).expect("ragged manifest TTT training smoke");
+
+    assert_eq!(report.steps, 1);
+    assert_eq!(report.samples, 2);
+    assert_eq!(report.rollout.mode, TttRolloutReportMode::SparseContext);
+    assert_eq!(report.rollout.student_tokens, 4);
+    let mask = report.mask.expect("ragged mask metrics");
+    assert_eq!(mask.context_min_tokens, 3);
+    assert_eq!(mask.context_max_tokens, 4);
+    assert_eq!(mask.target_min_tokens, 1);
+    assert_eq!(mask.target_max_tokens, 2);
+    assert!((mask.context_mean_tokens - 3.5).abs() < f32::EPSILON);
+    assert!((mask.target_mean_tokens - 1.5).abs() < f32::EPSILON);
+    assert!((mask.context_density - 0.4375).abs() < f32::EPSILON);
+    assert!((mask.target_density - 0.1875).abs() < f32::EPSILON);
     assert!(report.final_loss.is_finite());
     assert!(report.eval_loss.is_some_and(f64::is_finite));
 }

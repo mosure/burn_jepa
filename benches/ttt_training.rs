@@ -289,6 +289,7 @@ fn bench_ttt_sparsity_training_step_matrix<B>(
     group.finish();
 }
 
+#[allow(dead_code)]
 fn bench_ttt_sparse_patchify_sparsity_training_step_matrix<B>(
     c: &mut Criterion,
     backend_name: &str,

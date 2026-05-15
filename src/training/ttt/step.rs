@@ -7,6 +7,25 @@ use crate::training::config::{BurnJepaTrainConfig, TttSparsePatchifyTrainingMode
 use crate::training::mask::TrainingMaskConfig;
 use crate::{TttStateResetMode, VJepaTttLayerProbeRecord};
 
+#[derive(Debug)]
+pub(crate) struct TeacherTokenTargets<B: Backend> {
+    pub final_tokens: Tensor<B, 3>,
+    pub layer_tokens: Vec<(usize, Tensor<B, 3>)>,
+}
+
+impl<B: Backend> Clone for TeacherTokenTargets<B> {
+    fn clone(&self) -> Self {
+        Self {
+            final_tokens: self.final_tokens.clone(),
+            layer_tokens: self
+                .layer_tokens
+                .iter()
+                .map(|(layer, tokens)| (*layer, tokens.clone()))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedTttMasks<B: Backend> {
     pub context: SparseMaskBatch<B>,
@@ -160,11 +179,28 @@ pub(super) fn patchify_kind<B: TttSparsePatchifyTrainingBackend>(
     }
 }
 
-pub(super) fn teacher_tokens<B: Backend>(
+pub(super) fn teacher_targets<B: Backend>(
     teacher: &VJepa2_1Model<B>,
     video: Tensor<B, 5>,
-) -> Tensor<B, 3> {
-    teacher.encode_video(video, None).tokens.detach()
+    capture_layers: &[usize],
+) -> TeacherTokenTargets<B> {
+    let output = if capture_layers.is_empty() {
+        teacher.encode_video(video, None)
+    } else {
+        teacher
+            .encoder
+            .forward_video_capture_layers(video, None, capture_layers)
+    };
+    let layer_tokens = output
+        .captured_layers
+        .into_iter()
+        .zip(output.hierarchical)
+        .map(|(layer, tokens)| (layer, tokens.detach()))
+        .collect();
+    TeacherTokenTargets {
+        final_tokens: output.tokens.detach(),
+        layer_tokens,
+    }
 }
 
 pub(super) fn student_rollout<B: Backend>(

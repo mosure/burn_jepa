@@ -130,6 +130,12 @@ pub enum SparseMaskBatch<B: Backend> {
         dense_len: usize,
         indices: Tensor<B, 2, Int>,
     },
+    Ragged {
+        rows: Vec<Vec<usize>>,
+        dense_len: usize,
+        indices: Tensor<B, 2, Int>,
+        lengths: Vec<usize>,
+    },
 }
 
 impl<B: Backend> SparseMaskBatch<B> {
@@ -194,13 +200,56 @@ impl<B: Backend> SparseMaskBatch<B> {
                 device,
             );
         }
-        Self::fixed_width(rows, dense_len, device)
+        let same_width = rows.iter().all(|row| row.len() == rows[0].len());
+        if same_width {
+            return Self::fixed_width(rows, dense_len, device);
+        }
+        Self::ragged(rows, dense_len, device)
+    }
+
+    pub fn ragged(rows: Vec<Vec<usize>>, dense_len: usize, device: &B::Device) -> Result<Self> {
+        ensure!(dense_len > 0, "dense token count must be nonzero");
+        ensure!(
+            !rows.is_empty(),
+            "ragged sparse mask batch must be non-empty"
+        );
+        let mut normalized = Vec::with_capacity(rows.len());
+        let mut lengths = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            row.sort_unstable();
+            row.dedup();
+            ensure!(!row.is_empty(), "ragged sparse mask rows must be non-empty");
+            ensure!(
+                row.iter().all(|&index| index < dense_len),
+                "sparse token index outside dense token range"
+            );
+            lengths.push(row.len());
+            normalized.push(row);
+        }
+        let max_width = lengths.iter().copied().max().unwrap_or(0);
+        ensure!(max_width > 0, "ragged sparse mask rows must be non-empty");
+        let padded = padded_rows_from_normalized(&normalized, max_width);
+        let values = padded
+            .iter()
+            .flat_map(|row| row.iter().map(|&index| index as i64))
+            .collect::<Vec<_>>();
+        let indices = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(values, [normalized.len(), max_width]),
+            device,
+        );
+        Ok(Self::Ragged {
+            rows: normalized,
+            dense_len,
+            indices,
+            lengths,
+        })
     }
 
     pub fn batch(&self) -> usize {
         match self {
             Self::Uniform { batch, .. } => *batch,
             Self::FixedWidth { rows, .. } => rows.len(),
+            Self::Ragged { rows, .. } => rows.len(),
         }
     }
 
@@ -208,6 +257,7 @@ impl<B: Backend> SparseMaskBatch<B> {
         match self {
             Self::Uniform { mask, .. } => mask.dense_len(),
             Self::FixedWidth { dense_len, .. } => *dense_len,
+            Self::Ragged { dense_len, .. } => *dense_len,
         }
     }
 
@@ -215,6 +265,7 @@ impl<B: Backend> SparseMaskBatch<B> {
         match self {
             Self::Uniform { mask, .. } => mask.len(),
             Self::FixedWidth { rows, .. } => rows[0].len(),
+            Self::Ragged { lengths, .. } => lengths.iter().copied().max().unwrap_or(0),
         }
     }
 
@@ -226,16 +277,30 @@ impl<B: Backend> SparseMaskBatch<B> {
         matches!(self, Self::Uniform { .. })
     }
 
+    pub fn is_ragged(&self) -> bool {
+        matches!(self, Self::Ragged { .. })
+    }
+
+    pub fn valid_token_count(&self) -> usize {
+        match self {
+            Self::Uniform { mask, batch, .. } => mask.len() * *batch,
+            Self::FixedWidth { rows, .. } => rows.iter().map(Vec::len).sum(),
+            Self::Ragged { lengths, .. } => lengths.iter().sum(),
+        }
+    }
+
     pub fn uniform_mask(&self) -> Option<&SparseTokenMask> {
         match self {
             Self::Uniform { mask, .. } => Some(mask),
-            Self::FixedWidth { .. } => None,
+            Self::FixedWidth { .. } | Self::Ragged { .. } => None,
         }
     }
 
     pub fn indices(&self) -> Tensor<B, 2, Int> {
         match self {
-            Self::Uniform { indices, .. } | Self::FixedWidth { indices, .. } => indices.clone(),
+            Self::Uniform { indices, .. }
+            | Self::FixedWidth { indices, .. }
+            | Self::Ragged { indices, .. } => indices.clone(),
         }
     }
 
@@ -245,6 +310,38 @@ impl<B: Backend> SparseMaskBatch<B> {
                 .map(|_| mask.indices().to_vec())
                 .collect::<Vec<_>>(),
             Self::FixedWidth { rows, .. } => rows.clone(),
+            Self::Ragged { rows, .. } => rows.clone(),
+        }
+    }
+
+    pub fn padded_rows(&self) -> Vec<Vec<usize>> {
+        match self {
+            Self::Uniform { mask, batch, .. } => (0..*batch)
+                .map(|_| mask.indices().to_vec())
+                .collect::<Vec<_>>(),
+            Self::FixedWidth { rows, .. } => rows.clone(),
+            Self::Ragged { rows, lengths, .. } => {
+                padded_rows_from_normalized(rows, lengths.iter().copied().max().unwrap_or(0))
+            }
+        }
+    }
+
+    pub fn valid_token_mask(&self, device: &B::Device) -> Option<Tensor<B, 2>> {
+        match self {
+            Self::Ragged { lengths, .. } => {
+                let width = lengths.iter().copied().max().unwrap_or(0);
+                let values = lengths
+                    .iter()
+                    .flat_map(|&length| {
+                        (0..width).map(move |index| if index < length { 1.0 } else { 0.0 })
+                    })
+                    .collect::<Vec<_>>();
+                Some(Tensor::<B, 2>::from_data(
+                    TensorData::new(values, [lengths.len(), width]),
+                    device,
+                ))
+            }
+            _ => None,
         }
     }
 
@@ -253,9 +350,24 @@ impl<B: Backend> SparseMaskBatch<B> {
             Self::Uniform { mask, .. } => Ok(mask.clone()),
             Self::FixedWidth {
                 rows, dense_len, ..
+            }
+            | Self::Ragged {
+                rows, dense_len, ..
             } => SparseTokenMask::new(rows[0].clone(), *dense_len),
         }
     }
+}
+
+fn padded_rows_from_normalized(rows: &[Vec<usize>], width: usize) -> Vec<Vec<usize>> {
+    rows.iter()
+        .map(|row| {
+            let mut padded = row.clone();
+            if let Some(&pad) = padded.last() {
+                padded.resize(width, pad);
+            }
+            padded
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]

@@ -181,6 +181,10 @@ impl<B: Backend> SparsePatchifyBatchPlan<B> {
     pub fn new(mask: SparseMaskBatch<B>, grid: TokenGridShape, device: &B::Device) -> Result<Self> {
         ensure!(mask.batch() > 0, "sparse patchify batch must be nonzero");
         ensure!(
+            !mask.is_ragged(),
+            "sparse patchify batch plans require uniform or fixed-width masks; use ragged rollout grouping"
+        );
+        ensure!(
             mask.dense_len() == grid.len(),
             "sparse patchify batch mask dense token count must match grid"
         );

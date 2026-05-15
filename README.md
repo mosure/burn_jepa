@@ -174,8 +174,14 @@ are frozen by default (`ttt.freeze_pretrained = true`), so optimizer updates
 target the added TTT modules unless the config explicitly opts into full
 finetuning. The TTT state is chunked by `ttt.chunk_tokens`, updated in sequence,
 and detached every `ttt.rollout_blocks` tubelets for block-rollout training.
-`ttt.target = "teacher_final"` uses detached teacher tubelet features for the
-fast-weight target; `ttt.target = "self_hidden"` uses current hidden states.
+`ttt.memory_update = "self_hidden"` is the deployable default: adapter fast
+weights update from detached current hidden states. Set
+`ttt.memory_update = "teacher_forced_diagnostic"` only for privileged
+teacher-forced diagnostics. `ttt.supervision` controls the loss objective:
+`"final_teacher"` matches final 3D teacher tokens, `"layer_local_teacher"`
+matches same-depth teacher features at each TTT insertion point, and `"hybrid"`
+runs layer-local training until the last `ttt.hybrid_final_steps`, then
+finetunes against the final teacher.
 Training/eval reports keep deployable student inference separate from
 teacher-forced diagnostics: `eval_loss`/`eval_cosine` are free-run metrics,
 while `teacher_forced_eval_*` and `teacher_forcing_*_gap` quantify privileged
@@ -188,6 +194,8 @@ Those deeper probes are opt-in via `training.eval_utilization_diagnostics` and
 production sparse rollout cost unless the probes are explicitly requested.
 Set `loss.predictor_loss_weight > 0` to train the normal sparse JEPA predictor
 objective alongside feature distillation.
+The legacy `ttt.target` field is still accepted for older config files, but new
+configs should use `ttt.memory_update` and `ttt.supervision`.
 The default TTT placement is `ttt.layer_placement = "first_last"`, which
 resolves to the first and final encoder blocks. Local real-checkpoint CUDA
 ablation selected it as the best short-run speed/quality default; use
@@ -211,11 +219,15 @@ For GPU-resident sparse training, prefer `autogaze_sparse` or
 host-scored heuristic. Manifest-precomputed masks are per window; set
 `training.batching = "group_uniform_masks"` for identical masks or
 `training.batching = "fixed_width_masks"` for equal-width per-sample masks.
-CUDA sparse patchify supports fixed-width per-sample coordinate plans, while
-ragged variable-width masks should still be bucketed or run at `batch_size = 1`.
-Use `ttt.backprop_mode = "truncated_final"` or `"layer_local"` to benchmark
-reduced-backward TTT objectives, and `training.cache_teacher_tokens = true` for
-repeat-window teacher feature caching.
+Variable-width ragged masks are accepted in TTT training/eval. The rollout
+groups samples by per-tubelet token-count shape, runs exact-token
+encoder/sparse-patchify calls per bucket, and pads only the returned tensors so
+loss/reporting can ignore invalid positions with a valid-token mask.
+Use `ttt.supervision = "hybrid"` to train TTT across early encoder layers
+without paying full frozen-tail backward cost on every step. The training loop
+uses a layer-local early-exit phase for those steps and restores full-encoder
+free-run eval afterward. `training.cache_teacher_tokens = true` caches detached
+final and layer-local teacher features for repeat windows.
 
 Datasets can be synthetic smoke data or JSONL manifests. Video rows accept
 either explicit frame paths or a frame directory:

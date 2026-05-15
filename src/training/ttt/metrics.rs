@@ -1,6 +1,9 @@
 use super::step::{TttPatchifyKind, TttRolloutKind};
 use crate::training::config::BurnJepaTrainConfig;
-use crate::{SparseTokenMask, TttTargetMode, VJepaConfig, VJepaTttLayerProbeRecord, VJepaTttModel};
+use crate::{
+    SparseMaskBatch, TttMemoryUpdateSource, TttSupervisionMode, VJepaConfig,
+    VJepaTttLayerProbeRecord, VJepaTttModel,
+};
 use anyhow::Result;
 use burn::optim::GradientsParams;
 use burn::tensor::Tensor;
@@ -11,18 +14,47 @@ use crate::training::report::{
     TttRolloutReportMode, TttTargetSupervisionMetrics, TttUtilizationMetrics, tensor_scalar,
 };
 
-pub(super) fn mask_metrics_from_masks(
-    context: &SparseTokenMask,
-    target: &SparseTokenMask,
+pub(super) fn mask_metrics_from_batches<B: Backend>(
+    context: &SparseMaskBatch<B>,
+    target: &SparseMaskBatch<B>,
 ) -> TttMaskMetrics {
+    let context_rows = context.rows();
+    let target_rows = target.rows();
+    let context_lengths = context_rows.iter().map(Vec::len).collect::<Vec<_>>();
+    let target_lengths = target_rows.iter().map(Vec::len).collect::<Vec<_>>();
+    let context_stats = token_length_stats(&context_lengths);
+    let target_stats = token_length_stats(&target_lengths);
     let dense_tokens = context.dense_len().max(1);
     TttMaskMetrics {
-        context_tokens: context.len(),
-        target_tokens: target.len(),
+        context_tokens: context_stats.max,
+        target_tokens: target_stats.max,
+        context_min_tokens: context_stats.min,
+        context_max_tokens: context_stats.max,
+        context_mean_tokens: context_stats.mean,
+        target_min_tokens: target_stats.min,
+        target_max_tokens: target_stats.max,
+        target_mean_tokens: target_stats.mean,
         dense_tokens,
-        context_density: context.len() as f32 / dense_tokens as f32,
-        target_density: target.len() as f32 / dense_tokens as f32,
+        context_density: context_stats.mean / dense_tokens as f32,
+        target_density: target_stats.mean / dense_tokens as f32,
     }
+}
+
+struct TokenLengthStats {
+    min: usize,
+    max: usize,
+    mean: f32,
+}
+
+fn token_length_stats(lengths: &[usize]) -> TokenLengthStats {
+    let min = lengths.iter().copied().min().unwrap_or(0);
+    let max = lengths.iter().copied().max().unwrap_or(0);
+    let mean = if lengths.is_empty() {
+        0.0
+    } else {
+        lengths.iter().sum::<usize>() as f32 / lengths.len() as f32
+    };
+    TokenLengthStats { min, max, mean }
 }
 
 pub(super) fn ttt_memory_metrics(
@@ -97,21 +129,25 @@ pub(super) fn rollout_metrics(
 pub(super) fn target_supervision_metrics(
     config: &BurnJepaTrainConfig,
 ) -> TttTargetSupervisionMetrics {
-    match config.ttt.target {
-        TttTargetMode::TeacherFinal => TttTargetSupervisionMetrics {
-            mode: TttTargetMode::TeacherFinal,
-            train_adapter_target: "teacher_final_encoder_tokens",
-            deploy_adapter_target: "self_hidden_detached",
-            layer_alignment: "cross_depth_final_teacher_to_all_ttt_layers",
-            teacher_forced_eval: true,
-        },
-        TttTargetMode::SelfHidden => TttTargetSupervisionMetrics {
-            mode: TttTargetMode::SelfHidden,
-            train_adapter_target: "self_hidden_detached",
-            deploy_adapter_target: "self_hidden_detached",
-            layer_alignment: "layer_local_self_hidden",
-            teacher_forced_eval: false,
-        },
+    let train_adapter_target = match config.ttt.memory_update {
+        TttMemoryUpdateSource::SelfHidden => "self_hidden_detached",
+        TttMemoryUpdateSource::TeacherForcedDiagnostic => "teacher_final_encoder_tokens",
+    };
+    let layer_alignment = match config.ttt.supervision {
+        TttSupervisionMode::FinalTeacher => "final_teacher_loss",
+        TttSupervisionMode::LayerLocalTeacher => "same_depth_layer_teacher_loss",
+        TttSupervisionMode::Hybrid => "layer_local_pretrain_then_final_teacher_finetune",
+    };
+    TttTargetSupervisionMetrics {
+        mode: config.ttt.target,
+        memory_update: config.ttt.memory_update,
+        supervision: config.ttt.supervision,
+        hybrid_final_steps: config.ttt.hybrid_final_steps,
+        train_adapter_target,
+        deploy_adapter_target: "self_hidden_detached",
+        layer_alignment,
+        teacher_forced_eval: config.ttt.memory_update
+            == TttMemoryUpdateSource::TeacherForcedDiagnostic,
     }
 }
 

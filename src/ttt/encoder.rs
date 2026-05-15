@@ -1,6 +1,6 @@
-use super::config::{TttBackpropMode, TttEncoderConfig, TttTargetMode};
+use super::config::{TttBackpropMode, TttEncoderConfig, TttMemoryUpdateSource, TttTargetMode};
 use super::layer::{VJepaTttLayer, VJepaTttLayerProbe};
-use super::state::TttState;
+use super::state::{TttLayerState, TttState};
 use crate::{
     SparseEncoderBatchPlan, SparseEncoderPlan, SparseMaskBatch, SparseTokenMask, TokenGridShape,
     VJepaConfig, VJepaEncoder, VJepaEncoderOutput, apply_mask_batch, apply_token_mask,
@@ -11,6 +11,7 @@ use anyhow::{Result, ensure};
 use burn::module::Module;
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct VJepaTttLayerProbeRecord<B: Backend> {
@@ -44,6 +45,8 @@ pub struct VJepaTttEncoder<B: Backend> {
     #[module(skip)]
     backprop_truncate_blocks: usize,
     #[module(skip)]
+    memory_update: TttMemoryUpdateSource,
+    #[module(skip)]
     target_mode: TttTargetMode,
 }
 
@@ -56,6 +59,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
     ) -> Result<Self> {
         ttt_config.validate(model_config)?;
         let layer_indices = ttt_config.resolved_layers(model_config);
+        let hierarchical_layers = ttt_config.capture_layers(model_config);
         let ttt_layers = layer_indices
             .iter()
             .map(|_| VJepaTttLayer::new(model_config.encoder.embed_dim, &ttt_config, device))
@@ -65,10 +69,11 @@ impl<B: Backend> VJepaTttEncoder<B> {
             ttt_layers,
             config: model_config.clone(),
             layer_indices,
-            hierarchical_layers: model_config.encoder.hierarchical_layers(),
+            hierarchical_layers,
             rollout_blocks: ttt_config.rollout_blocks,
             backprop_mode: ttt_config.backprop_mode,
             backprop_truncate_blocks: ttt_config.backprop_truncate_blocks,
+            memory_update: ttt_config.memory_update,
             target_mode: ttt_config.target,
         })
     }
@@ -94,8 +99,20 @@ impl<B: Backend> VJepaTttEncoder<B> {
         self.target_mode
     }
 
+    pub fn memory_update_source(&self) -> TttMemoryUpdateSource {
+        self.memory_update
+    }
+
+    pub fn set_backprop_mode(&mut self, mode: TttBackpropMode) {
+        self.backprop_mode = mode;
+    }
+
     pub fn ttt_layer_indices(&self) -> &[usize] {
         &self.layer_indices
+    }
+
+    pub fn captured_layers(&self) -> &[usize] {
+        &self.hierarchical_layers
     }
 
     pub fn forward_video(
@@ -311,6 +328,9 @@ impl<B: Backend> VJepaTttEncoder<B> {
         let frame_grid = TokenGridShape::new(1, grid.height, grid.width);
         let frame_tokens = frame_grid.len();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             if reset_mode == TttStateResetMode::EachFrame
@@ -351,6 +371,12 @@ impl<B: Backend> VJepaTttEncoder<B> {
                 probes.as_mut().map(|records| &mut **records),
             )?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -362,6 +388,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
             "single-frame rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let device = tokens.device();
         let mask = mask
             .cloned()
@@ -369,7 +396,8 @@ impl<B: Backend> VJepaTttEncoder<B> {
         let plan = SparseEncoderPlan::new(&self.config, mask, grid, batch, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -385,6 +413,17 @@ impl<B: Backend> VJepaTttEncoder<B> {
         reset_mode: TttStateResetMode,
         mut probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
     ) -> Result<VJepaEncoderOutput<B>> {
+        if mask.is_ragged() {
+            return self.forward_single_frame_rollout_ragged_batch_impl(
+                video,
+                mask,
+                target_tokens,
+                state,
+                update_fast_weight,
+                reset_mode,
+                probes,
+            );
+        }
         let [batch, channels, frames, height, width] = video.shape().dims::<5>();
         let tubelet = self.config.tubelet_size.max(1);
         ensure!(
@@ -404,10 +443,24 @@ impl<B: Backend> VJepaTttEncoder<B> {
             mask.dense_len() == grid.len() && !mask.is_empty(),
             "single-frame sparse rollout batch mask must match a non-empty video token grid"
         );
+        if row_rollout_groups(&mask.rows(), grid).len() > 1 {
+            return self.forward_single_frame_rollout_ragged_batch_impl(
+                video,
+                mask,
+                target_tokens,
+                state,
+                update_fast_weight,
+                reset_mode,
+                probes,
+            );
+        }
         let frame_grid = TokenGridShape::new(1, grid.height, grid.width);
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             if reset_mode == TttStateResetMode::EachFrame
@@ -451,6 +504,12 @@ impl<B: Backend> VJepaTttEncoder<B> {
                 probes.as_mut().map(|records| &mut **records),
             )?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -462,10 +521,128 @@ impl<B: Backend> VJepaTttEncoder<B> {
             "single-frame sparse rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderBatchPlan::new(&self.config, mask.clone(), grid, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
+            token_indices: plan.positions.indices,
+            grid,
+        })
+    }
+
+    fn forward_single_frame_rollout_ragged_batch_impl(
+        &self,
+        video: Tensor<B, 5>,
+        mask: &SparseMaskBatch<B>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        update_fast_weight: bool,
+        reset_mode: TttStateResetMode,
+        mut probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        let [batch, _channels, frames, height, width] = video.shape().dims::<5>();
+        ensure!(
+            batch == mask.batch(),
+            "ragged sparse rollout batch mask must match video batch"
+        );
+        let tubelet = self.config.tubelet_size.max(1);
+        ensure!(
+            frames % tubelet == 0,
+            "ragged sparse rollout requires frames divisible by tubelet_size"
+        );
+        let grid = TokenGridShape::new(
+            frames / tubelet,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            mask.dense_len() == grid.len() && !mask.is_empty(),
+            "ragged sparse rollout batch mask must match a non-empty video token grid"
+        );
+        let rows = mask.rows();
+        let max_tokens = mask.len();
+        let mut outputs = (0..batch).map(|_| None).collect::<Vec<_>>();
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| (0..batch).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut state_outputs = state
+            .layers
+            .iter()
+            .map(|_| (0..batch).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for group in row_rollout_groups(&rows, grid) {
+            let group_video = select_batch_rows5(video.clone(), &group);
+            let group_target = target_tokens
+                .as_ref()
+                .map(|target| select_batch_rows3(target.clone(), &group));
+            let group_rows = group
+                .iter()
+                .map(|&sample| rows[sample].clone())
+                .collect::<Vec<_>>();
+            let group_mask =
+                SparseMaskBatch::from_rows(group_rows, mask.dense_len(), &video.device())?;
+            let mut group_state = select_ttt_state_rows(state, &group);
+            let encoded = self.forward_single_frame_rollout_batch_impl(
+                group_video,
+                &group_mask,
+                group_target,
+                &mut group_state,
+                update_fast_weight,
+                reset_mode,
+                probes.as_mut().map(|records| &mut **records),
+            )?;
+            for (group_offset, &sample_index) in group.iter().enumerate() {
+                outputs[sample_index] = Some(pad_token_sequence(
+                    encoded
+                        .tokens
+                        .clone()
+                        .slice_dim(0, group_offset..group_offset + 1),
+                    max_tokens,
+                ));
+            }
+            for (layer_outputs, tokens) in hierarchical_outputs
+                .iter_mut()
+                .zip(encoded.hierarchical.into_iter())
+            {
+                for (group_offset, &sample_index) in group.iter().enumerate() {
+                    layer_outputs[sample_index] = Some(pad_token_sequence(
+                        tokens.clone().slice_dim(0, group_offset..group_offset + 1),
+                        max_tokens,
+                    ));
+                }
+            }
+            store_ttt_state_rows(&mut state_outputs, &group_state, &group);
+        }
+        let tokens = Tensor::cat(
+            outputs
+                .into_iter()
+                .map(|tokens| tokens.expect("ragged rollout filled every sample"))
+                .collect(),
+            0,
+        );
+        let hierarchical = hierarchical_outputs
+            .into_iter()
+            .filter_map(|tokens| {
+                tokens.iter().any(Option::is_some).then(|| {
+                    Tensor::cat(
+                        tokens
+                            .into_iter()
+                            .map(|tokens| tokens.expect("ragged rollout filled every layer sample"))
+                            .collect(),
+                        0,
+                    )
+                })
+            })
+            .collect();
+        *state = rebuild_ttt_state_from_rows(state_outputs);
+        let plan =
+            SparseEncoderBatchPlan::new(&self.config, mask.clone(), grid, true, &tokens.device())?;
+        Ok(VJepaEncoderOutput {
+            tokens,
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -600,10 +777,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
         for (layer_index, block) in self.base.blocks.iter().enumerate() {
             x = block.forward(x, Some(&plan.positions));
             if let Ok(ttt_index) = self.layer_indices.binary_search(&layer_index) {
-                let layer_target = match self.target_mode {
-                    TttTargetMode::TeacherFinal => target_tokens.clone(),
-                    TttTargetMode::SelfHidden => None,
-                };
+                let layer_target = ttt_layer_target(self.memory_update, target_tokens.as_ref());
                 x = if let Some(records) = probes.as_mut() {
                     let (next, probe) = self.ttt_layers[ttt_index].forward_with_probe(
                         x,
@@ -625,16 +799,20 @@ impl<B: Backend> VJepaTttEncoder<B> {
                         update_fast_weight,
                     )
                 };
-                if self.should_early_exit_after_layer(layer_index) {
-                    break;
-                }
             }
             if let Some(norm_index) = self
-                .hierarchical_layers
+                .config
+                .encoder
+                .hierarchical_layers()
                 .iter()
                 .position(|&index| index == layer_index)
             {
                 hierarchical.push(self.base.norms_block[norm_index].forward(x.clone()));
+            } else if self.hierarchical_layers.binary_search(&layer_index).is_ok() {
+                hierarchical.push(x.clone());
+            }
+            if self.should_early_exit_after_layer(layer_index) {
+                break;
             }
         }
         let tokens = if let Some(norm) = self.base.norms_block.last() {
@@ -645,6 +823,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
         Ok(VJepaEncoderOutput {
             tokens,
             hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices.clone(),
             grid: plan.grid,
         })
@@ -720,10 +899,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
         for (layer_index, block) in self.base.blocks.iter().enumerate() {
             x = block.forward(x, Some(&plan.positions));
             if let Ok(ttt_index) = self.layer_indices.binary_search(&layer_index) {
-                let layer_target = match self.target_mode {
-                    TttTargetMode::TeacherFinal => target_tokens.clone(),
-                    TttTargetMode::SelfHidden => None,
-                };
+                let layer_target = ttt_layer_target(self.memory_update, target_tokens.as_ref());
                 x = if let Some(records) = probes.as_mut() {
                     let (next, probe) = self.ttt_layers[ttt_index].forward_with_probe(
                         x,
@@ -745,16 +921,20 @@ impl<B: Backend> VJepaTttEncoder<B> {
                         update_fast_weight,
                     )
                 };
-                if self.should_early_exit_after_layer(layer_index) {
-                    break;
-                }
             }
             if let Some(norm_index) = self
-                .hierarchical_layers
+                .config
+                .encoder
+                .hierarchical_layers()
                 .iter()
                 .position(|&index| index == layer_index)
             {
                 hierarchical.push(self.base.norms_block[norm_index].forward(x.clone()));
+            } else if self.hierarchical_layers.binary_search(&layer_index).is_ok() {
+                hierarchical.push(x.clone());
+            }
+            if self.should_early_exit_after_layer(layer_index) {
+                break;
             }
         }
         let tokens = if let Some(norm) = self.base.norms_block.last() {
@@ -765,10 +945,119 @@ impl<B: Backend> VJepaTttEncoder<B> {
         Ok(VJepaEncoderOutput {
             tokens,
             hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices.clone(),
             grid: plan.grid,
         })
     }
+}
+
+fn ttt_layer_target<B: Backend>(
+    source: TttMemoryUpdateSource,
+    target_tokens: Option<&Tensor<B, 3>>,
+) -> Option<Tensor<B, 3>> {
+    match source {
+        TttMemoryUpdateSource::SelfHidden => None,
+        TttMemoryUpdateSource::TeacherForcedDiagnostic => target_tokens.cloned(),
+    }
+}
+
+fn cat_hierarchical_outputs<B: Backend>(outputs: Vec<Vec<Tensor<B, 3>>>) -> Vec<Tensor<B, 3>> {
+    outputs
+        .into_iter()
+        .filter_map(|tokens| (!tokens.is_empty()).then(|| Tensor::cat(tokens, 1)))
+        .collect()
+}
+
+fn pad_token_sequence<B: Backend>(tokens: Tensor<B, 3>, target_len: usize) -> Tensor<B, 3> {
+    let [batch, len, dim] = tokens.shape().dims::<3>();
+    if len >= target_len {
+        return tokens;
+    }
+    let padding = Tensor::<B, 3>::zeros([batch, target_len - len, dim], &tokens.device());
+    Tensor::cat(vec![tokens, padding], 1)
+}
+
+fn row_rollout_groups(rows: &[Vec<usize>], grid: TokenGridShape) -> Vec<Vec<usize>> {
+    let frame_tokens = grid.tokens_per_frame();
+    let mut groups = BTreeMap::<Vec<usize>, Vec<usize>>::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut token_counts = vec![0; grid.depth];
+        for &index in row {
+            let tubelet = (index / frame_tokens).min(grid.depth.saturating_sub(1));
+            token_counts[tubelet] += 1;
+        }
+        groups.entry(token_counts).or_default().push(row_index);
+    }
+    groups.into_values().collect()
+}
+
+fn select_ttt_state_rows<B: Backend>(state: &TttState<B>, rows: &[usize]) -> TttState<B> {
+    TttState {
+        layers: state
+            .layers
+            .iter()
+            .map(|layer| TttLayerState {
+                fast_weight: layer
+                    .fast_weight
+                    .as_ref()
+                    .map(|weight| select_batch_rows3(weight.clone(), rows)),
+            })
+            .collect(),
+    }
+}
+
+fn store_ttt_state_rows<B: Backend>(
+    outputs: &mut [Vec<Option<Tensor<B, 3>>>],
+    state: &TttState<B>,
+    rows: &[usize],
+) {
+    for (layer_outputs, layer_state) in outputs.iter_mut().zip(state.layers.iter()) {
+        if let Some(weight) = layer_state.fast_weight.as_ref() {
+            for (group_offset, &sample_index) in rows.iter().enumerate() {
+                layer_outputs[sample_index] =
+                    Some(weight.clone().slice_dim(0, group_offset..group_offset + 1));
+            }
+        }
+    }
+}
+
+fn rebuild_ttt_state_from_rows<B: Backend>(outputs: Vec<Vec<Option<Tensor<B, 3>>>>) -> TttState<B> {
+    TttState {
+        layers: outputs
+            .into_iter()
+            .map(|layer_outputs| {
+                let fast_weight = layer_outputs.iter().any(Option::is_some).then(|| {
+                    Tensor::cat(
+                        layer_outputs
+                            .into_iter()
+                            .map(|weight| weight.expect("ragged rollout filled every state row"))
+                            .collect(),
+                        0,
+                    )
+                });
+                TttLayerState { fast_weight }
+            })
+            .collect(),
+    }
+}
+
+fn select_batch_rows5<B: Backend>(tensor: Tensor<B, 5>, rows: &[usize]) -> Tensor<B, 5> {
+    Tensor::cat(
+        rows.iter()
+            .map(|&row| tensor.clone().slice_dim(0, row..row + 1))
+            .collect(),
+        0,
+    )
+}
+
+fn select_batch_rows3<B: Backend>(tensor: Tensor<B, 3>, rows: &[usize]) -> Tensor<B, 3> {
+    Tensor::cat(
+        rows.iter()
+            .map(|&row| tensor.clone().slice_dim(0, row..row + 1))
+            .collect(),
+        0,
+    )
 }
 
 fn sparse_rollout_frame_mask(
@@ -815,7 +1104,7 @@ fn sparse_rollout_frame_mask_batch<B: Backend>(
     }
     ensure!(
         rows.iter().all(|row| !row.is_empty()),
-        "fixed-width sparse rollout does not yet support batches where only some samples have frame tokens"
+        "internal fixed-width sparse rollout received incompatible per-frame token buckets; route through ragged rollout grouping"
     );
     Ok(Some(SparseMaskBatch::from_rows(
         rows,
@@ -957,6 +1246,9 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             let Some(frame_mask) = sparse_rollout_frame_mask(mask, grid, tubelet_index)? else {
@@ -993,6 +1285,12 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -1004,10 +1302,12 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             "single-frame sparse patchify rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderPlan::new(&self.config, mask.clone(), grid, batch, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -1100,6 +1400,9 @@ impl VJepaTttEncoder<burn_flex_gmm::cuda::DefaultCudaBackend> {
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             let Some(frame_mask) = sparse_rollout_frame_mask(mask, grid, tubelet_index)? else {
@@ -1136,6 +1439,12 @@ impl VJepaTttEncoder<burn_flex_gmm::cuda::DefaultCudaBackend> {
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -1147,10 +1456,12 @@ impl VJepaTttEncoder<burn_flex_gmm::cuda::DefaultCudaBackend> {
             "single-frame sparse patchify rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderPlan::new(&self.config, mask.clone(), grid, batch, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -1188,6 +1499,9 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             let Some(frame_mask) = sparse_rollout_frame_mask(mask, grid, tubelet_index)? else {
@@ -1224,6 +1538,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -1235,10 +1555,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
             "single-frame sparse patchify rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderPlan::new(&self.config, mask.clone(), grid, batch, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -1321,6 +1643,14 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
                 state,
             );
         }
+        if mask.is_ragged() {
+            return self.forward_single_frame_rollout_sparse_patchify_wgpu_frozen_ragged_batch(
+                video,
+                mask,
+                target_tokens,
+                state,
+            );
+        }
         let [batch, channels, frames, height, width] = video.shape().dims::<5>();
         let tubelet = self.config.tubelet_size.max(1);
         ensure!(
@@ -1340,10 +1670,21 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
             mask.dense_len() == grid.len() && !mask.is_empty(),
             "single-frame sparse rollout batch mask must match a non-empty video token grid"
         );
+        if row_rollout_groups(&mask.rows(), grid).len() > 1 {
+            return self.forward_single_frame_rollout_sparse_patchify_wgpu_frozen_ragged_batch(
+                video,
+                mask,
+                target_tokens,
+                state,
+            );
+        }
         let frame_grid = TokenGridShape::new(1, grid.height, grid.width);
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             let Some(frame_mask) =
@@ -1378,6 +1719,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
                 state,
             )?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -1389,10 +1736,123 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
             "single-frame sparse patchify rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderBatchPlan::new(&self.config, mask.clone(), grid, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
+            token_indices: plan.positions.indices,
+            grid,
+        })
+    }
+
+    fn forward_single_frame_rollout_sparse_patchify_wgpu_frozen_ragged_batch(
+        &self,
+        video: Tensor<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend>, 5>,
+        mask: &SparseMaskBatch<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend>>,
+        target_tokens: Option<
+            Tensor<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend>, 3>,
+        >,
+        state: &mut TttState<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend>>,
+    ) -> Result<VJepaEncoderOutput<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend>>>
+    {
+        let [batch, _channels, frames, height, width] = video.shape().dims::<5>();
+        let tubelet = self.config.tubelet_size.max(1);
+        ensure!(
+            frames % tubelet == 0,
+            "ragged WGPU sparse patchify rollout requires frames divisible by tubelet_size"
+        );
+        let grid = TokenGridShape::new(
+            frames / tubelet,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            batch == mask.batch() && mask.dense_len() == grid.len() && !mask.is_empty(),
+            "ragged WGPU sparse patchify rollout mask must match a non-empty video token grid"
+        );
+        let rows = mask.rows();
+        let max_tokens = mask.len();
+        let mut outputs = (0..batch).map(|_| None).collect::<Vec<_>>();
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| (0..batch).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut state_outputs = state
+            .layers
+            .iter()
+            .map(|_| (0..batch).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for group in row_rollout_groups(&rows, grid) {
+            let group_video = select_batch_rows5(video.clone(), &group);
+            let group_target = target_tokens
+                .as_ref()
+                .map(|target| select_batch_rows3(target.clone(), &group));
+            let group_rows = group
+                .iter()
+                .map(|&sample| rows[sample].clone())
+                .collect::<Vec<_>>();
+            let group_mask =
+                SparseMaskBatch::from_rows(group_rows, mask.dense_len(), &video.device())?;
+            let mut group_state = select_ttt_state_rows(state, &group);
+            let encoded = self.forward_single_frame_rollout_sparse_patchify_wgpu_frozen_batch(
+                group_video,
+                &group_mask,
+                group_target,
+                &mut group_state,
+            )?;
+            for (group_offset, &sample_index) in group.iter().enumerate() {
+                outputs[sample_index] = Some(pad_token_sequence(
+                    encoded
+                        .tokens
+                        .clone()
+                        .slice_dim(0, group_offset..group_offset + 1),
+                    max_tokens,
+                ));
+            }
+            for (layer_outputs, tokens) in hierarchical_outputs
+                .iter_mut()
+                .zip(encoded.hierarchical.into_iter())
+            {
+                for (group_offset, &sample_index) in group.iter().enumerate() {
+                    layer_outputs[sample_index] = Some(pad_token_sequence(
+                        tokens.clone().slice_dim(0, group_offset..group_offset + 1),
+                        max_tokens,
+                    ));
+                }
+            }
+            store_ttt_state_rows(&mut state_outputs, &group_state, &group);
+        }
+        let tokens = Tensor::cat(
+            outputs
+                .into_iter()
+                .map(|tokens| tokens.expect("ragged WGPU rollout filled every sample"))
+                .collect(),
+            0,
+        );
+        let hierarchical = hierarchical_outputs
+            .into_iter()
+            .filter_map(|tokens| {
+                tokens.iter().any(Option::is_some).then(|| {
+                    Tensor::cat(
+                        tokens
+                            .into_iter()
+                            .map(|tokens| {
+                                tokens.expect("ragged WGPU rollout filled every layer sample")
+                            })
+                            .collect(),
+                        0,
+                    )
+                })
+            })
+            .collect();
+        *state = rebuild_ttt_state_from_rows(state_outputs);
+        let plan =
+            SparseEncoderBatchPlan::new(&self.config, mask.clone(), grid, true, &tokens.device())?;
+        Ok(VJepaEncoderOutput {
+            tokens,
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -1491,6 +1951,9 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::cuda::DefaultCudaBac
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             let Some(frame_mask) = sparse_rollout_frame_mask(mask, grid, tubelet_index)? else {
@@ -1527,6 +1990,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::cuda::DefaultCudaBac
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -1538,10 +2007,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::cuda::DefaultCudaBac
             "single-frame sparse patchify rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderPlan::new(&self.config, mask.clone(), grid, batch, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -1635,6 +2106,9 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             let Some(frame_mask) = sparse_rollout_frame_mask(mask, grid, tubelet_index)? else {
@@ -1671,6 +2145,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -1682,10 +2162,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
             "single-frame sparse patchify rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderPlan::new(&self.config, mask.clone(), grid, batch, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })
@@ -1764,6 +2246,15 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
                 state,
             );
         }
+        if mask.is_ragged() {
+            return self
+                .forward_single_frame_rollout_sparse_patchify_cuda_fusion_frozen_ragged_batch(
+                    video,
+                    mask,
+                    target_tokens,
+                    state,
+                );
+        }
         let [batch, channels, frames, height, width] = video.shape().dims::<5>();
         let tubelet = self.config.tubelet_size.max(1);
         ensure!(
@@ -1783,10 +2274,22 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
             mask.dense_len() == grid.len() && !mask.is_empty(),
             "single-frame sparse rollout batch mask must match a non-empty video token grid"
         );
+        if row_rollout_groups(&mask.rows(), grid).len() > 1 {
+            return self
+                .forward_single_frame_rollout_sparse_patchify_cuda_fusion_frozen_ragged_batch(
+                    video,
+                    mask,
+                    target_tokens,
+                    state,
+                );
+        }
         let frame_grid = TokenGridShape::new(1, grid.height, grid.width);
         let frame_tokens = frame_grid.len();
         let device = video.device();
         let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
         for frame in 0..frames {
             let tubelet_index = frame / tubelet;
             let Some(frame_mask) =
@@ -1822,6 +2325,12 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
                 state,
             )?;
             if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
                 outputs.push(encoded.tokens);
                 if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
                     state.detach();
@@ -1833,10 +2342,121 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
             "single-frame sparse patchify rollout produced no output tokens"
         );
         let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
         let plan = SparseEncoderBatchPlan::new(&self.config, mask.clone(), grid, true, &device)?;
         Ok(VJepaEncoderOutput {
             tokens,
-            hierarchical: Vec::new(),
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
+            token_indices: plan.positions.indices,
+            grid,
+        })
+    }
+
+    fn forward_single_frame_rollout_sparse_patchify_cuda_fusion_frozen_ragged_batch(
+        &self,
+        video: Tensor<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>, 5>,
+        mask: &SparseMaskBatch<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>,
+        target_tokens: Option<Tensor<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>, 3>>,
+        state: &mut TttState<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>,
+    ) -> Result<VJepaEncoderOutput<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>> {
+        let [batch, _channels, frames, height, width] = video.shape().dims::<5>();
+        let tubelet = self.config.tubelet_size.max(1);
+        ensure!(
+            frames % tubelet == 0,
+            "ragged CUDA sparse patchify rollout requires frames divisible by tubelet_size"
+        );
+        let grid = TokenGridShape::new(
+            frames / tubelet,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            batch == mask.batch() && mask.dense_len() == grid.len() && !mask.is_empty(),
+            "ragged CUDA sparse patchify rollout mask must match a non-empty video token grid"
+        );
+        let rows = mask.rows();
+        let max_tokens = mask.len();
+        let mut outputs = (0..batch).map(|_| None).collect::<Vec<_>>();
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| (0..batch).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut state_outputs = state
+            .layers
+            .iter()
+            .map(|_| (0..batch).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for group in row_rollout_groups(&rows, grid) {
+            let group_video = select_batch_rows5(video.clone(), &group);
+            let group_target = target_tokens
+                .as_ref()
+                .map(|target| select_batch_rows3(target.clone(), &group));
+            let group_rows = group
+                .iter()
+                .map(|&sample| rows[sample].clone())
+                .collect::<Vec<_>>();
+            let group_mask =
+                SparseMaskBatch::from_rows(group_rows, mask.dense_len(), &video.device())?;
+            let mut group_state = select_ttt_state_rows(state, &group);
+            let encoded = self
+                .forward_single_frame_rollout_sparse_patchify_cuda_fusion_frozen_batch(
+                    group_video,
+                    &group_mask,
+                    group_target,
+                    &mut group_state,
+                )?;
+            for (group_offset, &sample_index) in group.iter().enumerate() {
+                outputs[sample_index] = Some(pad_token_sequence(
+                    encoded
+                        .tokens
+                        .clone()
+                        .slice_dim(0, group_offset..group_offset + 1),
+                    max_tokens,
+                ));
+            }
+            for (layer_outputs, tokens) in hierarchical_outputs
+                .iter_mut()
+                .zip(encoded.hierarchical.into_iter())
+            {
+                for (group_offset, &sample_index) in group.iter().enumerate() {
+                    layer_outputs[sample_index] = Some(pad_token_sequence(
+                        tokens.clone().slice_dim(0, group_offset..group_offset + 1),
+                        max_tokens,
+                    ));
+                }
+            }
+            store_ttt_state_rows(&mut state_outputs, &group_state, &group);
+        }
+        let tokens = Tensor::cat(
+            outputs
+                .into_iter()
+                .map(|tokens| tokens.expect("ragged CUDA rollout filled every sample"))
+                .collect(),
+            0,
+        );
+        let hierarchical = hierarchical_outputs
+            .into_iter()
+            .filter_map(|tokens| {
+                tokens.iter().any(Option::is_some).then(|| {
+                    Tensor::cat(
+                        tokens
+                            .into_iter()
+                            .map(|tokens| {
+                                tokens.expect("ragged CUDA rollout filled every layer sample")
+                            })
+                            .collect(),
+                        0,
+                    )
+                })
+            })
+            .collect();
+        *state = rebuild_ttt_state_from_rows(state_outputs);
+        let plan =
+            SparseEncoderBatchPlan::new(&self.config, mask.clone(), grid, true, &tokens.device())?;
+        Ok(VJepaEncoderOutput {
+            tokens,
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
             token_indices: plan.positions.indices,
             grid,
         })

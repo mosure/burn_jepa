@@ -50,6 +50,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         .init::<B, VJepaTttModel<B>>();
     let dataset = dataset_from_config(&config.dataset, true)?;
     let memory = metrics::ttt_memory_metrics(config, model.config());
+    model.set_backprop_mode(crate::TttBackpropMode::FinalFeature);
     let pre_train_eval = if config.training.eval_steps > 0 {
         Some(eval::evaluate_ttt_dataset(
             &model,
@@ -64,13 +65,23 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     let mut progress = LossProgress::new(config.training.max_steps);
     let mut mask_metrics = None;
     let mut train_stage = TttStageMetrics::default();
-    let mut teacher_cache = BTreeMap::<String, burn::tensor::Tensor<B, 3>>::new();
+    let mut teacher_cache = BTreeMap::<String, step::TeacherTokenTargets<B>>::new();
     let mut observed_dense_tokens = None;
     let mut final_grad_metrics = None;
     let rollout = step::rollout_kind(config);
     let patchify = step::patchify_kind::<B>(config, rollout)?;
+    let capture_layers = config.ttt.capture_layers(model.config());
 
     for step_index in 0..config.training.max_steps {
+        let supervision = config
+            .ttt
+            .train_supervision_for_step(step_index, config.training.max_steps);
+        model.set_backprop_mode(match supervision {
+            crate::TttSupervisionMode::LayerLocalTeacher => crate::TttBackpropMode::LayerLocal,
+            crate::TttSupervisionMode::FinalTeacher | crate::TttSupervisionMode::Hybrid => {
+                config.ttt.backprop_mode
+            }
+        });
         let batch = load_training_batch_with_policy::<B>(
             dataset.as_ref(),
             &config.dataset,
@@ -93,15 +104,17 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         if mask_metrics.is_none()
             && let Some(masks) = &masks
         {
-            let context = masks.context.first_mask()?;
-            let target = masks.target.first_mask()?;
-            mask_metrics = Some(metrics::mask_metrics_from_masks(&context, &target));
+            mask_metrics = Some(metrics::mask_metrics_from_batches(
+                &masks.context,
+                &masks.target,
+            ));
         }
         let teacher_tokens = teacher_tokens_for_batch(
             &teacher,
             batch.teacher.clone(),
             &batch.metadata,
             step_index,
+            &capture_layers,
             config.training.cache_teacher_tokens,
             &mut teacher_cache,
             &mut train_stage,
@@ -110,7 +123,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             step::student_training_rollout(
                 &model,
                 batch.student,
-                teacher_tokens.clone(),
+                teacher_tokens.final_tokens.clone(),
                 masks.as_ref(),
                 rollout,
                 patchify,
@@ -121,11 +134,12 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                 &model,
                 config,
                 &student,
-                teacher_tokens,
+                &teacher_tokens,
                 masks.as_ref(),
                 rollout,
                 batch_size,
                 device,
+                supervision,
             )
         })?;
         let step_number = step_index + 1;
@@ -172,6 +186,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
 
     let train_elapsed_ms = start.elapsed().as_millis();
     let eval_start = Instant::now();
+    model.set_backprop_mode(crate::TttBackpropMode::FinalFeature);
     let (
         eval_loss,
         eval_cosine,
@@ -318,13 +333,14 @@ pub fn evaluate_ttt_model_file<B: step::TttSparsePatchifyTrainingBackend>(
 
     let teacher = load_teacher_model::<B>(config, device)?;
     let base = load_student_model::<B>(config, device)?;
-    let model = VJepaTttModel::from_model(base, config.ttt.clone(), device)?
+    let mut model = VJepaTttModel::from_model(base, config.ttt.clone(), device)?
         .load_file(
             model_path.clone(),
             &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
             device,
         )
         .with_context(|| format!("load TTT model {}", model_path.display()))?;
+    model.set_backprop_mode(crate::TttBackpropMode::FinalFeature);
     let memory = metrics::ttt_memory_metrics_for_batch_size(
         config,
         model.config(),
@@ -355,12 +371,7 @@ pub fn evaluate_ttt_model_file<B: step::TttSparsePatchifyTrainingBackend>(
     )?;
     let mask_metrics = masks
         .as_ref()
-        .map(|masks| {
-            let context = masks.context.first_mask()?;
-            let target = masks.target.first_mask()?;
-            Ok::<_, anyhow::Error>(metrics::mask_metrics_from_masks(&context, &target))
-        })
-        .transpose()?;
+        .map(|masks| metrics::mask_metrics_from_batches(&masks.context, &masks.target));
 
     let eval = eval::evaluate_ttt_dataset(&model, &teacher, config, device, steps)?;
     let eval_samples = eval.samples;
@@ -417,29 +428,34 @@ pub(super) fn teacher_tokens_for_batch<B: step::TttSparsePatchifyTrainingBackend
     video: burn::tensor::Tensor<B, 5>,
     metadata: &[crate::JepaSampleMetadata],
     fallback_index: usize,
+    capture_layers: &[usize],
     enabled: bool,
-    cache: &mut BTreeMap<String, burn::tensor::Tensor<B, 3>>,
+    cache: &mut BTreeMap<String, step::TeacherTokenTargets<B>>,
     stage: &mut TttStageMetrics,
-) -> Result<burn::tensor::Tensor<B, 3>> {
+) -> Result<step::TeacherTokenTargets<B>> {
     if !enabled {
         return timed(&mut stage.teacher_forward_ms, || {
-            Ok(step::teacher_tokens(teacher, video))
+            Ok(step::teacher_targets(teacher, video, capture_layers))
         });
     }
-    let key = teacher_cache_key(metadata, fallback_index);
+    let key = teacher_cache_key(metadata, fallback_index, capture_layers);
     if let Some(tokens) = cache.get(&key) {
         stage.teacher_cache_hits += 1;
         return Ok(tokens.clone());
     }
     stage.teacher_cache_misses += 1;
     let tokens = timed(&mut stage.teacher_forward_ms, || {
-        Ok(step::teacher_tokens(teacher, video))
+        Ok(step::teacher_targets(teacher, video, capture_layers))
     })?;
     cache.insert(key, tokens.clone());
     Ok(tokens)
 }
 
-fn teacher_cache_key(metadata: &[crate::JepaSampleMetadata], fallback_index: usize) -> String {
+fn teacher_cache_key(
+    metadata: &[crate::JepaSampleMetadata],
+    fallback_index: usize,
+    capture_layers: &[usize],
+) -> String {
     let has_identity = metadata.iter().any(|row| {
         row.clip_id.is_some()
             || row.source.is_some()
@@ -448,9 +464,13 @@ fn teacher_cache_key(metadata: &[crate::JepaSampleMetadata], fallback_index: usi
             || row.precomputed_target_indices.is_some()
     });
     if has_identity {
-        serde_json::to_string(metadata).unwrap_or_else(|_| format!("fallback:{fallback_index}"))
+        format!(
+            "layers={capture_layers:?}:{}",
+            serde_json::to_string(metadata)
+                .unwrap_or_else(|_| format!("fallback:{fallback_index}"))
+        )
     } else {
-        format!("fallback:{fallback_index}")
+        format!("layers={capture_layers:?}:fallback:{fallback_index}")
     }
 }
 

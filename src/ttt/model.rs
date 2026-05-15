@@ -1,4 +1,4 @@
-use super::config::TttEncoderConfig;
+use super::config::{TttBackpropMode, TttEncoderConfig};
 use super::encoder::VJepaTttEncoder;
 use super::state::TttState;
 use crate::{
@@ -44,6 +44,10 @@ impl<B: Backend> VJepaTttModel<B> {
 
     pub fn fresh_state(&self) -> TttState<B> {
         self.encoder.fresh_state()
+    }
+
+    pub fn set_backprop_mode(&mut self, mode: TttBackpropMode) {
+        self.encoder.set_backprop_mode(mode);
     }
 
     pub fn encode_video(

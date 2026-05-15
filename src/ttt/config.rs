@@ -17,6 +17,23 @@ impl Default for TttTargetMode {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TttMemoryUpdateSource {
+    #[default]
+    SelfHidden,
+    TeacherForcedDiagnostic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TttSupervisionMode {
+    #[default]
+    FinalTeacher,
+    LayerLocalTeacher,
+    Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TttBackpropMode {
     #[default]
     FinalFeature,
@@ -46,11 +63,19 @@ pub struct TttEncoderConfig {
     pub ttt_lr: f32,
     pub use_projection: bool,
     pub conv_kernel: usize,
+    pub memory_update: TttMemoryUpdateSource,
+    pub supervision: TttSupervisionMode,
+    pub hybrid_final_steps: usize,
+    #[serde(default, skip_serializing_if = "is_default_target_mode")]
     pub target: TttTargetMode,
     pub rollout_blocks: usize,
     pub backprop_mode: TttBackpropMode,
     pub backprop_truncate_blocks: usize,
     pub freeze_pretrained: bool,
+}
+
+fn is_default_target_mode(mode: &TttTargetMode) -> bool {
+    *mode == TttTargetMode::default()
 }
 
 impl Default for TttEncoderConfig {
@@ -63,6 +88,9 @@ impl Default for TttEncoderConfig {
             ttt_lr: 0.05,
             use_projection: true,
             conv_kernel: 3,
+            memory_update: TttMemoryUpdateSource::SelfHidden,
+            supervision: TttSupervisionMode::FinalTeacher,
+            hybrid_final_steps: 1,
             target: TttTargetMode::TeacherFinal,
             rollout_blocks: 1,
             backprop_mode: TttBackpropMode::FinalFeature,
@@ -80,6 +108,10 @@ impl TttEncoderConfig {
         ensure!(
             self.backprop_truncate_blocks > 0,
             "ttt.backprop_truncate_blocks must be nonzero"
+        );
+        ensure!(
+            self.hybrid_final_steps > 0 || self.supervision != TttSupervisionMode::Hybrid,
+            "ttt.hybrid_final_steps must be nonzero when ttt.supervision=hybrid"
         );
         for layer in self.resolved_layers(config) {
             ensure!(
@@ -106,6 +138,40 @@ impl TttEncoderConfig {
         layers.sort_unstable();
         layers.dedup();
         layers
+    }
+
+    pub fn capture_layers(&self, config: &VJepaConfig) -> Vec<usize> {
+        let mut layers = config.encoder.hierarchical_layers();
+        if self.supervision.requires_layer_targets() {
+            layers.extend(self.resolved_layers(config));
+        }
+        layers.sort_unstable();
+        layers.dedup();
+        layers
+    }
+
+    pub fn train_supervision_for_step(
+        &self,
+        step_index: usize,
+        max_steps: usize,
+    ) -> TttSupervisionMode {
+        match self.supervision {
+            TttSupervisionMode::Hybrid => {
+                let final_steps = self.hybrid_final_steps.min(max_steps.max(1));
+                if step_index + final_steps >= max_steps {
+                    TttSupervisionMode::FinalTeacher
+                } else {
+                    TttSupervisionMode::LayerLocalTeacher
+                }
+            }
+            mode => mode,
+        }
+    }
+}
+
+impl TttSupervisionMode {
+    pub fn requires_layer_targets(self) -> bool {
+        matches!(self, Self::LayerLocalTeacher | Self::Hybrid)
     }
 }
 
