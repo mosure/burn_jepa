@@ -23,6 +23,10 @@ pub enum TrainingMaskConfig {
         #[serde(default)]
         seed: u64,
     },
+    TemporalUniformSparse {
+        context_tokens: usize,
+        target_tokens: usize,
+    },
     AutogazeSparse {
         image_grid: TrainingImageTokenGrid,
         context_tokens: usize,
@@ -99,14 +103,18 @@ impl TrainingMaskConfig {
                 context_tokens,
                 target_tokens,
                 ..
+            }
+            | Self::TemporalUniformSparse {
+                context_tokens,
+                target_tokens,
             } => {
                 ensure!(
                     *context_tokens > 0,
-                    "training.mask.random_sparse context_tokens must be nonzero"
+                    "training.mask sparse context_tokens must be nonzero"
                 );
                 ensure!(
                     *target_tokens > 0,
-                    "training.mask.random_sparse target_tokens must be nonzero"
+                    "training.mask sparse target_tokens must be nonzero"
                 );
             }
             Self::AutogazeSparse {
@@ -219,6 +227,17 @@ impl TrainingMaskConfig {
             } => {
                 let (context_mask, target_mask) =
                     random_sparse_masks(grid, *context_tokens, *target_tokens, *seed)?;
+                SparseJepaSparsityDriverConfig::PrecomputedMasks {
+                    context_mask,
+                    target_mask,
+                }
+            }
+            Self::TemporalUniformSparse {
+                context_tokens,
+                target_tokens,
+            } => {
+                let (context_mask, target_mask) =
+                    temporal_uniform_sparse_masks(grid, *context_tokens, *target_tokens)?;
                 SparseJepaSparsityDriverConfig::PrecomputedMasks {
                     context_mask,
                     target_mask,
@@ -453,6 +472,83 @@ fn random_sparse_masks(
         SparseTokenMask::new(context, grid.len())?,
         SparseTokenMask::new(target, grid.len())?,
     ))
+}
+
+fn temporal_uniform_sparse_masks(
+    grid: TokenGridShape,
+    context_tokens: usize,
+    target_tokens: usize,
+) -> Result<(SparseTokenMask, SparseTokenMask)> {
+    ensure!(
+        grid.len() > 1,
+        "temporal uniform sparse mask requires at least two dense tokens"
+    );
+    let context_tokens = context_tokens.max(1).min(grid.len() - 1);
+    let unblocked = vec![false; grid.len()];
+    let context = temporal_uniform_indices(grid, context_tokens, &unblocked);
+    let mut blocked = vec![false; grid.len()];
+    for &index in &context {
+        blocked[index] = true;
+    }
+    let target_tokens = target_tokens
+        .max(1)
+        .min(grid.len().saturating_sub(context.len()).max(1));
+    let target = temporal_uniform_indices(grid, target_tokens, &blocked);
+    Ok((
+        SparseTokenMask::new(context, grid.len())?,
+        SparseTokenMask::new(target, grid.len())?,
+    ))
+}
+
+fn temporal_uniform_indices(grid: TokenGridShape, budget: usize, blocked: &[bool]) -> Vec<usize> {
+    let budget = budget.max(1).min(grid.len());
+    let tubelets = grid.depth.max(1);
+    let frame_tokens = grid.tokens_per_frame().max(1);
+    let mut selected = vec![false; grid.len()];
+    let mut indices = Vec::with_capacity(budget);
+    for tubelet in 0..tubelets {
+        let available = (0..frame_tokens)
+            .map(|spatial| tubelet * frame_tokens + spatial)
+            .filter(|&index| index < grid.len() && !blocked.get(index).copied().unwrap_or(true))
+            .collect::<Vec<_>>();
+        if available.is_empty() {
+            continue;
+        }
+        let quota = budget / tubelets + usize::from(tubelet < budget % tubelets);
+        let quota = quota.min(available.len());
+        for index in evenly_spaced_from_available(&available, quota) {
+            if !selected[index] {
+                selected[index] = true;
+                indices.push(index);
+            }
+        }
+    }
+    if indices.len() < budget {
+        let available = (0..grid.len())
+            .filter(|&index| !blocked[index] && !selected[index])
+            .collect::<Vec<_>>();
+        for index in evenly_spaced_from_available(&available, budget - indices.len()) {
+            if !selected[index] {
+                selected[index] = true;
+                indices.push(index);
+            }
+        }
+    }
+    indices
+}
+
+fn evenly_spaced_from_available(available: &[usize], keep: usize) -> Vec<usize> {
+    let keep = keep.min(available.len());
+    if keep == 0 {
+        return Vec::new();
+    }
+    if keep == available.len() {
+        return available.to_vec();
+    }
+    let last = available.len().saturating_sub(1);
+    (0..keep)
+        .map(|i| available[((i * last) + (keep / 2)) / keep.max(1)])
+        .collect()
 }
 
 fn splitmix64(mut value: u64) -> u64 {

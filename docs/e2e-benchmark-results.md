@@ -129,6 +129,13 @@ diagnosis but are not faster than direct rolling generation.
 
 ## Interpretation
 
+Terminology note: `webgpu` and `wgpu` are separate Burn feature/backend
+surfaces, but they are the same WebGPU/wgpu backend family for paper-level
+analysis. In this document, `WebGPU` usually means Burn's default
+`burn::backend::WebGpu` lane, while `sparse-patchify-wgpu` means the native WGPU
+`burn_flex_gmm` sparse-patchify kernel lane. Do not treat those rows as
+independent hardware configurations.
+
 The sparse V-JEPA temporal stream is similar between ndarray and WebGPU for the
 small sparse-token counts tested here. The benchmark uses
 `AutogazeSparseJepaWindowConfig`, which treats AutoGaze top-k as a per-frame

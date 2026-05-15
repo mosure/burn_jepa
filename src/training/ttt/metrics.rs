@@ -70,17 +70,27 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
     batch_size: usize,
 ) -> TttMemoryMetrics {
     let layers = config.ttt.resolved_layers(model);
+    let predictor_layers = config.ttt.resolved_predictor_layers(model);
     let embed_dim = model.encoder.embed_dim.max(1);
+    let predictor_embed_dim = model.predictor.embed_dim.max(1);
     let layer_count = layers.len();
+    let predictor_layer_count = predictor_layers.len();
     let batch_size = batch_size.max(1);
-    let fast_weight_elements = layer_count * batch_size * embed_dim * embed_dim;
-    let per_layer_params = embed_dim * embed_dim
+    let fast_weight_elements = layer_count * batch_size * embed_dim * embed_dim
+        + predictor_layer_count * batch_size * predictor_embed_dim * predictor_embed_dim;
+    let per_encoder_layer_params = embed_dim * embed_dim
         + embed_dim * config.ttt.conv_kernel.max(1)
         + usize::from(config.ttt.use_projection) * embed_dim * embed_dim;
-    let trainable_param_elements = per_layer_params * layer_count;
+    let per_predictor_layer_params = predictor_embed_dim * predictor_embed_dim
+        + predictor_embed_dim * config.ttt.conv_kernel.max(1)
+        + usize::from(config.ttt.use_projection) * predictor_embed_dim * predictor_embed_dim;
+    let trainable_param_elements =
+        per_encoder_layer_params * layer_count + per_predictor_layer_params * predictor_layer_count;
     TttMemoryMetrics {
         layers,
+        predictor_layers,
         embed_dim,
+        predictor_embed_dim,
         batch_size,
         chunk_tokens: config.ttt.chunk_tokens.max(1),
         ttt_lr: config.ttt.ttt_lr,

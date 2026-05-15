@@ -1,4 +1,7 @@
-use crate::{JepaSampleMetadata, SparseMaskBatch, SparseTokenMask, VJepa2_1Model, VJepaTttModel};
+use crate::{
+    JepaSampleMetadata, SparseMaskBatch, SparseTokenMask, VJepa2_1Model, VJepaTttModel,
+    apply_mask_batch,
+};
 use anyhow::{Result, bail, ensure};
 use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -203,17 +206,144 @@ pub(super) fn teacher_targets<B: Backend>(
     }
 }
 
-pub(super) fn student_rollout<B: Backend>(
+pub(super) fn teacher_predictor_targets<B: Backend>(
+    teacher: &VJepa2_1Model<B>,
+    teacher_tokens: &TeacherTokenTargets<B>,
+    masks: Option<&ResolvedTttMasks<B>>,
+    grid: crate::TokenGridShape,
+    predictor_loss_weight: f32,
+) -> Result<Option<Tensor<B, 3>>> {
+    if predictor_loss_weight <= 0.0 {
+        return Ok(None);
+    }
+    let Some(masks) = masks else {
+        return Ok(None);
+    };
+    let context_mask = masks.context.uniform_mask().ok_or_else(|| {
+        anyhow::anyhow!("predictor loss currently requires a uniform context mask")
+    })?;
+    let target_mask = masks.target.uniform_mask().ok_or_else(|| {
+        anyhow::anyhow!("predictor loss currently requires a uniform target mask")
+    })?;
+    let direct_target = apply_mask_batch(teacher_tokens.final_tokens.clone(), &masks.target);
+    let predictor_output_dim = teacher
+        .config()
+        .predictor
+        .output_dim
+        .unwrap_or(teacher.config().encoder.embed_dim);
+    if predictor_output_dim == teacher.config().encoder.embed_dim {
+        return Ok(Some(direct_target));
+    }
+    let context_tokens = apply_mask_batch(teacher_tokens.final_tokens.clone(), &masks.context);
+    let prediction = teacher
+        .predictor
+        .forward_sparse(context_tokens, context_mask, target_mask, grid, 0)?
+        .target_predictions
+        .detach();
+    Ok(Some(prediction))
+}
+
+pub(super) fn student_training_rollout<B: TttSparsePatchifyTrainingBackend>(
+    model: &VJepaTttModel<B>,
+    video: Tensor<B, 5>,
+    teacher_tokens: Tensor<B, 3>,
+    masks: Option<&ResolvedTttMasks<B>>,
+    rollout: TttRolloutKind,
+    patchify: TttPatchifyKind,
+) -> Result<crate::VJepaEncoderOutput<B>> {
+    student_rollout_with_patchify(model, video, Some(teacher_tokens), masks, rollout, patchify)
+}
+
+pub(super) fn student_training_rollout_with_state<B: TttSparsePatchifyTrainingBackend>(
+    model: &VJepaTttModel<B>,
+    video: Tensor<B, 5>,
+    teacher_tokens: Tensor<B, 3>,
+    masks: Option<&ResolvedTttMasks<B>>,
+    rollout: TttRolloutKind,
+    patchify: TttPatchifyKind,
+    state: &mut crate::TttState<B>,
+) -> Result<crate::VJepaEncoderOutput<B>> {
+    student_rollout_with_patchify_and_state(
+        model,
+        video,
+        Some(teacher_tokens),
+        masks,
+        rollout,
+        patchify,
+        state,
+    )
+}
+
+pub(super) fn student_free_run_rollout_with_state<B: TttSparsePatchifyTrainingBackend>(
+    model: &VJepaTttModel<B>,
+    video: Tensor<B, 5>,
+    masks: Option<&ResolvedTttMasks<B>>,
+    rollout: TttRolloutKind,
+    patchify: TttPatchifyKind,
+    state: &mut crate::TttState<B>,
+) -> Result<crate::VJepaEncoderOutput<B>> {
+    student_rollout_with_patchify_and_state(model, video, None, masks, rollout, patchify, state)
+}
+
+fn student_rollout_with_patchify<B: TttSparsePatchifyTrainingBackend>(
     model: &VJepaTttModel<B>,
     video: Tensor<B, 5>,
     adapter_target_tokens: Option<Tensor<B, 3>>,
     masks: Option<&ResolvedTttMasks<B>>,
     rollout: TttRolloutKind,
+    patchify: TttPatchifyKind,
 ) -> Result<crate::VJepaEncoderOutput<B>> {
     let mut state = model.fresh_state();
+    student_rollout_with_patchify_and_state(
+        model,
+        video,
+        adapter_target_tokens,
+        masks,
+        rollout,
+        patchify,
+        &mut state,
+    )
+}
+
+fn student_rollout_with_patchify_and_state<B: TttSparsePatchifyTrainingBackend>(
+    model: &VJepaTttModel<B>,
+    video: Tensor<B, 5>,
+    adapter_target_tokens: Option<Tensor<B, 3>>,
+    masks: Option<&ResolvedTttMasks<B>>,
+    rollout: TttRolloutKind,
+    patchify: TttPatchifyKind,
+    state: &mut crate::TttState<B>,
+) -> Result<crate::VJepaEncoderOutput<B>> {
+    if rollout.sparse_mask_kind().is_some() && patchify == TttPatchifyKind::FrozenSparsePatchify {
+        let Some(masks) = masks else {
+            bail!("frozen sparse patchify rollout requires resolved masks")
+        };
+        let mask = rollout.select_mask(masks);
+        ensure!(
+            !mask.is_empty(),
+            "frozen sparse patchify rollout requires a non-empty target mask"
+        );
+        if let Some(mask) = mask.uniform_mask() {
+            return B::student_frozen_sparse_patchify_rollout(
+                model,
+                video,
+                mask,
+                adapter_target_tokens,
+                state,
+            );
+        } else if B::frozen_sparse_patchify_batch_supported() {
+            return B::student_frozen_sparse_patchify_rollout_batch(
+                model,
+                video,
+                mask,
+                adapter_target_tokens,
+                state,
+            );
+        }
+    }
     match rollout {
         TttRolloutKind::Dense => {
-            model.forward_single_frame_rollout(video, adapter_target_tokens, &mut state)
+            model.forward_single_frame_rollout(video, adapter_target_tokens, state)
         }
         TttRolloutKind::SparseContext | TttRolloutKind::SparseTarget => {
             let Some(masks) = masks else {
@@ -228,61 +358,10 @@ pub(super) fn student_rollout<B: Backend>(
                 video,
                 mask,
                 adapter_target_tokens,
-                &mut state,
+                state,
             )
         }
     }
-}
-
-pub(super) fn student_training_rollout<B: TttSparsePatchifyTrainingBackend>(
-    model: &VJepaTttModel<B>,
-    video: Tensor<B, 5>,
-    teacher_tokens: Tensor<B, 3>,
-    masks: Option<&ResolvedTttMasks<B>>,
-    rollout: TttRolloutKind,
-    patchify: TttPatchifyKind,
-) -> Result<crate::VJepaEncoderOutput<B>> {
-    student_rollout_with_patchify(model, video, Some(teacher_tokens), masks, rollout, patchify)
-}
-
-fn student_rollout_with_patchify<B: TttSparsePatchifyTrainingBackend>(
-    model: &VJepaTttModel<B>,
-    video: Tensor<B, 5>,
-    adapter_target_tokens: Option<Tensor<B, 3>>,
-    masks: Option<&ResolvedTttMasks<B>>,
-    rollout: TttRolloutKind,
-    patchify: TttPatchifyKind,
-) -> Result<crate::VJepaEncoderOutput<B>> {
-    if rollout.sparse_mask_kind().is_some() && patchify == TttPatchifyKind::FrozenSparsePatchify {
-        let Some(masks) = masks else {
-            bail!("frozen sparse patchify rollout requires resolved masks")
-        };
-        let mask = rollout.select_mask(masks);
-        ensure!(
-            !mask.is_empty(),
-            "frozen sparse patchify rollout requires a non-empty target mask"
-        );
-        if let Some(mask) = mask.uniform_mask() {
-            let mut state = model.fresh_state();
-            return B::student_frozen_sparse_patchify_rollout(
-                model,
-                video,
-                mask,
-                adapter_target_tokens,
-                &mut state,
-            );
-        } else if B::frozen_sparse_patchify_batch_supported() {
-            let mut state = model.fresh_state();
-            return B::student_frozen_sparse_patchify_rollout_batch(
-                model,
-                video,
-                mask,
-                adapter_target_tokens,
-                &mut state,
-            );
-        }
-    }
-    student_rollout(model, video, adapter_target_tokens, masks, rollout)
 }
 
 pub(super) fn student_eval_rollout<B: TttSparsePatchifyTrainingBackend>(
@@ -297,6 +376,44 @@ pub(super) fn student_eval_rollout<B: TttSparsePatchifyTrainingBackend>(
 ) -> Result<StudentEvalRollout<B>> {
     let free_run =
         student_rollout_with_patchify(model, video.clone(), None, masks, rollout, patchify)?;
+    let teacher_forced = teacher_forced_eval
+        .then(|| {
+            student_rollout_with_patchify(
+                model,
+                video.clone(),
+                Some(teacher_tokens.clone()),
+                masks,
+                rollout,
+                patchify,
+            )
+        })
+        .transpose()?;
+    let full_free_run = (eval_full_grid && rollout.sparse_mask_kind().is_some())
+        .then(|| {
+            let mut full_state = model.fresh_state();
+            model.forward_single_frame_rollout(video, None, &mut full_state)
+        })
+        .transpose()?;
+    Ok(StudentEvalRollout {
+        free_run,
+        teacher_forced,
+        full_free_run,
+    })
+}
+
+pub(super) fn student_eval_rollout_with_state<B: TttSparsePatchifyTrainingBackend>(
+    model: &VJepaTttModel<B>,
+    video: Tensor<B, 5>,
+    teacher_tokens: Tensor<B, 3>,
+    masks: Option<&ResolvedTttMasks<B>>,
+    rollout: TttRolloutKind,
+    patchify: TttPatchifyKind,
+    eval_full_grid: bool,
+    teacher_forced_eval: bool,
+    state: &mut crate::TttState<B>,
+) -> Result<StudentEvalRollout<B>> {
+    let free_run =
+        student_free_run_rollout_with_state(model, video.clone(), masks, rollout, patchify, state)?;
     let teacher_forced = teacher_forced_eval
         .then(|| {
             student_rollout_with_patchify(
@@ -437,6 +554,12 @@ pub trait TttSparsePatchifyTrainingBackend: AutodiffBackend {
 
 #[cfg(feature = "ndarray")]
 impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::NdArray<f32>> {}
+
+#[cfg(feature = "flex")]
+impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::Flex<f32, i32>> {}
+
+#[cfg(feature = "dispatch")]
+impl TttSparsePatchifyTrainingBackend for burn::Dispatch {}
 
 #[cfg(feature = "webgpu")]
 impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::WebGpu<f32, i32>> {}

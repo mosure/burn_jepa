@@ -1,6 +1,6 @@
 use burn::tensor::Tensor;
 use burn_jepa::{
-    SparseMaskBatch, SparseTokenMask, TttEncoderConfig, TttSparsePatchifyTrainingBackend,
+    SparseMaskBatch, SparseTokenMask, TttEncoderConfig, TttSparsePatchifyTrainingBackend, TttState,
     VJepa2_1Model, VJepaTttModel, apply_mask_batch, synthetic_video,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -27,6 +27,48 @@ const SPARSITY_DENSITY_CASES: [DensityCase; 3] = [
     },
 ];
 
+#[derive(Clone, Copy)]
+struct TbpttStreamCase {
+    label: &'static str,
+    carry_state: bool,
+    reset_interval: usize,
+    state_decay: f64,
+}
+
+const TBPTT_STREAM_CASES: [TbpttStreamCase; 5] = [
+    TbpttStreamCase {
+        label: "no_stream_fresh",
+        carry_state: false,
+        reset_interval: 1,
+        state_decay: 1.0,
+    },
+    TbpttStreamCase {
+        label: "tbptt_reset1_decay1",
+        carry_state: true,
+        reset_interval: 1,
+        state_decay: 1.0,
+    },
+    TbpttStreamCase {
+        label: "tbptt_carry4_decay1",
+        carry_state: true,
+        reset_interval: 4,
+        state_decay: 1.0,
+    },
+    TbpttStreamCase {
+        label: "tbptt_carry4_decay0_97",
+        carry_state: true,
+        reset_interval: 4,
+        state_decay: 0.97,
+    },
+    TbpttStreamCase {
+        label: "tbptt_carry4_decay0_90",
+        carry_state: true,
+        reset_interval: 4,
+        state_decay: 0.90,
+    },
+];
+
+#[allow(dead_code)]
 fn rollout_mask(config: &burn_jepa::VJepaConfig) -> SparseTokenMask {
     let dense = config.num_patches();
     let keep = (dense / 2).max(1);
@@ -38,10 +80,19 @@ fn synthetic_video_batch<B: burn::tensor::backend::Backend>(
     batch_size: usize,
     device: &B::Device,
 ) -> Tensor<B, 5> {
+    synthetic_video_batch_with_offset(config, batch_size, device, 0)
+}
+
+fn synthetic_video_batch_with_offset<B: burn::tensor::backend::Backend>(
+    config: &burn_jepa::VJepaConfig,
+    batch_size: usize,
+    device: &B::Device,
+    offset: usize,
+) -> Tensor<B, 5> {
     let videos = (0..batch_size)
         .map(|index| {
             synthetic_video::<B>(
-                index,
+                offset * batch_size + index,
                 config.in_channels,
                 4,
                 config.image_size,
@@ -91,13 +142,28 @@ fn density_rows(dense_tokens: usize, batch_size: usize, density: f32) -> Vec<Vec
 fn bench_ttt_training_step_matrix<B>(c: &mut Criterion, backend_name: &str, batch_sizes: &[usize])
 where
     B: burn::tensor::backend::AutodiffBackend,
+    B::Device: Default,
+{
+    bench_ttt_training_step_matrix_with_device::<B, _>(c, backend_name, batch_sizes, || {
+        Default::default()
+    });
+}
+
+fn bench_ttt_training_step_matrix_with_device<B, MakeDevice>(
+    c: &mut Criterion,
+    backend_name: &str,
+    batch_sizes: &[usize],
+    make_device: MakeDevice,
+) where
+    B: burn::tensor::backend::AutodiffBackend,
+    MakeDevice: Fn() -> B::Device + Copy,
 {
     use burn::module::Module;
     use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 
     let mut group = c.benchmark_group(format!("ttt_training_step_{backend_name}"));
     for &batch_size in batch_sizes {
-        let device = Default::default();
+        let device = make_device();
         let config = training_step_bench_config();
         let teacher = VJepa2_1Model::<B>::new(&config, &device).no_grad();
         let student = VJepaTttModel::from_model(
@@ -185,6 +251,24 @@ fn bench_ttt_sparsity_training_step_matrix<B>(
     batch_sizes: &[usize],
 ) where
     B: burn::tensor::backend::AutodiffBackend,
+    B::Device: Default,
+{
+    bench_ttt_sparsity_training_step_matrix_with_device::<B, _>(
+        c,
+        backend_name,
+        batch_sizes,
+        || Default::default(),
+    );
+}
+
+fn bench_ttt_sparsity_training_step_matrix_with_device<B, MakeDevice>(
+    c: &mut Criterion,
+    backend_name: &str,
+    batch_sizes: &[usize],
+    make_device: MakeDevice,
+) where
+    B: burn::tensor::backend::AutodiffBackend,
+    MakeDevice: Fn() -> B::Device + Copy,
 {
     use burn::module::Module;
     use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
@@ -193,7 +277,7 @@ fn bench_ttt_sparsity_training_step_matrix<B>(
     for &batch_size in batch_sizes {
         group.throughput(Throughput::Elements(batch_size as u64));
 
-        let device = Default::default();
+        let device = make_device();
         let config = training_step_bench_config();
         let dense_tokens = config.num_patches();
         let video = synthetic_video_batch::<B>(&config, batch_size, &device);
@@ -412,6 +496,128 @@ fn bench_ttt_sparse_patchify_sparsity_training_step_matrix<B>(
     group.finish();
 }
 
+fn bench_ttt_tbptt_training_step_matrix<B>(c: &mut Criterion, backend_name: &str)
+where
+    B: burn::tensor::backend::AutodiffBackend,
+    B::Device: Default,
+{
+    bench_ttt_tbptt_training_step_matrix_with_device::<B, _>(c, backend_name, || {
+        Default::default()
+    });
+}
+
+fn bench_ttt_tbptt_training_step_matrix_with_device<B, MakeDevice>(
+    c: &mut Criterion,
+    backend_name: &str,
+    make_device: MakeDevice,
+) where
+    B: burn::tensor::backend::AutodiffBackend,
+    MakeDevice: Fn() -> B::Device + Copy,
+{
+    use burn::module::Module;
+    use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+
+    let mut group = c.benchmark_group(format!("ttt_tbptt_training_step_{backend_name}"));
+    for case in TBPTT_STREAM_CASES {
+        for batch_size in [1usize, 4] {
+            group.throughput(Throughput::Elements(batch_size as u64));
+            let device = make_device();
+            let config = training_step_bench_config();
+            let dense_tokens = config.num_patches();
+            let mask = SparseMaskBatch::<B>::from_rows(
+                density_rows(dense_tokens, batch_size, 0.5),
+                dense_tokens,
+                &device,
+            )
+            .expect("tbptt sparse mask");
+            let teacher = VJepa2_1Model::<B>::new(&config, &device).no_grad();
+            let videos = (0..case.reset_interval.max(4))
+                .map(|index| {
+                    synthetic_video_batch_with_offset::<B>(&config, batch_size, &device, index)
+                })
+                .collect::<Vec<_>>();
+            let teacher_tokens = videos
+                .iter()
+                .map(|video| teacher.encode_video(video.clone(), None).tokens.detach())
+                .collect::<Vec<_>>();
+            let sparse_teacher_tokens = teacher_tokens
+                .iter()
+                .map(|tokens| apply_mask_batch(tokens.clone(), &mask))
+                .collect::<Vec<_>>();
+            let mut model = Some(
+                VJepaTttModel::from_model(
+                    VJepa2_1Model::<B>::new(&config, &device),
+                    TttEncoderConfig {
+                        layers: vec![0],
+                        chunk_tokens: 2,
+                        ..TttEncoderConfig::default()
+                    },
+                    &device,
+                )
+                .expect("tbptt ttt model"),
+            );
+            let mut optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+            let mut carried_state = None::<TttState<B>>;
+            let mut windows_in_stream = 0usize;
+            let mut stream_step = 0usize;
+
+            group.bench_function(
+                format!(
+                    "{}_b{batch_size}_tokens{}_of{}_reset{}",
+                    case.label,
+                    mask.len(),
+                    dense_tokens,
+                    case.reset_interval
+                ),
+                |bench| {
+                    bench.iter(|| {
+                        let current = model.take().expect("model available");
+                        let reset = !case.carry_state
+                            || carried_state.is_none()
+                            || windows_in_stream >= case.reset_interval;
+                        let mut state = if reset {
+                            windows_in_stream = 1;
+                            current.fresh_state()
+                        } else {
+                            windows_in_stream += 1;
+                            carried_state
+                                .take()
+                                .unwrap_or_else(|| current.fresh_state())
+                        };
+                        let index = stream_step % videos.len();
+                        stream_step += 1;
+                        let student = current
+                            .forward_single_frame_rollout_sparse_batch(
+                                black_box(videos[index].clone()),
+                                &mask,
+                                Some(teacher_tokens[index].clone()),
+                                &mut state,
+                            )
+                            .expect("tbptt sparse rollout");
+                        let loss = (student.tokens - sparse_teacher_tokens[index].clone())
+                            .powf_scalar(2.0)
+                            .mean();
+                        let grads = GradientsParams::from_grads(loss.backward(), &current);
+                        let next = optim.step(1.0e-3, current, grads);
+                        if case.carry_state {
+                            state.detach();
+                            if case.state_decay < 1.0 {
+                                state.decay(case.state_decay);
+                            }
+                            carried_state = Some(state);
+                        } else {
+                            carried_state = None;
+                        }
+                        model = Some(next);
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[cfg(feature = "ndarray")]
 fn ttt_single_frame_rollout_ndarray(c: &mut Criterion) {
     type B = burn::backend::NdArray<f32>;
     let device = Default::default();
@@ -445,6 +651,10 @@ fn ttt_single_frame_rollout_ndarray(c: &mut Criterion) {
     });
 }
 
+#[cfg(not(feature = "ndarray"))]
+fn ttt_single_frame_rollout_ndarray(_c: &mut Criterion) {}
+
+#[cfg(feature = "ndarray")]
 fn ttt_sparse_single_frame_rollout_ndarray(c: &mut Criterion) {
     type B = burn::backend::NdArray<f32>;
     let device = Default::default();
@@ -480,6 +690,10 @@ fn ttt_sparse_single_frame_rollout_ndarray(c: &mut Criterion) {
     });
 }
 
+#[cfg(not(feature = "ndarray"))]
+fn ttt_sparse_single_frame_rollout_ndarray(_c: &mut Criterion) {}
+
+#[cfg(feature = "ndarray")]
 fn ttt_fixed_width_sparse_single_frame_rollout_ndarray(c: &mut Criterion) {
     type B = burn::backend::NdArray<f32>;
     let device = Default::default();
@@ -529,6 +743,10 @@ fn ttt_fixed_width_sparse_single_frame_rollout_ndarray(c: &mut Criterion) {
     );
 }
 
+#[cfg(not(feature = "ndarray"))]
+fn ttt_fixed_width_sparse_single_frame_rollout_ndarray(_c: &mut Criterion) {}
+
+#[cfg(feature = "ndarray")]
 fn ttt_training_step_matrix_ndarray(c: &mut Criterion) {
     bench_ttt_training_step_matrix::<burn::backend::Autodiff<burn::backend::NdArray<f32>>>(
         c,
@@ -537,6 +755,10 @@ fn ttt_training_step_matrix_ndarray(c: &mut Criterion) {
     );
 }
 
+#[cfg(not(feature = "ndarray"))]
+fn ttt_training_step_matrix_ndarray(_c: &mut Criterion) {}
+
+#[cfg(feature = "ndarray")]
 fn ttt_sparsity_training_step_matrix_ndarray(c: &mut Criterion) {
     bench_ttt_sparsity_training_step_matrix::<burn::backend::Autodiff<burn::backend::NdArray<f32>>>(
         c,
@@ -544,6 +766,129 @@ fn ttt_sparsity_training_step_matrix_ndarray(c: &mut Criterion) {
         &[1, 2, 4, 8],
     );
 }
+
+#[cfg(not(feature = "ndarray"))]
+fn ttt_sparsity_training_step_matrix_ndarray(_c: &mut Criterion) {}
+
+#[cfg(feature = "ndarray")]
+fn ttt_tbptt_training_step_matrix_ndarray(c: &mut Criterion) {
+    bench_ttt_tbptt_training_step_matrix::<burn::backend::Autodiff<burn::backend::NdArray<f32>>>(
+        c, "ndarray",
+    );
+}
+
+#[cfg(not(feature = "ndarray"))]
+fn ttt_tbptt_training_step_matrix_ndarray(_c: &mut Criterion) {}
+
+#[cfg(feature = "flex")]
+fn ttt_training_step_matrix_flex(c: &mut Criterion) {
+    bench_ttt_training_step_matrix::<burn::backend::Autodiff<burn::backend::Flex<f32, i32>>>(
+        c,
+        "flex",
+        &[1, 2, 4, 8],
+    );
+}
+
+#[cfg(not(feature = "flex"))]
+fn ttt_training_step_matrix_flex(_c: &mut Criterion) {}
+
+#[cfg(feature = "flex")]
+fn ttt_sparsity_training_step_matrix_flex(c: &mut Criterion) {
+    bench_ttt_sparsity_training_step_matrix::<burn::backend::Autodiff<burn::backend::Flex<f32, i32>>>(
+        c,
+        "flex",
+        &[1, 2, 4, 8],
+    );
+}
+
+#[cfg(not(feature = "flex"))]
+fn ttt_sparsity_training_step_matrix_flex(_c: &mut Criterion) {}
+
+#[cfg(feature = "flex")]
+fn ttt_tbptt_training_step_matrix_flex(c: &mut Criterion) {
+    bench_ttt_tbptt_training_step_matrix::<burn::backend::Autodiff<burn::backend::Flex<f32, i32>>>(
+        c, "flex",
+    );
+}
+
+#[cfg(not(feature = "flex"))]
+fn ttt_tbptt_training_step_matrix_flex(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "flex"))]
+fn ttt_training_step_matrix_dispatch_flex(c: &mut Criterion) {
+    bench_ttt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_flex",
+        &[1, 2, 4, 8],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Flex(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "flex")))]
+fn ttt_training_step_matrix_dispatch_flex(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "flex"))]
+fn ttt_sparsity_training_step_matrix_dispatch_flex(c: &mut Criterion) {
+    bench_ttt_sparsity_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_flex",
+        &[1, 2, 4, 8],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Flex(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "flex")))]
+fn ttt_sparsity_training_step_matrix_dispatch_flex(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "flex"))]
+fn ttt_tbptt_training_step_matrix_dispatch_flex(c: &mut Criterion) {
+    bench_ttt_tbptt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_flex",
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Flex(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "flex")))]
+fn ttt_tbptt_training_step_matrix_dispatch_flex(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "ndarray"))]
+fn ttt_training_step_matrix_dispatch_ndarray(c: &mut Criterion) {
+    bench_ttt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_ndarray",
+        &[1, 2, 4, 8],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::NdArray(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "ndarray")))]
+fn ttt_training_step_matrix_dispatch_ndarray(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "ndarray"))]
+fn ttt_sparsity_training_step_matrix_dispatch_ndarray(c: &mut Criterion) {
+    bench_ttt_sparsity_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_ndarray",
+        &[1, 2, 4, 8],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::NdArray(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "ndarray")))]
+fn ttt_sparsity_training_step_matrix_dispatch_ndarray(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "ndarray"))]
+fn ttt_tbptt_training_step_matrix_dispatch_ndarray(c: &mut Criterion) {
+    bench_ttt_tbptt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_ndarray",
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::NdArray(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "ndarray")))]
+fn ttt_tbptt_training_step_matrix_dispatch_ndarray(_c: &mut Criterion) {}
 
 #[cfg(feature = "cuda")]
 fn ttt_training_step_matrix_cuda(c: &mut Criterion) {
@@ -578,6 +923,22 @@ fn ttt_sparsity_training_step_matrix_cuda(c: &mut Criterion) {
     );
 }
 
+#[cfg(feature = "cuda")]
+fn ttt_tbptt_training_step_matrix_cuda(c: &mut Criterion) {
+    if let Err(reason) =
+        burn_jepa::runtime::cuda_runtime_preflight(burn_jepa::runtime::CUDA_TRAIN_FORCE_ENV)
+    {
+        eprintln!("skipping ttt_tbptt_training_step_matrix_cuda: {reason}");
+        return;
+    }
+    bench_ttt_tbptt_training_step_matrix::<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>(
+        c, "cuda",
+    );
+}
+
+#[cfg(not(feature = "cuda"))]
+fn ttt_tbptt_training_step_matrix_cuda(_c: &mut Criterion) {}
+
 #[cfg(not(feature = "cuda"))]
 fn ttt_sparsity_training_step_matrix_cuda(_c: &mut Criterion) {}
 
@@ -596,6 +957,62 @@ fn ttt_sparse_patchify_sparsity_training_step_matrix_cuda(c: &mut Criterion) {
 
 #[cfg(not(all(feature = "cuda", feature = "sparse-patchify-cuda")))]
 fn ttt_sparse_patchify_sparsity_training_step_matrix_cuda(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "cuda"))]
+fn ttt_training_step_matrix_dispatch_cuda(c: &mut Criterion) {
+    if let Err(reason) =
+        burn_jepa::runtime::cuda_runtime_preflight(burn_jepa::runtime::CUDA_TRAIN_FORCE_ENV)
+    {
+        eprintln!("skipping ttt_training_step_matrix_dispatch_cuda: {reason}");
+        return;
+    }
+    bench_ttt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_cuda",
+        &[1, 2, 4],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Cuda(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "cuda")))]
+fn ttt_training_step_matrix_dispatch_cuda(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "cuda"))]
+fn ttt_sparsity_training_step_matrix_dispatch_cuda(c: &mut Criterion) {
+    if let Err(reason) =
+        burn_jepa::runtime::cuda_runtime_preflight(burn_jepa::runtime::CUDA_TRAIN_FORCE_ENV)
+    {
+        eprintln!("skipping ttt_sparsity_training_step_matrix_dispatch_cuda: {reason}");
+        return;
+    }
+    bench_ttt_sparsity_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_cuda",
+        &[1, 2, 4],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Cuda(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "cuda")))]
+fn ttt_sparsity_training_step_matrix_dispatch_cuda(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", feature = "cuda"))]
+fn ttt_tbptt_training_step_matrix_dispatch_cuda(c: &mut Criterion) {
+    if let Err(reason) =
+        burn_jepa::runtime::cuda_runtime_preflight(burn_jepa::runtime::CUDA_TRAIN_FORCE_ENV)
+    {
+        eprintln!("skipping ttt_tbptt_training_step_matrix_dispatch_cuda: {reason}");
+        return;
+    }
+    bench_ttt_tbptt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_cuda",
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Cuda(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", feature = "cuda")))]
+fn ttt_tbptt_training_step_matrix_dispatch_cuda(_c: &mut Criterion) {}
 
 #[cfg(feature = "wgpu")]
 fn ttt_training_step_matrix_wgpu(c: &mut Criterion) {
@@ -618,6 +1035,16 @@ fn ttt_sparsity_training_step_matrix_wgpu(c: &mut Criterion) {
     );
 }
 
+#[cfg(feature = "wgpu")]
+fn ttt_tbptt_training_step_matrix_wgpu(c: &mut Criterion) {
+    bench_ttt_tbptt_training_step_matrix::<burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>>(
+        c, "wgpu",
+    );
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn ttt_tbptt_training_step_matrix_wgpu(_c: &mut Criterion) {}
+
 #[cfg(not(feature = "wgpu"))]
 fn ttt_sparsity_training_step_matrix_wgpu(_c: &mut Criterion) {}
 
@@ -630,6 +1057,44 @@ fn ttt_sparse_patchify_sparsity_training_step_matrix_wgpu(c: &mut Criterion) {
 
 #[cfg(not(feature = "sparse-patchify-wgpu"))]
 fn ttt_sparse_patchify_sparsity_training_step_matrix_wgpu(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", any(feature = "wgpu", feature = "webgpu")))]
+fn ttt_training_step_matrix_dispatch_wgpu(c: &mut Criterion) {
+    bench_ttt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_wgpu",
+        &[1, 2, 4],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Wgpu(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", any(feature = "wgpu", feature = "webgpu"))))]
+fn ttt_training_step_matrix_dispatch_wgpu(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", any(feature = "wgpu", feature = "webgpu")))]
+fn ttt_sparsity_training_step_matrix_dispatch_wgpu(c: &mut Criterion) {
+    bench_ttt_sparsity_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_wgpu",
+        &[1, 2, 4],
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Wgpu(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", any(feature = "wgpu", feature = "webgpu"))))]
+fn ttt_sparsity_training_step_matrix_dispatch_wgpu(_c: &mut Criterion) {}
+
+#[cfg(all(feature = "dispatch", any(feature = "wgpu", feature = "webgpu")))]
+fn ttt_tbptt_training_step_matrix_dispatch_wgpu(c: &mut Criterion) {
+    bench_ttt_tbptt_training_step_matrix_with_device::<burn::Dispatch, _>(
+        c,
+        "dispatch_wgpu",
+        || burn::DispatchDevice::autodiff(burn::DispatchDevice::Wgpu(Default::default())),
+    );
+}
+
+#[cfg(not(all(feature = "dispatch", any(feature = "wgpu", feature = "webgpu"))))]
+fn ttt_tbptt_training_step_matrix_dispatch_wgpu(_c: &mut Criterion) {}
 
 #[cfg(feature = "webgpu")]
 fn ttt_training_step_matrix_webgpu(c: &mut Criterion) {
@@ -649,6 +1114,16 @@ fn ttt_sparsity_training_step_matrix_webgpu(c: &mut Criterion) {
         burn::backend::Autodiff<burn::backend::WebGpu<f32, i32>>,
     >(c, "webgpu", &[1, 2, 4]);
 }
+
+#[cfg(feature = "webgpu")]
+fn ttt_tbptt_training_step_matrix_webgpu(c: &mut Criterion) {
+    bench_ttt_tbptt_training_step_matrix::<burn::backend::Autodiff<burn::backend::WebGpu<f32, i32>>>(
+        c, "webgpu",
+    );
+}
+
+#[cfg(not(feature = "webgpu"))]
+fn ttt_tbptt_training_step_matrix_webgpu(_c: &mut Criterion) {}
 
 #[cfg(not(feature = "webgpu"))]
 fn ttt_sparsity_training_step_matrix_webgpu(_c: &mut Criterion) {}
@@ -793,14 +1268,33 @@ criterion_group!(
     ttt_fixed_width_sparse_single_frame_rollout_ndarray,
     ttt_training_step_matrix_ndarray,
     ttt_sparsity_training_step_matrix_ndarray,
+    ttt_tbptt_training_step_matrix_ndarray,
+    ttt_training_step_matrix_flex,
+    ttt_sparsity_training_step_matrix_flex,
+    ttt_tbptt_training_step_matrix_flex,
+    ttt_training_step_matrix_dispatch_flex,
+    ttt_sparsity_training_step_matrix_dispatch_flex,
+    ttt_tbptt_training_step_matrix_dispatch_flex,
+    ttt_training_step_matrix_dispatch_ndarray,
+    ttt_sparsity_training_step_matrix_dispatch_ndarray,
+    ttt_tbptt_training_step_matrix_dispatch_ndarray,
     ttt_training_step_matrix_cuda,
     ttt_sparsity_training_step_matrix_cuda,
+    ttt_tbptt_training_step_matrix_cuda,
     ttt_sparse_patchify_sparsity_training_step_matrix_cuda,
+    ttt_training_step_matrix_dispatch_cuda,
+    ttt_sparsity_training_step_matrix_dispatch_cuda,
+    ttt_tbptt_training_step_matrix_dispatch_cuda,
     ttt_training_step_matrix_wgpu,
     ttt_sparsity_training_step_matrix_wgpu,
+    ttt_tbptt_training_step_matrix_wgpu,
     ttt_sparse_patchify_sparsity_training_step_matrix_wgpu,
+    ttt_training_step_matrix_dispatch_wgpu,
+    ttt_sparsity_training_step_matrix_dispatch_wgpu,
+    ttt_tbptt_training_step_matrix_dispatch_wgpu,
     ttt_training_step_matrix_webgpu,
     ttt_sparsity_training_step_matrix_webgpu,
+    ttt_tbptt_training_step_matrix_webgpu,
     ttt_single_frame_rollout_cuda,
     ttt_sparse_patchify_single_frame_rollout_wgpu,
     ttt_sparse_patchify_single_frame_rollout_cuda

@@ -5,9 +5,9 @@ use burn_jepa::{
     BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseMaskBatch,
     SparseTokenMask, TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState,
     TttMemoryUpdateSource, TttRolloutReportMode, TttSparsePatchifyTrainingMode,
-    TttSparseRolloutMode, TttSupervisionMode, TttTargetMode, VJepa2_1Model, VJepaTttLayer,
-    VJepaTttModel, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
-    train_ttt_distillation,
+    TttSparseRolloutMode, TttStreamStepKind, TttSupervisionMode, TttTargetMode, VJepa2_1Model,
+    VJepaTttLayer, VJepaTttModel, apply_token_mask, evaluate_ttt_model_file,
+    load_jepa_tensor_batch, synthetic_video, train_dense_jepa, train_ttt_distillation,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -42,6 +42,10 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     config.ttt.backprop_mode = TttBackpropMode::LayerLocal;
     config.training.max_steps = 3;
     config.training.batch_size = 2;
+    config.training.lr_schedule = burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine {
+        warmup_steps: 1,
+        min_learning_rate: 1.0e-5,
+    };
     config.loss.predictor_loss_weight = 0.25;
 
     let toml = config.to_toml_string().expect("serialize config");
@@ -51,6 +55,8 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     assert!(toml.contains("supervision = \"hybrid\""));
     assert!(toml.contains("hybrid_final_steps = 2"));
     assert!(toml.contains("backprop_mode = \"layer_local\""));
+    assert!(toml.contains("[training.lr_schedule]"));
+    assert!(toml.contains("kind = \"linear_warmup_cosine\""));
     assert!(toml.contains("[loss]"));
 
     let parsed: burn_jepa::training::BurnJepaTrainConfig =
@@ -70,7 +76,141 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     assert_eq!(parsed.ttt.backprop_mode, TttBackpropMode::LayerLocal);
     assert_eq!(parsed.training.max_steps, 3);
     assert_eq!(parsed.training.batch_size, 2);
+    assert!(matches!(
+        parsed.training.lr_schedule,
+        burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine { .. }
+    ));
     assert_eq!(parsed.loss.predictor_loss_weight, 0.25);
+}
+
+#[test]
+fn learning_rate_schedule_warmup_cosine_reaches_floor() {
+    let mut config = BurnJepaTrainConfig::default();
+    config.training.max_steps = 5;
+    config.training.learning_rate = 1.0e-3;
+    config.training.lr_schedule = burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine {
+        warmup_steps: 2,
+        min_learning_rate: 1.0e-4,
+    };
+    config.validate_for_ttt().expect("valid scheduled config");
+
+    let stats = config.training.learning_rate_stats();
+    assert!((config.training.learning_rate_for_step(0) - 5.0e-4).abs() < 1.0e-12);
+    assert!((config.training.learning_rate_for_step(1) - 1.0e-3).abs() < 1.0e-12);
+    assert!((stats.final_learning_rate - 1.0e-4).abs() < 1.0e-12);
+    assert_eq!(stats.base_learning_rate, 1.0e-3);
+
+    let clamped = config.training.lr_schedule.clamped_to_max_steps(1);
+    clamped
+        .validate(1, config.training.learning_rate)
+        .expect("clamped schedule stays valid for short bench overrides");
+}
+
+#[test]
+fn production_ttt_configs_are_encoder_only_and_scheduled() {
+    let stage1: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-adapter-cuda.toml"
+    ))
+    .expect("parse stage1 production config");
+    let stream: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-stream-tbptt-cuda.toml"
+    ))
+    .expect("parse stream production config");
+    let stream_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stream-eval-cuda.toml"
+    ))
+    .expect("parse stream eval production config");
+    let stage2: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage2-unfrozen-low-lr-cuda.toml"
+    ))
+    .expect("parse stage2 production config");
+
+    assert_eq!(stage1.ttt.layers, vec![3, 7, 11]);
+    assert!(stage1.ttt.predictor_layers.is_empty());
+    assert!(stage1.ttt.freeze_pretrained);
+    assert_eq!(
+        stage1.training.sparse_patchify_training,
+        TttSparsePatchifyTrainingMode::FrozenSparsePatchify
+    );
+    assert!(matches!(
+        stage1.training.lr_schedule,
+        burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine { .. }
+    ));
+
+    assert_eq!(stream.ttt.layers, vec![3, 7, 11]);
+    assert!(stream.ttt.predictor_layers.is_empty());
+    assert!(stream.ttt.freeze_pretrained);
+    assert!(stream.training.stream.enabled);
+    assert!(stream.training.stream.curriculum.enabled);
+    assert_eq!(stream.training.stream.reset_interval_for_step(0), 1);
+    assert_eq!(
+        stream
+            .training
+            .stream
+            .reset_interval_for_step(stream.training.max_steps - 1),
+        4
+    );
+    assert_eq!(
+        stream.ttt.supervision,
+        burn_jepa::TttSupervisionMode::FinalTeacher
+    );
+    assert_eq!(stream.training.batch_size, 2);
+    assert_eq!(
+        stream.training.batching,
+        burn_jepa::TrainingBatchingMode::PackedStreams
+    );
+
+    assert!(stream_eval.training.stream.enabled);
+    assert_eq!(stream_eval.training.effective_eval_batch_size(), 4);
+    assert_eq!(
+        stream_eval.training.batching,
+        burn_jepa::TrainingBatchingMode::PackedStreams
+    );
+    assert_eq!(stream_eval.training.stream.reset_interval_steps, 4);
+    assert!(!stream_eval.training.stream.curriculum.enabled);
+
+    assert_eq!(stage2.ttt.layers, vec![3, 7, 11]);
+    assert!(stage2.ttt.predictor_layers.is_empty());
+    assert!(!stage2.ttt.freeze_pretrained);
+    assert_eq!(
+        stage2.training.sparse_patchify_training,
+        TttSparsePatchifyTrainingMode::DensePatchEmbed
+    );
+    assert!(stage2.training.learning_rate < stage1.training.learning_rate);
+    assert!(matches!(
+        stage2.training.lr_schedule,
+        burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine { .. }
+    ));
+}
+
+#[test]
+fn ttt_dispatch_backend_config_round_trips() {
+    let default_toml = BurnJepaTrainConfig::default()
+        .to_toml_string()
+        .expect("serialize default config");
+    assert!(
+        !default_toml.contains("dispatch_backend"),
+        "dispatch backend selector should stay out of default configs unless dispatch is selected"
+    );
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.training.backend = burn_jepa::JepaTrainBackend::Dispatch;
+    config.training.dispatch_backend = burn_jepa::JepaDispatchBackend::Flex;
+
+    let toml = config.to_toml_string().expect("serialize dispatch config");
+    assert!(toml.contains("backend = \"dispatch\""));
+    assert!(toml.contains("dispatch_backend = \"flex\""));
+
+    let parsed: BurnJepaTrainConfig = toml::from_str(&toml).expect("parse dispatch config");
+    parsed.validate_for_ttt().expect("valid dispatch config");
+    assert_eq!(
+        parsed.training.backend,
+        burn_jepa::JepaTrainBackend::Dispatch
+    );
+    assert_eq!(
+        parsed.training.dispatch_backend,
+        burn_jepa::JepaDispatchBackend::Flex
+    );
 }
 
 #[test]
@@ -99,6 +239,96 @@ fn ttt_sparse_rollout_config_round_trips() {
         parsed.training.sparse_patchify_training,
         TttSparsePatchifyTrainingMode::FrozenSparsePatchify
     );
+}
+
+#[test]
+fn ttt_stream_training_config_round_trips_and_validates() {
+    let mut config = BurnJepaTrainConfig::default();
+    config.training.batch_size = 1;
+    config.training.stream.enabled = true;
+    config.training.stream.state_decay = 0.95;
+    config.training.stream.state_l2_weight = 1.0e-6;
+    config.training.stream.update_l2_weight = 2.0e-6;
+    config.training.stream.reset_interval_steps = 4;
+    config.training.stream.curriculum.enabled = true;
+    config
+        .training
+        .stream
+        .curriculum
+        .initial_reset_interval_steps = 1;
+    config.training.stream.curriculum.final_reset_interval_steps = 4;
+    config.training.stream.curriculum.warmup_steps = 8;
+
+    let toml = config.to_toml_string().expect("serialize config");
+    assert!(toml.contains("[training.stream]"));
+    assert!(toml.contains("[training.stream.curriculum]"));
+    assert!(toml.contains("enabled = true"));
+    assert!(toml.contains("state_decay = 0.95"));
+    assert!(toml.contains("state_l2_weight = "));
+    assert!(toml.contains("update_l2_weight = "));
+    assert!(toml.contains("reset_interval_steps = 4"));
+
+    let parsed: BurnJepaTrainConfig = toml::from_str(&toml).expect("parse stream config");
+    parsed.validate_for_ttt().expect("valid stream config");
+    assert!(parsed.training.stream.enabled);
+    assert!(parsed.training.stream.detach_between_steps);
+    assert_eq!(parsed.training.stream.reset_interval_steps, 4);
+    assert!(parsed.training.stream.curriculum.enabled);
+    assert_eq!(
+        parsed
+            .training
+            .stream
+            .curriculum
+            .initial_reset_interval_steps,
+        1
+    );
+    assert_eq!(
+        parsed.training.stream.curriculum.final_reset_interval_steps,
+        4
+    );
+    assert_eq!(parsed.training.stream.curriculum.warmup_steps, 8);
+    assert_eq!(parsed.training.stream.reset_interval_for_step(0), 1);
+    assert_eq!(parsed.training.stream.reset_interval_for_step(7), 4);
+    assert_eq!(parsed.training.stream.state_l2_weight, 1.0e-6);
+    assert_eq!(parsed.training.stream.update_l2_weight, 2.0e-6);
+
+    let mut packed = parsed;
+    packed.training.batch_size = 2;
+    packed.training.eval_steps = 1;
+    packed.training.eval_batch_size = Some(2);
+    packed.training.batching = burn_jepa::TrainingBatchingMode::PackedStreams;
+    packed
+        .validate_for_ttt()
+        .expect("stream mode should accept packed multi-stream batches");
+
+    let toml = packed
+        .to_toml_string()
+        .expect("serialize packed stream config");
+    assert!(toml.contains("batching = \"packed_streams\""));
+    let parsed: BurnJepaTrainConfig = toml::from_str(&toml).expect("parse packed stream config");
+    assert_eq!(
+        parsed.training.batching,
+        burn_jepa::TrainingBatchingMode::PackedStreams
+    );
+}
+
+#[test]
+fn ttt_predictor_layers_require_predictor_loss() {
+    let mut config = BurnJepaTrainConfig::default();
+    config.ttt.layer_placement = TttLayerPlacement::Explicit;
+    config.ttt.layers.clear();
+    config.ttt.predictor_layers = vec![0];
+    config.loss.predictor_loss_weight = 0.0;
+    assert!(
+        config.validate_for_ttt().is_err(),
+        "predictor-only TTT should require predictor auxiliary loss"
+    );
+
+    config.loss.feature_loss_weight = 0.0;
+    config.loss.predictor_loss_weight = 0.25;
+    config
+        .validate_for_ttt()
+        .expect("predictor-only TTT should validate with predictor loss");
 }
 
 #[test]
@@ -231,6 +461,10 @@ fn training_mask_config_resolves_supported_policies() {
             context_keep_ratio: 0.5,
         },
         burn_jepa::TrainingMaskConfig::FullFrame { target_tokens: 2 },
+        burn_jepa::TrainingMaskConfig::TemporalUniformSparse {
+            context_tokens: 4,
+            target_tokens: 2,
+        },
         burn_jepa::TrainingMaskConfig::AutogazeSparse {
             image_grid: burn_jepa::TrainingImageTokenGrid::new(2, 2),
             context_tokens: 4,
@@ -266,6 +500,36 @@ fn training_mask_config_resolves_supported_policies() {
         for index in target.indices() {
             assert!(!context.indices().contains(index));
         }
+    }
+}
+
+#[test]
+fn temporal_uniform_sparse_mask_balances_context_across_tubelets() {
+    let device = Default::default();
+    let model = burn_jepa::VJepaConfig::tiny_for_tests();
+    let video = synthetic_video::<B>(0, model.in_channels, 4, 32, 32, &device);
+    let mut training = burn_jepa::TrainingLoopConfig::default();
+    training.mask = Some(burn_jepa::TrainingMaskConfig::TemporalUniformSparse {
+        context_tokens: 4,
+        target_tokens: 2,
+    });
+
+    let (context, target) = training
+        .resolve_masks(&video, &model)
+        .expect("resolve temporal uniform sparse mask");
+    let frame_tokens = 4;
+    let counts = |mask: &SparseTokenMask| {
+        let mut counts = vec![0usize; 2];
+        for &index in mask.indices() {
+            counts[index / frame_tokens] += 1;
+        }
+        counts
+    };
+
+    assert_eq!(counts(&context), vec![2, 2]);
+    assert_eq!(counts(&target), vec![1, 1]);
+    for index in target.indices() {
+        assert!(!context.indices().contains(index));
     }
 }
 
@@ -454,6 +718,47 @@ fn ttt_model_zero_init_matches_pretrained_video_encoder_and_stays_stable() {
 }
 
 #[test]
+fn ttt_predictor_layer_zero_init_matches_pretrained_predictor() {
+    let device = Default::default();
+    let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
+    let base = VJepa2_1Model::<B>::new(&model_config, &device);
+    let video = synthetic_video::<B>(0, model_config.in_channels, 4, 32, 32, &device);
+    let dense = base.encode_video(video, None);
+    let context =
+        SparseTokenMask::new(vec![0, 2, 5, 7], model_config.num_patches()).expect("context mask");
+    let target = SparseTokenMask::new(vec![1, 3], model_config.num_patches()).expect("target mask");
+    let context_tokens = apply_token_mask(dense.tokens.clone(), context.to_tensor(1, &device));
+    let expected = base
+        .predictor
+        .forward_sparse(context_tokens.clone(), &context, &target, dense.grid, 0)
+        .expect("base predictor")
+        .target_predictions;
+
+    let student = VJepaTttModel::from_model(
+        base,
+        TttEncoderConfig {
+            layer_placement: TttLayerPlacement::Explicit,
+            layers: Vec::new(),
+            predictor_layers: vec![0],
+            ..TttEncoderConfig::default()
+        },
+        &device,
+    )
+    .expect("TTT predictor model");
+    assert_eq!(student.predictor_ttt_layer_indices(), &[0]);
+    let actual = student
+        .forward_predictor_sparse(context_tokens, &context, &target, dense.grid, 0)
+        .expect("TTT predictor")
+        .target_predictions;
+    assert_tensor_close(
+        "zero-init predictor TTT should match pretrained/base predictor",
+        expected,
+        actual,
+        1.0e-5,
+    );
+}
+
+#[test]
 fn ttt_distillation_training_smoke_improves_tiny_loss() {
     let device = Default::default();
     let mut config = BurnJepaTrainConfig::default();
@@ -511,10 +816,23 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
         .temporal_diagnostics
         .as_ref()
         .expect("TTT eval should report temporal diagnostics");
+    assert!(temporal.samples > 0);
     assert!(temporal.reset_each_frame_loss.is_some_and(f64::is_finite));
     assert!(temporal.reverse_order_loss.is_some_and(f64::is_finite));
     assert!(temporal.shuffle_order_loss.is_some_and(f64::is_finite));
     assert!(temporal.freeze_fast_update_loss.is_some_and(f64::is_finite));
+    let segments = report
+        .temporal_segments
+        .as_ref()
+        .expect("TTT eval should report temporal segment diagnostics");
+    assert_eq!(segments.samples, temporal.samples);
+    assert_eq!(segments.segments.len(), 3);
+    assert!(
+        segments
+            .segments
+            .iter()
+            .all(|segment| segment.loss.is_finite() && segment.cosine.is_finite())
+    );
     assert!(
         report.best_loss < report.initial_loss,
         "tiny training run should improve at least one step: initial={} best={} final={}",
@@ -529,6 +847,563 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
         report.final_loss
     );
     assert!(report.report_path.exists());
+}
+
+#[test]
+fn ttt_stream_training_smoke_carries_and_decays_state() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-stream-train");
+    config.training.max_steps = 3;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 1;
+    config.training.learning_rate = 5.0e-3;
+    config.training.stream.enabled = true;
+    config.training.stream.state_decay = 0.9;
+    config.training.stream.state_l2_weight = 1.0e-6;
+    config.training.stream.update_l2_weight = 1.0e-6;
+    config.dataset.synthetic_len = 1;
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("stream training smoke");
+
+    assert_eq!(report.steps, 3);
+    assert!(report.final_loss.is_finite());
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
+    assert!(report.stream.enabled);
+    assert!(report.stream.detach_between_steps);
+    assert_eq!(report.stream.reset_steps, 1);
+    assert_eq!(report.stream.carried_steps, 2);
+    assert_eq!(report.stream.optimizer_steps, Some(3));
+    assert_eq!(report.stream.reset_optimizer_steps, Some(1));
+    assert_eq!(report.stream.carried_optimizer_steps, Some(2));
+    assert_eq!(report.stream.detached_steps, 3);
+    assert_eq!(report.stream.decayed_steps, 3);
+    assert!(!report.stream.curriculum_enabled);
+    assert_eq!(report.stream.final_effective_reset_interval_steps, 0);
+    assert_eq!(report.stream.state_decay, 0.9);
+    assert_eq!(report.stream.state_l2_weight, 1.0e-6);
+    assert_eq!(report.stream.update_l2_weight, 1.0e-6);
+    assert_eq!(report.loss_trace.len(), 3);
+    assert_eq!(
+        report.loss_trace[0].stream_step,
+        Some(TttStreamStepKind::Reset)
+    );
+    assert_eq!(
+        report.loss_trace[1].stream_step,
+        Some(TttStreamStepKind::Carried)
+    );
+    assert_eq!(
+        report.loss_trace[2].stream_step,
+        Some(TttStreamStepKind::Carried)
+    );
+    assert_eq!(report.loss_trace[0].effective_reset_interval_steps, Some(0));
+}
+
+#[test]
+fn ttt_stream_training_resets_on_manifest_clip_change() {
+    let device = Default::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let frame_dir = temp.path().join("frames");
+    std::fs::create_dir_all(&frame_dir).expect("frame dir");
+    let mut frame_paths = Vec::new();
+    for frame in 0..6 {
+        let path = frame_dir.join(format!("frame-{frame}.png"));
+        let image = image::RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([
+                ((x + y + frame) % 255) as u8,
+                ((x * 3 + frame * 5) % 255) as u8,
+                ((y * 7 + frame) % 255) as u8,
+            ])
+        });
+        image.save(&path).expect("save frame");
+        frame_paths.push(path);
+    }
+    let frames = |start: usize| {
+        frame_paths[start..start + 4]
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    };
+    let manifest = temp.path().join("stream-manifest.jsonl");
+    let rows = [
+        serde_json::json!({
+            "clip_id": "a",
+            "domain": "test",
+            "start_frame": 0,
+            "frames": frames(0),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+        serde_json::json!({
+            "clip_id": "a",
+            "domain": "test",
+            "start_frame": 1,
+            "frames": frames(1),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+        serde_json::json!({
+            "clip_id": "b",
+            "domain": "test",
+            "start_frame": 0,
+            "frames": frames(2),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+    ];
+    std::fs::write(
+        &manifest,
+        rows.iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write manifest");
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    config.model.output_dir = temp.path().join("ttt-stream-manifest");
+    config.dataset.kind = burn_jepa::JepaDatasetKind::Manifest;
+    config.dataset.sample_kind = burn_jepa::JepaSampleKind::Video;
+    config.dataset.train_manifest = Some(manifest.clone());
+    config.dataset.eval_manifest = Some(manifest);
+    config.dataset.synthetic_len = 3;
+    config.training.max_steps = 3;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 0;
+    config.training.stream.enabled = true;
+    config.training.stream.reset_interval_steps = 0;
+    config.training.sparse_rollout = TttSparseRolloutMode::ContextMask;
+    config.training.mask = Some(burn_jepa::TrainingMaskConfig::ManifestPrecomputedMasks);
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("stream manifest smoke");
+
+    assert_eq!(report.stream.reset_steps, 2);
+    assert_eq!(report.stream.carried_steps, 1);
+    assert_eq!(report.stream.detached_steps, 3);
+    assert_eq!(report.rollout.mode, TttRolloutReportMode::SparseContext);
+    assert!(report.final_loss.is_finite());
+}
+
+#[test]
+fn ttt_stream_training_packs_independent_manifest_streams() {
+    let device = Default::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let frame_dir = temp.path().join("packed-frames");
+    std::fs::create_dir_all(&frame_dir).expect("frame dir");
+    let mut frame_paths = Vec::new();
+    for frame in 0..10 {
+        let path = frame_dir.join(format!("frame-{frame}.png"));
+        let image = image::RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([
+                ((x + frame * 11) % 255) as u8,
+                ((y * 2 + frame * 3) % 255) as u8,
+                ((x + y + frame * 5) % 255) as u8,
+            ])
+        });
+        image.save(&path).expect("save frame");
+        frame_paths.push(path);
+    }
+    let frames = |start: usize| {
+        frame_paths[start..start + 4]
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    };
+    let manifest = temp.path().join("packed-stream-manifest.jsonl");
+    let rows = [
+        serde_json::json!({
+            "clip_id": "a",
+            "domain": "test",
+            "start_frame": 0,
+            "frames": frames(0),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+        serde_json::json!({
+            "clip_id": "a",
+            "domain": "test",
+            "start_frame": 1,
+            "frames": frames(1),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+        serde_json::json!({
+            "clip_id": "b",
+            "domain": "test",
+            "start_frame": 0,
+            "frames": frames(4),
+            "precomputed_context_indices": [0, 3, 4, 7],
+            "precomputed_target_indices": [1, 5]
+        }),
+        serde_json::json!({
+            "clip_id": "b",
+            "domain": "test",
+            "start_frame": 1,
+            "frames": frames(5),
+            "precomputed_context_indices": [0, 3, 4, 7],
+            "precomputed_target_indices": [1, 5]
+        }),
+    ];
+    std::fs::write(
+        &manifest,
+        rows.iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write manifest");
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    config.model.output_dir = temp.path().join("ttt-packed-stream-manifest");
+    config.dataset.kind = burn_jepa::JepaDatasetKind::Manifest;
+    config.dataset.sample_kind = burn_jepa::JepaSampleKind::Video;
+    config.dataset.train_manifest = Some(manifest.clone());
+    config.dataset.eval_manifest = Some(manifest);
+    config.dataset.synthetic_len = 4;
+    config.training.max_steps = 2;
+    config.training.batch_size = 2;
+    config.training.eval_steps = 0;
+    config.training.learning_rate = 5.0e-3;
+    config.training.batching = burn_jepa::TrainingBatchingMode::PackedStreams;
+    config.training.stream.enabled = true;
+    config.training.stream.reset_interval_steps = 0;
+    config.training.stream.state_decay = 0.95;
+    config.training.sparse_rollout = TttSparseRolloutMode::ContextMask;
+    config.training.mask = Some(burn_jepa::TrainingMaskConfig::ManifestPrecomputedMasks);
+
+    let report =
+        train_ttt_distillation::<AB>(&config, &device).expect("packed stream training smoke");
+
+    assert_eq!(report.steps, 2);
+    assert_eq!(report.samples, 4);
+    assert_eq!(report.stream.reset_steps, 2);
+    assert_eq!(report.stream.carried_steps, 2);
+    assert_eq!(report.stream.packed_batches, 2);
+    assert_eq!(report.stream.max_packed_batch_size, 2);
+    assert_eq!(report.stream.active_streams, 2);
+    assert_eq!(report.stream.max_active_streams, 2);
+    assert_eq!(report.stream.optimizer_steps, Some(2));
+    assert_eq!(report.stream.reset_optimizer_steps, Some(1));
+    assert_eq!(report.stream.carried_optimizer_steps, Some(1));
+    assert_eq!(report.stream.mixed_optimizer_steps, Some(0));
+    assert_eq!(report.stream.detached_steps, 4);
+    assert_eq!(report.stream.decayed_steps, 4);
+    assert_eq!(
+        report.loss_trace[0].stream_step,
+        Some(TttStreamStepKind::Reset)
+    );
+    assert_eq!(
+        report.loss_trace[1].stream_step,
+        Some(TttStreamStepKind::Carried)
+    );
+    assert!(report.final_loss.is_finite());
+}
+
+#[test]
+fn ttt_stream_packed_batches_shrink_when_stream_count_is_smaller_than_batch_size() {
+    let device = Default::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let frame_dir = temp.path().join("partial-frames");
+    std::fs::create_dir_all(&frame_dir).expect("frame dir");
+    let mut frame_paths = Vec::new();
+    for frame in 0..5 {
+        let path = frame_dir.join(format!("frame-{frame}.png"));
+        image::RgbImage::from_pixel(32, 32, image::Rgb([frame as u8, 3, 7]))
+            .save(&path)
+            .expect("save frame");
+        frame_paths.push(path);
+    }
+    let frames = |start: usize| {
+        frame_paths[start..start + 4]
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    };
+    let manifest = temp.path().join("partial-stream-manifest.jsonl");
+    let rows = [
+        serde_json::json!({
+            "clip_id": "solo",
+            "domain": "test",
+            "start_frame": 0,
+            "frames": frames(0),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+        serde_json::json!({
+            "clip_id": "solo",
+            "domain": "test",
+            "start_frame": 1,
+            "frames": frames(1),
+            "precomputed_context_indices": [0, 1, 4, 5],
+            "precomputed_target_indices": [2, 6]
+        }),
+    ];
+    std::fs::write(
+        &manifest,
+        rows.iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write manifest");
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    config.model.output_dir = temp.path().join("ttt-partial-packed-stream");
+    config.dataset.kind = burn_jepa::JepaDatasetKind::Manifest;
+    config.dataset.sample_kind = burn_jepa::JepaSampleKind::Video;
+    config.dataset.train_manifest = Some(manifest.clone());
+    config.dataset.eval_manifest = Some(manifest);
+    config.dataset.synthetic_len = 2;
+    config.training.max_steps = 2;
+    config.training.batch_size = 4;
+    config.training.eval_steps = 0;
+    config.training.batching = burn_jepa::TrainingBatchingMode::PackedStreams;
+    config.training.stream.enabled = true;
+    config.training.stream.reset_interval_steps = 0;
+    config.training.sparse_rollout = TttSparseRolloutMode::ContextMask;
+    config.training.mask = Some(burn_jepa::TrainingMaskConfig::ManifestPrecomputedMasks);
+
+    let report =
+        train_ttt_distillation::<AB>(&config, &device).expect("partial packed stream training");
+
+    assert_eq!(report.steps, 2);
+    assert_eq!(
+        report.samples, 2,
+        "actual sample count should reflect partial packed batches"
+    );
+    assert_eq!(report.stream.packed_batches, 2);
+    assert_eq!(report.stream.max_packed_batch_size, 1);
+    assert_eq!(report.stream.active_streams, 1);
+    assert_eq!(report.stream.reset_steps, 1);
+    assert_eq!(report.stream.carried_steps, 1);
+    assert_eq!(report.stream.detached_steps, 2);
+    assert!(report.final_loss.is_finite());
+}
+
+#[test]
+fn ttt_stream_training_rejects_duplicate_stream_rows_in_one_batch() {
+    let device = Default::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let frame_dir = temp.path().join("duplicate-frames");
+    std::fs::create_dir_all(&frame_dir).expect("frame dir");
+    let mut frame_paths = Vec::new();
+    for frame in 0..5 {
+        let path = frame_dir.join(format!("frame-{frame}.png"));
+        image::RgbImage::from_pixel(32, 32, image::Rgb([frame as u8, 0, 0]))
+            .save(&path)
+            .expect("save frame");
+        frame_paths.push(path);
+    }
+    let frames = |start: usize| {
+        frame_paths[start..start + 4]
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    };
+    let manifest = temp.path().join("duplicate-stream-manifest.jsonl");
+    let rows = [
+        serde_json::json!({
+            "clip_id": "a",
+            "domain": "test",
+            "start_frame": 0,
+            "frames": frames(0)
+        }),
+        serde_json::json!({
+            "clip_id": "a",
+            "domain": "test",
+            "start_frame": 1,
+            "frames": frames(1)
+        }),
+    ];
+    std::fs::write(
+        &manifest,
+        rows.iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write manifest");
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    config.model.output_dir = temp.path().join("ttt-duplicate-stream-manifest");
+    config.dataset.kind = burn_jepa::JepaDatasetKind::Manifest;
+    config.dataset.sample_kind = burn_jepa::JepaSampleKind::Video;
+    config.dataset.train_manifest = Some(manifest.clone());
+    config.dataset.eval_manifest = Some(manifest);
+    config.dataset.synthetic_len = 2;
+    config.training.max_steps = 1;
+    config.training.batch_size = 2;
+    config.training.eval_steps = 0;
+    config.training.batching = burn_jepa::TrainingBatchingMode::Sequential;
+    config.training.stream.enabled = true;
+
+    let error = format!(
+        "{:#}",
+        train_ttt_distillation::<AB>(&config, &device)
+            .expect_err("duplicate stream rows should be rejected")
+    );
+    assert!(
+        error.contains("at most one window per stream key"),
+        "unexpected duplicate-stream error: {error}"
+    );
+}
+
+#[test]
+fn ttt_stream_eval_carries_manifest_state_between_windows() {
+    let device = Default::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let frame_dir = temp.path().join("frames");
+    std::fs::create_dir_all(&frame_dir).expect("frame dir");
+    let mut frame_paths = Vec::new();
+    for frame in 0..5 {
+        let path = frame_dir.join(format!("frame-{frame}.png"));
+        let image = image::RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([
+                ((x + frame) % 255) as u8,
+                ((y + frame * 3) % 255) as u8,
+                ((x + y + frame * 7) % 255) as u8,
+            ])
+        });
+        image.save(&path).expect("save frame");
+        frame_paths.push(path);
+    }
+    let frames = |start: usize| {
+        frame_paths[start..start + 4]
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    };
+    let manifest = temp.path().join("stream-eval-manifest.jsonl");
+    let rows = [
+        serde_json::json!({
+            "clip_id": "stream-a",
+            "domain": "test",
+            "start_frame": 0,
+            "frames": frames(0)
+        }),
+        serde_json::json!({
+            "clip_id": "stream-a",
+            "domain": "test",
+            "start_frame": 1,
+            "frames": frames(1)
+        }),
+    ];
+    std::fs::write(
+        &manifest,
+        rows.iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write manifest");
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.output_dir = temp.path().join("ttt-stream-eval");
+    config.model.save_model = true;
+    config.dataset.kind = burn_jepa::JepaDatasetKind::Manifest;
+    config.dataset.sample_kind = burn_jepa::JepaSampleKind::Video;
+    config.dataset.train_manifest = Some(manifest.clone());
+    config.dataset.eval_manifest = Some(manifest);
+    config.dataset.synthetic_len = 2;
+    config.training.max_steps = 1;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 0;
+    config.training.stream.enabled = true;
+    config.training.stream.reset_interval_steps = 0;
+
+    let train = train_ttt_distillation::<AB>(&config, &device).expect("stream eval train");
+    let model_path = train.model_path.expect("saved stream eval model");
+    let eval = evaluate_ttt_model_file::<AB>(&config, model_path, &device, 2).expect("stream eval");
+
+    assert!(eval.stream.enabled);
+    assert_eq!(eval.stream.reset_steps, 1);
+    assert_eq!(eval.stream.carried_steps, 1);
+    assert_eq!(eval.stream.detached_steps, 2);
+    assert_eq!(eval.stream.optimizer_steps, None);
+    assert!(eval.loss.is_finite());
+}
+
+#[test]
+fn ttt_stream_manifest_training_requires_identity_metadata() {
+    let device = Default::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let frame_dir = temp.path().join("frames");
+    std::fs::create_dir_all(&frame_dir).expect("frame dir");
+    let mut frame_paths = Vec::new();
+    for frame in 0..4 {
+        let path = frame_dir.join(format!("frame-{frame}.png"));
+        image::RgbImage::from_pixel(32, 32, image::Rgb([frame as u8, 0, 0]))
+            .save(&path)
+            .expect("save frame");
+        frame_paths.push(path.to_string_lossy().to_string());
+    }
+    let manifest = temp.path().join("missing-stream-metadata.jsonl");
+    std::fs::write(
+        &manifest,
+        serde_json::json!({
+            "frames": frame_paths
+        })
+        .to_string(),
+    )
+    .expect("write manifest");
+
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.output_dir = temp.path().join("ttt-stream-missing-metadata");
+    config.model.save_model = false;
+    config.dataset.kind = burn_jepa::JepaDatasetKind::Manifest;
+    config.dataset.sample_kind = burn_jepa::JepaSampleKind::Video;
+    config.dataset.train_manifest = Some(manifest.clone());
+    config.dataset.eval_manifest = Some(manifest);
+    config.training.max_steps = 1;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 0;
+    config.training.stream.enabled = true;
+
+    let error = format!(
+        "{:#}",
+        train_ttt_distillation::<AB>(&config, &device)
+            .expect_err("stream manifest should require identity metadata")
+    );
+    assert!(
+        error.contains("requires clip_id or source metadata"),
+        "unexpected stream metadata validation error: {error}"
+    );
+}
+
+#[test]
+fn ttt_predictor_layers_train_with_predictor_loss_smoke() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-predictor-train");
+    config.model.save_model = false;
+    config.training.max_steps = 2;
+    config.training.batch_size = 2;
+    config.training.eval_steps = 1;
+    config.training.mask = Some(burn_jepa::TrainingMaskConfig::PrecomputedMasks {
+        context_indices: vec![0, 2, 5, 7],
+        target_indices: vec![1, 3],
+    });
+    config.loss.feature_loss_weight = 0.0;
+    config.loss.predictor_loss_weight = 0.25;
+    config.ttt.layer_placement = TttLayerPlacement::Explicit;
+    config.ttt.layers.clear();
+    config.ttt.predictor_layers = vec![0];
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("predictor TTT smoke");
+    assert_eq!(report.memory.layers, Vec::<usize>::new());
+    assert_eq!(report.memory.predictor_layers, vec![0]);
+    assert!(report.initial_loss.is_finite());
+    assert!(report.final_loss.is_finite());
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
+    assert!(report.eval_feature_loss.is_some_and(f64::is_finite));
+    assert!(report.eval_predictor_loss.is_some_and(f64::is_finite));
 }
 
 #[test]

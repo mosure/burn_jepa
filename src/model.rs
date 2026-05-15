@@ -1575,7 +1575,7 @@ fn inverse_permutation(order: &[usize]) -> Vec<usize> {
     inverse
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 mod tests {
     use super::*;
     use crate::make_context_target_masks;

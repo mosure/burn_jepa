@@ -1,9 +1,10 @@
 use super::config::{TttBackpropMode, TttEncoderConfig};
 use super::encoder::VJepaTttEncoder;
+use super::layer::VJepaTttLayer;
 use super::state::TttState;
 use crate::{
     SparseMaskBatch, SparsePredictorPlan, SparseTokenMask, SparseVJepaForwardOutput, VJepa2_1Model,
-    VJepaConfig, VJepaEncoderOutput, VJepaPredictor,
+    VJepaConfig, VJepaEncoderOutput, VJepaPredictor, VJepaPredictorOutput, apply_token_mask,
 };
 use anyhow::Result;
 use burn::module::Module;
@@ -14,8 +15,11 @@ use burn::tensor::backend::Backend;
 pub struct VJepaTttModel<B: Backend> {
     pub encoder: VJepaTttEncoder<B>,
     pub predictor: VJepaPredictor<B>,
+    pub predictor_ttt_layers: Option<Vec<VJepaTttLayer<B>>>,
     #[module(skip)]
     config: VJepaConfig,
+    #[module(skip)]
+    predictor_layer_indices: Vec<usize>,
 }
 
 impl<B: Backend> VJepaTttModel<B> {
@@ -30,11 +34,18 @@ impl<B: Backend> VJepaTttModel<B> {
         } else {
             model
         };
+        let predictor_layer_indices = ttt_config.resolved_predictor_layers(&model_config);
+        let predictor_ttt_layers = predictor_layer_indices
+            .iter()
+            .map(|_| VJepaTttLayer::new(model_config.predictor.embed_dim, &ttt_config, device))
+            .collect();
         let encoder = VJepaTttEncoder::new(model.encoder, &model_config, ttt_config, device)?;
         Ok(Self {
             encoder,
             predictor: model.predictor,
+            predictor_ttt_layers: Some(predictor_ttt_layers),
             config: model_config,
+            predictor_layer_indices,
         })
     }
 
@@ -44,6 +55,14 @@ impl<B: Backend> VJepaTttModel<B> {
 
     pub fn fresh_state(&self) -> TttState<B> {
         self.encoder.fresh_state()
+    }
+
+    pub fn predictor_ttt_layer_indices(&self) -> &[usize] {
+        &self.predictor_layer_indices
+    }
+
+    fn predictor_ttt_layers(&self) -> &[VJepaTttLayer<B>] {
+        self.predictor_ttt_layers.as_deref().unwrap_or_default()
     }
 
     pub fn set_backprop_mode(&mut self, mode: TttBackpropMode) {
@@ -109,12 +128,129 @@ impl<B: Backend> VJepaTttModel<B> {
             &context.tokens.device(),
         )?;
         let predictor =
-            self.predictor
-                .forward_sparse_with_plan(context.tokens.clone(), &plan, 0)?;
+            self.forward_predictor_sparse_with_plan(context.tokens.clone(), &plan, 0)?;
         Ok(SparseVJepaForwardOutput {
             context,
             target,
             predictor,
+        })
+    }
+
+    pub fn forward_predictor_sparse(
+        &self,
+        context_tokens: Tensor<B, 3>,
+        context_mask: &SparseTokenMask,
+        target_mask: &SparseTokenMask,
+        grid: crate::TokenGridShape,
+        mask_index: usize,
+    ) -> Result<VJepaPredictorOutput<B>> {
+        if self.predictor_ttt_layers().is_empty() {
+            return self.predictor.forward_sparse(
+                context_tokens,
+                context_mask,
+                target_mask,
+                grid,
+                mask_index,
+            );
+        }
+        let batch = context_tokens.shape().dims::<3>()[0];
+        let device = context_tokens.device();
+        let plan = SparsePredictorPlan::new(
+            &self.config,
+            context_mask.clone(),
+            target_mask.clone(),
+            grid,
+            batch,
+            &device,
+        )?;
+        self.forward_predictor_sparse_with_plan(context_tokens, &plan, mask_index)
+    }
+
+    pub fn forward_predictor_sparse_with_plan(
+        &self,
+        context_tokens: Tensor<B, 3>,
+        plan: &SparsePredictorPlan<B>,
+        mask_index: usize,
+    ) -> Result<VJepaPredictorOutput<B>> {
+        let predictor_ttt_layers = self.predictor_ttt_layers();
+        if predictor_ttt_layers.is_empty() {
+            return self
+                .predictor
+                .forward_sparse_with_plan(context_tokens, plan, mask_index);
+        }
+        let context_mask = &plan.context_mask;
+        let target_mask = &plan.target_mask;
+        let [batch, context_len, _encoder_dim] = context_tokens.shape().dims::<3>();
+        anyhow::ensure!(
+            batch == plan.batch,
+            "context token batch does not match sparse predictor plan"
+        );
+        anyhow::ensure!(
+            context_len == context_mask.len(),
+            "context token shape does not match context mask"
+        );
+        let mut context = self.predictor.predictor_embed.forward(context_tokens);
+        if let Some(position_embed) = &plan.context_position_embed {
+            context = context + position_embed.clone();
+        }
+
+        let target_len = target_mask.len();
+        let token = self.predictor.mask_tokens[mask_index % self.predictor.mask_tokens.len()]
+            .val()
+            .reshape([1, 1, self.config.predictor.embed_dim])
+            .repeat_dim(0, batch)
+            .repeat_dim(1, target_len);
+        let target = if let Some(position_embed) = &plan.target_position_embed {
+            token + position_embed.clone()
+        } else {
+            token
+        };
+        let mut sequence = Tensor::cat(vec![context, target], 1);
+        sequence = apply_token_mask(sequence, plan.sort_order.clone());
+        if self.config.predictor.modality_embedding {
+            let token_count = context_len + target_len;
+            let embed = self
+                .predictor
+                .video_mod_embed
+                .val()
+                .reshape([1, 1, self.config.predictor.embed_dim])
+                .repeat_dim(0, batch)
+                .repeat_dim(1, token_count);
+            sequence = sequence + embed;
+        }
+
+        let mut state = TttState::new(predictor_ttt_layers.len());
+        for (layer_index, block) in self.predictor.blocks.iter().enumerate() {
+            sequence = block.forward(sequence, Some(&plan.positions));
+            if let Ok(ttt_index) = self.predictor_layer_indices.binary_search(&layer_index) {
+                sequence = predictor_ttt_layers[ttt_index].forward_with_options(
+                    sequence,
+                    None,
+                    &mut state.layers[ttt_index],
+                    true,
+                );
+            }
+        }
+        sequence = self.predictor.norm.forward(sequence);
+        sequence = apply_token_mask(sequence, plan.reverse_order.clone());
+        let context_predictions = self.config.predictor.return_all_tokens.then(|| {
+            let context = sequence.clone().slice_dim(1, 0..context_len);
+            self.predictor
+                .context_proj
+                .as_ref()
+                .expect("context projection")
+                .forward(context)
+        });
+        let target_predictions = self.predictor.target_proj.forward(
+            sequence
+                .clone()
+                .slice_dim(1, context_len..context_len + target_len),
+        );
+        Ok(VJepaPredictorOutput {
+            target_predictions,
+            context_predictions,
+            sequence_tokens: sequence,
+            sequence_indices: plan.sequence_indices.clone(),
         })
     }
 }

@@ -15,6 +15,12 @@ pub struct TttDistillationLoss<B: Backend> {
     pub teacher_tokens: Tensor<B, 3>,
 }
 
+pub(super) struct TttLossBreakdown<B: Backend> {
+    pub total: Tensor<B, 1>,
+    pub feature: Tensor<B, 1>,
+    pub predictor: Option<Tensor<B, 1>>,
+}
+
 pub fn evaluate_ttt_distillation<B: Backend>(
     student: &VJepaTttModel<B>,
     teacher: &VJepa2_1Model<B>,
@@ -44,7 +50,35 @@ pub(super) fn training_loss<B: Backend>(
     batch_size: usize,
     device: &B::Device,
     supervision: crate::TttSupervisionMode,
+    predictor_target_tokens: Option<Tensor<B, 3>>,
 ) -> Result<Tensor<B, 1>> {
+    Ok(training_loss_breakdown(
+        model,
+        config,
+        student,
+        teacher,
+        masks,
+        rollout,
+        batch_size,
+        device,
+        supervision,
+        predictor_target_tokens,
+    )?
+    .total)
+}
+
+pub(super) fn training_loss_breakdown<B: Backend>(
+    model: &VJepaTttModel<B>,
+    config: &BurnJepaTrainConfig,
+    student: &crate::VJepaEncoderOutput<B>,
+    teacher: &TeacherTokenTargets<B>,
+    masks: Option<&ResolvedTttMasks<B>>,
+    rollout: TttRolloutKind,
+    batch_size: usize,
+    device: &B::Device,
+    supervision: crate::TttSupervisionMode,
+    predictor_target_tokens: Option<Tensor<B, 3>>,
+) -> Result<TttLossBreakdown<B>> {
     let primary_mask = masks.map(|masks| match rollout {
         TttRolloutKind::Dense | TttRolloutKind::SparseTarget => &masks.target,
         TttRolloutKind::SparseContext => &masks.context,
@@ -72,7 +106,7 @@ pub(super) fn training_loss<B: Backend>(
             device,
         )?,
     };
-    if config.loss.predictor_loss_weight > 0.0
+    let predictor = if config.loss.predictor_loss_weight > 0.0
         && let Some(masks) = masks
     {
         let context_mask = masks
@@ -83,23 +117,45 @@ pub(super) fn training_loss<B: Backend>(
             .target
             .uniform_mask()
             .context("predictor loss currently requires a uniform target mask")?;
-        let context_tokens = apply_mask_batch(student.tokens.clone(), &masks.context);
-        let target_tokens = apply_mask_batch(teacher.final_tokens.clone(), &masks.target);
-        let predictions = model.predictor.forward_sparse(
+        let context_tokens = match rollout {
+            TttRolloutKind::SparseContext => student.tokens.clone(),
+            TttRolloutKind::Dense | TttRolloutKind::SparseTarget => {
+                apply_mask_batch(student.tokens.clone(), &masks.context)
+            }
+        };
+        let target_tokens = predictor_target_tokens
+            .unwrap_or_else(|| apply_mask_batch(teacher.final_tokens.clone(), &masks.target));
+        let predictions = model.forward_predictor_sparse(
             context_tokens,
             context_mask,
             target_mask,
             student.grid,
             0,
         )?;
-        Ok(feature_loss
-            + (predictions.target_predictions - target_tokens)
+        ensure!(
+            predictions.target_predictions.shape().dims::<3>() == target_tokens.shape().dims::<3>(),
+            "predictor loss target shape {:?} does not match predictor output {:?}",
+            target_tokens.shape().dims::<3>(),
+            predictions.target_predictions.shape().dims::<3>()
+        );
+        Some(
+            (predictions.target_predictions - target_tokens)
                 .powf_scalar(2.0)
                 .mean()
-                .mul_scalar(config.loss.predictor_loss_weight as f64))
+                .mul_scalar(config.loss.predictor_loss_weight as f64),
+        )
     } else {
-        Ok(feature_loss)
-    }
+        None
+    };
+    let total = match predictor.clone() {
+        Some(predictor) => feature_loss.clone() + predictor,
+        None => feature_loss.clone(),
+    };
+    Ok(TttLossBreakdown {
+        total,
+        feature: feature_loss,
+        predictor,
+    })
 }
 
 fn layer_local_feature_loss<B: Backend>(
@@ -221,7 +277,7 @@ pub(super) fn primary_cosine<B: Backend>(
     }
 }
 
-fn align_primary_tokens<B: Backend>(
+pub(super) fn align_primary_tokens<B: Backend>(
     student_tokens: Tensor<B, 3>,
     teacher_tokens: Tensor<B, 3>,
     target_mask: Option<&SparseMaskBatch<B>>,

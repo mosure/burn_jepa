@@ -283,7 +283,7 @@ pub fn ensure_model_sized_video(shape: VJepaVideoShape, config: &VJepaConfig) ->
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 mod tests {
     use super::*;
 

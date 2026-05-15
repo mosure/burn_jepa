@@ -1,0 +1,97 @@
+name = "vjepa21-production-autogaze-mask-data"
+output_dir = "target/burn-jepa-production-final/data-prep"
+require_real_checkpoint = true
+require_real_dataset = true
+seeds = [0]
+densities = [0.2]
+target_density = 0.05
+model_variants = ["single_frame_no_ttt"]
+mask_policies = ["precomputed_masks"]
+
+[[ttt_layer_sets]]
+name = "encoder_thirds"
+encoder_layers = [3, 7, 11]
+predictor_layers = []
+
+[base.model]
+checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
+teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
+config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
+weights_name = "model.pt"
+output_dir = "target/burn-jepa-production-final/trial"
+save_model = false
+
+[base.dataset]
+kind = "manifest"
+sample_kind = "video"
+train_manifest = "target/burn-jepa-production-final/data/train-real-autogaze.jsonl"
+eval_manifest = "target/burn-jepa-production-final/data/eval-real-autogaze.jsonl"
+frames = 16
+stride = 1
+image_size = 224
+synthetic_len = 1
+
+[base.ttt]
+layer_placement = "explicit"
+layers = [3, 7, 11]
+predictor_layers = []
+chunk_tokens = 196
+ttt_lr = 0.003
+use_projection = true
+conv_kernel = 3
+memory_update = "self_hidden"
+supervision = "final_teacher"
+hybrid_final_steps = 1
+rollout_blocks = 2
+backprop_mode = "final_feature"
+backprop_truncate_blocks = 1
+freeze_pretrained = true
+
+[base.training]
+backend = "cuda"
+batch_size = 1
+max_steps = 1
+learning_rate = 0.0
+weight_decay = 0.0
+context_keep_ratio = 0.75
+sparse_rollout = "context_mask"
+sparse_patchify_training = "frozen_sparse_patchify"
+batching = "fixed_width_masks"
+loss_trace_interval = 1
+eval_steps = 1
+eval_batch_size = 16
+eval_full_grid = false
+eval_utilization_diagnostics = false
+eval_temporal_diagnostics = false
+cache_teacher_tokens = true
+save_steps = 0
+
+[base.training.lr_schedule]
+kind = "constant"
+
+[base.training.mask]
+kind = "manifest_precomputed_masks"
+
+[base.loss]
+feature_loss_weight = 1.0
+predictor_loss_weight = 0.0
+
+[data]
+input = "target/burn-jepa-production-ttt-large/data/frames"
+output_dir = "target/burn-jepa-production-final/data"
+train_manifest = "target/burn-jepa-production-final/data/train-real-autogaze.jsonl"
+eval_manifest = "target/burn-jepa-production-final/data/eval-real-autogaze.jsonl"
+domain_from_clip_prefix = true
+eval_ratio = 0.2
+window_frames = 16
+window_stride = 8
+extract_videos = false
+
+[data.autogaze_masks]
+checkpoint_dir = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a"
+backend = "cuda"
+streaming = true
+context_density = 0.2
+target_density = 0.05
+top_k_overfetch = 1.0
+dilation = 0

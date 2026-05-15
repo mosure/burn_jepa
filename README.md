@@ -182,7 +182,10 @@ teacher-forced diagnostics. `ttt.supervision` controls the loss objective:
 `"final_teacher"` matches final 3D teacher tokens, `"layer_local_teacher"`
 matches same-depth teacher features at each TTT insertion point, and `"hybrid"`
 runs layer-local training until the last `ttt.hybrid_final_steps`, then
-finetunes against the final teacher.
+finetunes against the final teacher. `ttt.predictor_layers` is also available
+for opt-in auxiliary predictor-head ablations, but the default production path
+keeps TTT in the encoder because predictor adapters do not change deployed
+encoder features.
 Training/eval reports keep deployable student inference separate from
 teacher-forced diagnostics: `eval_loss`/`eval_cosine` are free-run metrics,
 while `teacher_forced_eval_*` and `teacher_forcing_*_gap` quantify privileged
@@ -220,6 +223,9 @@ For GPU-resident sparse training, prefer `autogaze_sparse` or
 host-scored heuristic. Manifest-precomputed masks are per window; set
 `training.batching = "group_uniform_masks"` for identical masks or
 `training.batching = "fixed_width_masks"` for equal-width per-sample masks.
+For long-form TBPTT over multiple videos, set
+`training.batching = "packed_streams"` so each batch row owns an independent
+carried TTT state keyed by manifest `clip_id`/`source`.
 Variable-width ragged masks are accepted in TTT training/eval. The rollout
 groups samples by per-tubelet token-count shape, runs exact-token
 encoder/sparse-patchify calls per bucket, and pads only the returned tensors so
@@ -332,6 +338,25 @@ The TTT rollout benchmark measures the same single-frame recurrent path used by
 cargo bench --bench ttt_training -- --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 
+Burn 0.21 backend lanes are feature-gated independently. The crate keeps Burn
+fusion enabled for GPU-capable backends. Use `flex` for the new portable CPU
+backend, and `dispatch` with one or more concrete backend features to measure
+Burn's runtime backend switch:
+
+```sh
+cargo bench --bench ttt_training \
+  --no-default-features --features flex \
+  -- ttt_training_step_flex/dense_b1 --sample-size 10 --measurement-time 1 --warm-up-time 0.2
+
+cargo bench --bench ttt_training \
+  --no-default-features --features dispatch,flex \
+  -- ttt_training_step_dispatch_flex/dense_b1 --sample-size 10 --measurement-time 1 --warm-up-time 0.2
+
+cargo bench --bench ttt_training \
+  --no-default-features --features dispatch,webgpu \
+  -- ttt_training_step_dispatch_wgpu/dense_b1 --sample-size 10 --measurement-time 1 --warm-up-time 0.2
+```
+
 The `ttt_sparsity_training_step_*` Criterion groups are the training-step
 sparsity matrix. They sweep 10%, 50%, and 100% sparse token input, plus the
 normal dense 100% baseline, and each sample includes student rollout, loss,
@@ -422,14 +447,18 @@ cargo test --test numerical_parity real_vjepa_checkpoint_loads_when_fixture_is_s
 ```
 
 Set `BURN_JEPA_VJEPA21_FORWARD_SMOKE=1` to also run a sparse forward smoke after
-loading. Set `BURN_JEPA_VJEPA21_FORWARD_PARITY=1` to compare a one-token
-real-checkpoint micro forward against the installed Hugging Face `VJEPA2Model`
-for HF-compatible fixtures or against the official `facebookresearch/vjepa2`
-torch.hub V-JEPA 2.1 entrypoints for Meta `.pt` fixtures. Official `.pt`
-checkpoints store singleton modality and mask-token tensors in a rank that
+loading. Set `BURN_JEPA_VJEPA21_FORWARD_PARITY=1` to compare real-checkpoint
+forwards against the installed Hugging Face `VJEPA2Model` for HF-compatible
+fixtures or against the official `facebookresearch/vjepa2` torch.hub V-JEPA 2.1
+entrypoints for Meta `.pt` fixtures. The torch.hub fixture now checks both a
+small sparse 2x2 case and a multi-tubelet 3x4 grid case, including official
+masked-encoder context tokens, predictor targets, and predictor outputs.
+Official `.pt` checkpoints store singleton modality tensors in a rank that
 differs from this crate's persisted Burn layout; the loader reshapes the
-encoder/predictor modality embeddings into the Burn module layout and leaves
-zero-initialized predictor mask tokens at their Burn initialization.
+encoder/predictor modality embeddings into the Burn module layout and keeps the
+extra Burn predictor mask-token slots at their zero initialization when the
+upstream checkpoint does not provide them. Hugging Face safetensors fixtures
+slice and load the combined predictor mask-token tensor.
 CUDA pipeline throughput is exposed by the benchmark harness, but it requires a
 CUDA-capable device at runtime.
 Set `BURN_JEPA_RUN_CUDA_SPARSE_PATCHIFY=1` to run the opt-in CUDA sparse

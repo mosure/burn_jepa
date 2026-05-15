@@ -230,6 +230,55 @@ fn ttt_training_benchmark_has_sparse_density_training_step_matrix() {
         compact.contains("sparse_optim.step(") && compact.contains("dense_optim.step("),
         "matrix should include optimizer updates for sparse and dense rows"
     );
+    assert!(
+        bench.contains("TBPTT_STREAM_CASES"),
+        "TTT benches should expose a TBPTT/reset/decay sweep"
+    );
+    assert!(bench.contains("tbptt_carry4_decay0_97"));
+    assert!(bench.contains("tbptt_carry4_decay0_90"));
+    assert!(
+        bench.contains("ttt_training_step_matrix_flex")
+            && bench.contains("ttt_sparsity_training_step_matrix_flex"),
+        "TTT Criterion benches should include Burn 0.21 flex backend lanes"
+    );
+    assert!(
+        bench.contains("ttt_training_step_matrix_dispatch_flex")
+            && bench.contains("ttt_training_step_matrix_dispatch_wgpu")
+            && bench.contains("ttt_training_step_matrix_dispatch_cuda"),
+        "TTT Criterion benches should include Burn 0.21 dispatch backend lanes"
+    );
+    assert!(
+        compact.contains("DispatchDevice::autodiff("),
+        "dispatch benches should select concrete runtime devices through DispatchDevice"
+    );
+    assert!(
+        bench.contains("for batch_size in [1usize, 4]"),
+        "TBPTT bench should sweep single-stream and packed multi-stream batches"
+    );
+    assert!(
+        bench.contains("ttt_tbptt_training_step_"),
+        "Criterion benches should include a TBPTT training-step group"
+    );
+    assert!(
+        compact.contains("state.detach();") && compact.contains("state.decay(case.state_decay);"),
+        "TBPTT bench should include detach and decay overhead in the measured step"
+    );
+}
+
+#[test]
+fn cargo_features_expose_burn_021_flex_and_dispatch_lanes() {
+    let manifest = include_str!("../Cargo.toml");
+
+    assert!(manifest.contains("flex = [\"burn/flex\"]"));
+    assert!(manifest.contains("dispatch = [\"burn/dispatch\"]"));
+    assert!(
+        manifest.contains("features = [\"autodiff\", \"fusion\", \"std\"]"),
+        "Burn dependency should keep fusion enabled for GPU/backend benches"
+    );
+    assert!(
+        manifest.contains("required-features = [\"ndarray\"]"),
+        "ndarray-only benches should stay feature-gated so flex/dispatch bench builds are narrow"
+    );
 }
 
 #[test]

@@ -6,6 +6,8 @@ use crate::{
     evaluate_ttt_model_file, prepare_experiment_data, run_experiment, train_dense_jepa,
     train_ttt_distillation, write_experiment_plan,
 };
+#[cfg(feature = "dispatch")]
+use crate::{JepaDispatchBackend, TrainingLoopConfig};
 use anyhow::{Result, bail};
 use burn::tensor::backend::AutodiffBackend;
 use clap::{Parser, Subcommand};
@@ -53,6 +55,10 @@ pub enum BurnJepaCommand {
         config: PathBuf,
         #[arg(long)]
         steps: Option<usize>,
+        #[arg(long)]
+        eval_steps: Option<usize>,
+        #[arg(long)]
+        eval_batch_size: Option<usize>,
     },
     PrintConfig,
     PrintExperimentConfig,
@@ -121,10 +127,23 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             let report = dispatch_dense(&config)?;
             print_json(&report)
         }
-        BurnJepaCommand::BenchTtt { config, steps } => {
+        BurnJepaCommand::BenchTtt {
+            config,
+            steps,
+            eval_steps,
+            eval_batch_size,
+        } => {
             let mut config = BurnJepaTrainConfig::from_toml_file(config)?;
             if let Some(steps) = steps {
                 config.training.max_steps = steps;
+                config.training.lr_schedule =
+                    config.training.lr_schedule.clamped_to_max_steps(steps);
+            }
+            if let Some(eval_steps) = eval_steps {
+                config.training.eval_steps = eval_steps;
+            }
+            if let Some(eval_batch_size) = eval_batch_size {
+                config.training.eval_batch_size = Some(eval_batch_size);
             }
             config.model.save_model = false;
             let report = dispatch_ttt(&config)?;
@@ -177,6 +196,19 @@ fn dispatch_experiment(config: &ExperimentConfig) -> Result<ExperimentRunReport>
                 bail!("ndarray backend requested but the ndarray feature is not enabled")
             }
         }
+        JepaTrainBackend::Flex => {
+            #[cfg(feature = "flex")]
+            {
+                let device = Default::default();
+                run_experiment::<burn::backend::Autodiff<burn::backend::Flex<f32, i32>>>(
+                    config, &device,
+                )
+            }
+            #[cfg(not(feature = "flex"))]
+            {
+                bail!("flex backend requested but the flex feature is not enabled")
+            }
+        }
         JepaTrainBackend::Cuda => {
             #[cfg(feature = "cuda")]
             {
@@ -224,6 +256,17 @@ fn dispatch_experiment(config: &ExperimentConfig) -> Result<ExperimentRunReport>
                 bail!("webgpu backend requested but the webgpu feature is not enabled")
             }
         }
+        JepaTrainBackend::Dispatch => {
+            #[cfg(feature = "dispatch")]
+            {
+                let device = dispatch_autodiff_device(&config.base.training)?;
+                run_experiment::<burn::Dispatch>(config, &device)
+            }
+            #[cfg(not(feature = "dispatch"))]
+            {
+                bail!("dispatch backend requested but the dispatch feature is not enabled")
+            }
+        }
     }
 }
 
@@ -237,6 +280,16 @@ fn dispatch_ttt(config: &BurnJepaTrainConfig) -> Result<TttTrainingReport> {
             #[cfg(not(feature = "ndarray"))]
             {
                 bail!("ndarray backend requested but the ndarray feature is not enabled")
+            }
+        }
+        JepaTrainBackend::Flex => {
+            #[cfg(feature = "flex")]
+            {
+                run_ttt::<burn::backend::Autodiff<burn::backend::Flex<f32, i32>>>(config)
+            }
+            #[cfg(not(feature = "flex"))]
+            {
+                bail!("flex backend requested but the flex feature is not enabled")
             }
         }
         JepaTrainBackend::Cuda => {
@@ -277,6 +330,17 @@ fn dispatch_ttt(config: &BurnJepaTrainConfig) -> Result<TttTrainingReport> {
                 bail!("webgpu backend requested but the webgpu feature is not enabled")
             }
         }
+        JepaTrainBackend::Dispatch => {
+            #[cfg(feature = "dispatch")]
+            {
+                let device = dispatch_autodiff_device(&config.training)?;
+                train_ttt_distillation::<burn::Dispatch>(config, &device)
+            }
+            #[cfg(not(feature = "dispatch"))]
+            {
+                bail!("dispatch backend requested but the dispatch feature is not enabled")
+            }
+        }
     }
 }
 
@@ -296,6 +360,18 @@ fn dispatch_ttt_eval(
             #[cfg(not(feature = "ndarray"))]
             {
                 bail!("ndarray backend requested but the ndarray feature is not enabled")
+            }
+        }
+        JepaTrainBackend::Flex => {
+            #[cfg(feature = "flex")]
+            {
+                run_ttt_eval::<burn::backend::Autodiff<burn::backend::Flex<f32, i32>>>(
+                    config, model, steps,
+                )
+            }
+            #[cfg(not(feature = "flex"))]
+            {
+                bail!("flex backend requested but the flex feature is not enabled")
             }
         }
         JepaTrainBackend::Cuda => {
@@ -342,6 +418,17 @@ fn dispatch_ttt_eval(
                 bail!("webgpu backend requested but the webgpu feature is not enabled")
             }
         }
+        JepaTrainBackend::Dispatch => {
+            #[cfg(feature = "dispatch")]
+            {
+                let device = dispatch_autodiff_device(&config.training)?;
+                evaluate_ttt_model_file::<burn::Dispatch>(config, model, &device, steps)
+            }
+            #[cfg(not(feature = "dispatch"))]
+            {
+                bail!("dispatch backend requested but the dispatch feature is not enabled")
+            }
+        }
     }
 }
 
@@ -355,6 +442,16 @@ fn dispatch_dense(config: &BurnJepaTrainConfig) -> Result<DenseJepaTrainingRepor
             #[cfg(not(feature = "ndarray"))]
             {
                 bail!("ndarray backend requested but the ndarray feature is not enabled")
+            }
+        }
+        JepaTrainBackend::Flex => {
+            #[cfg(feature = "flex")]
+            {
+                run_dense::<burn::backend::Autodiff<burn::backend::Flex<f32, i32>>>(config)
+            }
+            #[cfg(not(feature = "flex"))]
+            {
+                bail!("flex backend requested but the flex feature is not enabled")
             }
         }
         JepaTrainBackend::Cuda => {
@@ -389,7 +486,108 @@ fn dispatch_dense(config: &BurnJepaTrainConfig) -> Result<DenseJepaTrainingRepor
                 bail!("webgpu backend requested but the webgpu feature is not enabled")
             }
         }
+        JepaTrainBackend::Dispatch => {
+            #[cfg(feature = "dispatch")]
+            {
+                let device = dispatch_autodiff_device(&config.training)?;
+                train_dense_jepa::<burn::Dispatch>(config, &device)
+            }
+            #[cfg(not(feature = "dispatch"))]
+            {
+                bail!("dispatch backend requested but the dispatch feature is not enabled")
+            }
+        }
     }
+}
+
+#[cfg(feature = "dispatch")]
+fn dispatch_autodiff_device(training: &TrainingLoopConfig) -> Result<burn::DispatchDevice> {
+    Ok(burn::DispatchDevice::autodiff(dispatch_inner_device(
+        training.dispatch_backend,
+    )?))
+}
+
+#[cfg(feature = "dispatch")]
+fn dispatch_inner_device(target: JepaDispatchBackend) -> Result<burn::DispatchDevice> {
+    match target {
+        JepaDispatchBackend::Auto => dispatch_auto_device(),
+        JepaDispatchBackend::NdArray => {
+            #[cfg(feature = "ndarray")]
+            {
+                Ok(burn::DispatchDevice::NdArray(Default::default()))
+            }
+            #[cfg(not(feature = "ndarray"))]
+            {
+                bail!("dispatch ndarray requested but the ndarray feature is not enabled")
+            }
+        }
+        JepaDispatchBackend::Flex => {
+            #[cfg(feature = "flex")]
+            {
+                Ok(burn::DispatchDevice::Flex(Default::default()))
+            }
+            #[cfg(not(feature = "flex"))]
+            {
+                bail!("dispatch flex requested but the flex feature is not enabled")
+            }
+        }
+        JepaDispatchBackend::Wgpu | JepaDispatchBackend::WebGpu => {
+            #[cfg(any(feature = "wgpu", feature = "webgpu"))]
+            {
+                Ok(burn::DispatchDevice::Wgpu(Default::default()))
+            }
+            #[cfg(not(any(feature = "wgpu", feature = "webgpu")))]
+            {
+                bail!("dispatch wgpu requested but neither the wgpu nor webgpu feature is enabled")
+            }
+        }
+        JepaDispatchBackend::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                cuda_runtime_preflight(CUDA_TRAIN_FORCE_ENV)
+                    .map_err(|reason| anyhow::anyhow!("cuda backend unavailable: {reason}"))?;
+                Ok(burn::DispatchDevice::Cuda(Default::default()))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                bail!("dispatch cuda requested but the cuda feature is not enabled")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dispatch")]
+fn dispatch_auto_device() -> Result<burn::DispatchDevice> {
+    let mut device = None;
+    #[cfg(feature = "cuda")]
+    {
+        if cuda_runtime_preflight(CUDA_TRAIN_FORCE_ENV).is_ok() {
+            device = Some(burn::DispatchDevice::Cuda(Default::default()));
+        }
+    }
+    #[cfg(any(feature = "wgpu", feature = "webgpu"))]
+    {
+        if device.is_none() {
+            device = Some(burn::DispatchDevice::Wgpu(Default::default()));
+        }
+    }
+    #[cfg(feature = "flex")]
+    {
+        if device.is_none() {
+            device = Some(burn::DispatchDevice::Flex(Default::default()));
+        }
+    }
+    #[cfg(feature = "ndarray")]
+    {
+        if device.is_none() {
+            device = Some(burn::DispatchDevice::NdArray(Default::default()));
+        }
+    }
+    device.ok_or_else(|| {
+        anyhow::anyhow!(
+            "dispatch backend requested but no concrete dispatch backend feature is enabled"
+        )
+    })
 }
 
 fn run_ttt<B: crate::TttSparsePatchifyTrainingBackend>(

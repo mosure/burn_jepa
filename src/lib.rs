@@ -89,15 +89,18 @@ pub use tokens::{
     repeat_token_indices, target_mask_from_context,
 };
 pub use training::{
-    BurnJepaTrainConfig, DenseJepaTrainingReport, DensePredictiveLoss, JepaTrainBackend,
-    TrainModelConfig, TrainingAutogazeTokenSource, TrainingBatchingMode, TrainingImageTokenGrid,
-    TrainingLoopConfig, TrainingMaskConfig, TttBackpropMetrics, TttDistillationConfig,
-    TttDistillationLoss, TttDomainEvalMetric, TttEvalReport, TttLayerUtilizationMetric,
-    TttRolloutMetrics, TttRolloutReportMode, TttSparsePatchifyTrainingBackend,
-    TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttTargetSupervisionMetrics,
-    TttTemporalDiagnosticMetrics, TttTrainingReport, TttUtilizationMetrics, VJepaTrainingBatch,
-    center_prior_frame_tokens, dense_predictive_loss, evaluate_ttt_distillation,
-    evaluate_ttt_model_file, train_dense_jepa, train_ttt_distillation,
+    BurnJepaTrainConfig, DenseJepaTrainingReport, DensePredictiveLoss, JepaDispatchBackend,
+    JepaTrainBackend, LearningRateScheduleConfig, LearningRateScheduleStats, TrainModelConfig,
+    TrainingAutogazeTokenSource, TrainingBatchingMode, TrainingImageTokenGrid, TrainingLoopConfig,
+    TrainingMaskConfig, TttBackpropMetrics, TttDistillationConfig, TttDistillationLoss,
+    TttDomainEvalMetric, TttEvalReport, TttLayerUtilizationMetric, TttRolloutMetrics,
+    TttRolloutReportMode, TttSequenceCurriculumConfig, TttSparsePatchifyTrainingBackend,
+    TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttStreamStepKind,
+    TttStreamTrainingConfig, TttStreamTrainingMetrics, TttTargetSupervisionMetrics,
+    TttTemporalDiagnosticMetrics, TttTemporalSegmentMetric, TttTemporalSegmentMetrics,
+    TttTrainingReport, TttUtilizationMetrics, VJepaTrainingBatch, center_prior_frame_tokens,
+    dense_predictive_loss, evaluate_ttt_distillation, evaluate_ttt_model_file, train_dense_jepa,
+    train_ttt_distillation,
 };
 pub use ttt::{
     TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttMemoryUpdateSource,
@@ -112,6 +115,18 @@ pub type NdArrayVJepaModel = VJepa2_1Model<burn::backend::NdArray<f32>>;
 
 #[cfg(feature = "ndarray")]
 pub type NdArrayVJepaPipeline = VJepaPipeline<burn::backend::NdArray<f32>>;
+
+#[cfg(feature = "flex")]
+pub type FlexVJepaModel = VJepa2_1Model<burn::backend::Flex<f32, i32>>;
+
+#[cfg(feature = "flex")]
+pub type FlexVJepaPipeline = VJepaPipeline<burn::backend::Flex<f32, i32>>;
+
+#[cfg(feature = "dispatch")]
+pub type DispatchVJepaModel = VJepa2_1Model<burn::Dispatch>;
+
+#[cfg(feature = "dispatch")]
+pub type DispatchVJepaPipeline = VJepaPipeline<burn::Dispatch>;
 
 #[cfg(feature = "cuda")]
 pub type CudaVJepaModel = VJepa2_1Model<burn::backend::Cuda<f32, i32>>;

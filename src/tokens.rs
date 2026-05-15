@@ -471,7 +471,7 @@ pub fn apply_mask_batch<B: Backend>(
     apply_token_mask(tokens, mask.indices())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 mod tests {
     use super::*;
 

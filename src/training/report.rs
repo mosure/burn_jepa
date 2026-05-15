@@ -1,4 +1,7 @@
-use crate::{TttBackpropMode, TttMemoryUpdateSource, TttSupervisionMode, TttTargetMode};
+use crate::{
+    LearningRateScheduleConfig, LearningRateScheduleStats, TttBackpropMode, TttMemoryUpdateSource,
+    TttSupervisionMode, TttTargetMode,
+};
 use anyhow::{Context, Result};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
@@ -6,16 +9,28 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TttStreamStepKind {
+    Reset,
+    Carried,
+    Mixed,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TttStepMetric {
     pub step: usize,
     pub loss: f64,
+    pub stream_step: Option<TttStreamStepKind>,
+    pub effective_reset_interval_steps: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TttMemoryMetrics {
     pub layers: Vec<usize>,
+    pub predictor_layers: Vec<usize>,
     pub embed_dim: usize,
+    pub predictor_embed_dim: usize,
     pub batch_size: usize,
     pub chunk_tokens: usize,
     pub ttt_lr: f32,
@@ -45,6 +60,35 @@ pub struct TttMaskMetrics {
 pub struct TttBackpropMetrics {
     pub mode: TttBackpropMode,
     pub truncate_blocks: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TttStreamTrainingMetrics {
+    pub enabled: bool,
+    pub detach_between_steps: bool,
+    pub reset_on_clip_change: bool,
+    pub reset_on_non_monotonic_start: bool,
+    pub reset_interval_steps: usize,
+    pub curriculum_enabled: bool,
+    pub curriculum_initial_reset_interval_steps: usize,
+    pub curriculum_final_reset_interval_steps: usize,
+    pub curriculum_warmup_steps: usize,
+    pub final_effective_reset_interval_steps: usize,
+    pub state_decay: f64,
+    pub state_l2_weight: f64,
+    pub update_l2_weight: f64,
+    pub active_streams: usize,
+    pub max_active_streams: usize,
+    pub packed_batches: usize,
+    pub max_packed_batch_size: usize,
+    pub carried_steps: usize,
+    pub reset_steps: usize,
+    pub optimizer_steps: Option<usize>,
+    pub reset_optimizer_steps: Option<usize>,
+    pub carried_optimizer_steps: Option<usize>,
+    pub mixed_optimizer_steps: Option<usize>,
+    pub detached_steps: usize,
+    pub decayed_steps: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -113,6 +157,7 @@ pub struct TttUtilizationMetrics {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TttTemporalDiagnosticMetrics {
+    pub samples: usize,
     pub reset_each_frame_loss: Option<f64>,
     pub reset_each_frame_cosine: Option<f64>,
     pub reset_each_tubelet_loss: Option<f64>,
@@ -123,6 +168,24 @@ pub struct TttTemporalDiagnosticMetrics {
     pub shuffle_order_cosine: Option<f64>,
     pub freeze_fast_update_loss: Option<f64>,
     pub freeze_fast_update_cosine: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttTemporalSegmentMetric {
+    pub segment: usize,
+    pub start_tubelet: usize,
+    pub end_tubelet: usize,
+    pub tokens: usize,
+    pub loss: f64,
+    pub cosine: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttTemporalSegmentMetrics {
+    pub samples: usize,
+    pub segments: Vec<TttTemporalSegmentMetric>,
+    pub late_minus_early_loss: Option<f64>,
+    pub late_minus_early_cosine: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -155,8 +218,13 @@ pub struct TttTrainingReport {
     pub mask: Option<TttMaskMetrics>,
     pub rollout: TttRolloutMetrics,
     pub backprop: TttBackpropMetrics,
+    pub stream: TttStreamTrainingMetrics,
+    pub lr_schedule: LearningRateScheduleConfig,
+    pub lr_stats: LearningRateScheduleStats,
     pub target_supervision: TttTargetSupervisionMetrics,
     pub pre_train_eval_loss: Option<f64>,
+    pub pre_train_eval_feature_loss: Option<f64>,
+    pub pre_train_eval_predictor_loss: Option<f64>,
     pub pre_train_eval_cosine: Option<f64>,
     pub pre_train_teacher_forced_eval_loss: Option<f64>,
     pub pre_train_teacher_forced_eval_cosine: Option<f64>,
@@ -165,6 +233,8 @@ pub struct TttTrainingReport {
     pub pre_train_full_eval_loss: Option<f64>,
     pub pre_train_full_eval_cosine: Option<f64>,
     pub eval_loss: Option<f64>,
+    pub eval_feature_loss: Option<f64>,
+    pub eval_predictor_loss: Option<f64>,
     pub eval_cosine: Option<f64>,
     pub teacher_forced_eval_loss: Option<f64>,
     pub teacher_forced_eval_cosine: Option<f64>,
@@ -178,6 +248,7 @@ pub struct TttTrainingReport {
     pub eval_domains: Vec<TttDomainEvalMetric>,
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
+    pub temporal_segments: Option<TttTemporalSegmentMetrics>,
     pub train_elapsed_ms: u128,
     pub eval_elapsed_ms: u128,
     pub elapsed_ms: u128,
@@ -192,6 +263,8 @@ pub struct TttEvalReport {
     pub eval_steps: usize,
     pub eval_samples: usize,
     pub loss: f64,
+    pub feature_loss: f64,
+    pub predictor_loss: Option<f64>,
     pub cosine: f64,
     pub teacher_forced_loss: Option<f64>,
     pub teacher_forced_cosine: Option<f64>,
@@ -207,6 +280,8 @@ pub struct TttEvalReport {
     pub domains: Vec<TttDomainEvalMetric>,
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
+    pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub stream: TttStreamTrainingMetrics,
     pub elapsed_ms: u128,
     pub samples_per_second: f64,
     pub report_path: PathBuf,

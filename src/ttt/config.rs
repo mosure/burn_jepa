@@ -120,10 +120,13 @@ impl TttEncoderConfig {
                 config.encoder.depth.max(1)
             );
         }
-        ensure!(
-            self.predictor_layers.is_empty(),
-            "TTT predictor-layer adapters are not implemented yet; use encoder layer placement"
-        );
+        for layer in self.resolved_predictor_layers(config) {
+            ensure!(
+                layer < config.predictor.depth.max(1),
+                "ttt predictor layer {layer} is outside predictor depth {}",
+                config.predictor.depth.max(1)
+            );
+        }
         Ok(())
     }
 
@@ -135,6 +138,13 @@ impl TttEncoderConfig {
             } else {
                 placement_layers(self.layer_placement, depth)
             };
+        layers.sort_unstable();
+        layers.dedup();
+        layers
+    }
+
+    pub fn resolved_predictor_layers(&self, _config: &VJepaConfig) -> Vec<usize> {
+        let mut layers = self.predictor_layers.clone();
         layers.sort_unstable();
         layers.dedup();
         layers

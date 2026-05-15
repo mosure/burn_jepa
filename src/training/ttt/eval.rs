@@ -1,14 +1,14 @@
 use super::loss;
 use super::step::{self, TttRolloutKind};
-use crate::training::batch::load_training_batch_with_policy;
+use crate::training::batch::TrainingBatchPlanner;
 use crate::training::config::BurnJepaTrainConfig;
 use crate::training::report::{
-    TttDomainEvalMetric, TttStageMetrics, TttTemporalDiagnosticMetrics, TttUtilizationMetrics,
-    tensor_scalar,
+    TttDomainEvalMetric, TttStageMetrics, TttStreamTrainingMetrics, TttTemporalDiagnosticMetrics,
+    TttTemporalSegmentMetric, TttTemporalSegmentMetrics, TttUtilizationMetrics, tensor_scalar,
 };
+use crate::{SparseMaskBatch, TokenGridShape, VJepa2_1Model, VJepaTttModel, dataset_from_config};
 use crate::{TttMemoryUpdateSource, TttStateResetMode, TttSupervisionMode};
-use crate::{VJepa2_1Model, VJepaTttModel, dataset_from_config};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use std::collections::BTreeMap;
@@ -17,6 +17,8 @@ use std::time::Instant;
 pub(super) struct TttEvalSummary {
     pub samples: usize,
     pub loss: f64,
+    pub feature_loss: f64,
+    pub predictor_loss: Option<f64>,
     pub cosine: f64,
     pub teacher_forced_loss: Option<f64>,
     pub teacher_forced_cosine: Option<f64>,
@@ -28,6 +30,8 @@ pub(super) struct TttEvalSummary {
     pub domains: Vec<TttDomainEvalMetric>,
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
+    pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub stream: TttStreamTrainingMetrics,
 }
 
 #[derive(Default)]
@@ -51,24 +55,31 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
     steps: usize,
 ) -> Result<TttEvalSummary> {
     let dataset = dataset_from_config(&config.dataset, false)?;
+    super::validate_stream_dataset(config, dataset.as_ref())?;
+    let batch_planner = TrainingBatchPlanner::new(dataset.as_ref(), config.training.batching)?;
     let rollout = step::rollout_kind(config);
     let patchify = step::patchify_kind::<B>(config, rollout)?;
     let eval_batch_size = config.training.effective_eval_batch_size();
     let eval_full_grid = config.training.eval_full_grid || rollout == TttRolloutKind::Dense;
     let mut total = 0.0;
+    let mut total_feature = 0.0;
+    let mut total_predictor = 0.0;
     let mut total_cosine = 0.0;
     let mut total_teacher_forced_loss = 0.0;
     let mut total_teacher_forced_cosine = 0.0;
     let mut total_full_loss = 0.0;
     let mut total_full_cosine = 0.0;
     let mut samples = 0usize;
+    let mut predictor_samples = 0usize;
     let mut teacher_forced_samples = 0usize;
     let mut full_samples = 0usize;
     let mut stage = TttStageMetrics::default();
     let mut domains = BTreeMap::<String, DomainTotals>::new();
     let mut teacher_cache = BTreeMap::<String, step::TeacherTokenTargets<B>>::new();
     let mut utilization = None;
-    let mut temporal_diagnostics = None;
+    let mut temporal_diagnostics = TemporalDiagnosticAccumulator::default();
+    let mut temporal_segments = TemporalSegmentAccumulator::new(3);
+    let mut stream_state = super::StreamStateTracker::<B>::default();
     let teacher_forced_eval =
         config.ttt.memory_update == TttMemoryUpdateSource::TeacherForcedDiagnostic;
     let capture_layers = config.ttt.capture_layers(model.config());
@@ -79,14 +90,13 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
         } else {
             eval_batch_size
         };
-        let batch = load_training_batch_with_policy::<B>(
+        let batch = batch_planner.load_batch::<B>(
             dataset.as_ref(),
             &config.dataset,
             model.config(),
             device,
             start_index,
             batch_size,
-            config.training.batching,
         )?;
         let teacher_tokens = super::teacher_tokens_for_batch(
             teacher,
@@ -102,18 +112,43 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
         let masks = super::timed(&mut stage.mask_ms, || {
             step::resolve_masks(config, &batch.student, model.config(), &batch.metadata)
         })?;
+        let mut eval_state = config
+            .training
+            .stream
+            .enabled
+            .then(|| {
+                stream_state.begin_step(model, config, step_index, batch_size, &batch.metadata)
+            })
+            .transpose()?;
         let student = super::timed(&mut stage.student_forward_ms, || {
-            step::student_eval_rollout(
-                model,
-                batch.student.clone(),
-                teacher_tokens.final_tokens.clone(),
-                masks.as_ref(),
-                rollout,
-                patchify,
-                eval_full_grid,
-                teacher_forced_eval,
-            )
+            if let Some(state) = eval_state.as_mut() {
+                step::student_eval_rollout_with_state(
+                    model,
+                    batch.student.clone(),
+                    teacher_tokens.final_tokens.clone(),
+                    masks.as_ref(),
+                    rollout,
+                    patchify,
+                    eval_full_grid,
+                    teacher_forced_eval,
+                    state,
+                )
+            } else {
+                step::student_eval_rollout(
+                    model,
+                    batch.student.clone(),
+                    teacher_tokens.final_tokens.clone(),
+                    masks.as_ref(),
+                    rollout,
+                    patchify,
+                    eval_full_grid,
+                    teacher_forced_eval,
+                )
+            }
         })?;
+        if let Some(state) = eval_state {
+            stream_state.finish_step(state, config);
+        }
         if step_index == 0 && config.training.eval_utilization_diagnostics {
             let mut probes = Vec::new();
             let _ = step::student_probe_rollout(
@@ -130,8 +165,8 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
                 config, model, probes, batch_size,
             )?);
         }
-        if step_index == 0 && config.training.eval_temporal_diagnostics {
-            temporal_diagnostics = Some(eval_temporal_diagnostics(
+        if config.training.eval_temporal_diagnostics {
+            let diagnostics = eval_temporal_diagnostics(
                 model,
                 config,
                 batch.student.clone(),
@@ -140,10 +175,18 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
                 rollout,
                 batch_size,
                 device,
-            )?);
+            )?;
+            temporal_diagnostics.add(&diagnostics, batch_size);
         }
         let loss_start = Instant::now();
-        let primary_loss = loss::training_loss(
+        let predictor_target = step::teacher_predictor_targets(
+            teacher,
+            &teacher_tokens,
+            masks.as_ref(),
+            student.free_run.grid,
+            config.loss.predictor_loss_weight,
+        )?;
+        let loss_breakdown = loss::training_loss_breakdown(
             model,
             config,
             &student.free_run,
@@ -153,7 +196,14 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             batch_size,
             device,
             TttSupervisionMode::FinalTeacher,
+            predictor_target.clone(),
         )?;
+        let primary_loss = tensor_scalar(loss_breakdown.total.detach())?;
+        let feature_loss = tensor_scalar(loss_breakdown.feature.detach())?;
+        let predictor_loss = loss_breakdown
+            .predictor
+            .map(|predictor| tensor_scalar(predictor.detach()))
+            .transpose()?;
         let primary_cosine = loss::primary_cosine(
             student.free_run.tokens.clone(),
             teacher_tokens.final_tokens.clone(),
@@ -165,8 +215,26 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             batch_size,
             device,
         )?;
-        let primary_loss = tensor_scalar(primary_loss.detach())?;
+        if config.training.eval_temporal_diagnostics {
+            temporal_segments.add_batch(
+                student.free_run.tokens.clone(),
+                teacher_tokens.final_tokens.clone(),
+                masks.as_ref().map(|masks| match rollout {
+                    TttRolloutKind::Dense | TttRolloutKind::SparseTarget => &masks.target,
+                    TttRolloutKind::SparseContext => &masks.context,
+                }),
+                rollout,
+                student.free_run.grid,
+                batch_size,
+                device,
+            )?;
+        }
         total += primary_loss * batch_size as f64;
+        total_feature += feature_loss * batch_size as f64;
+        if let Some(predictor_loss) = predictor_loss {
+            total_predictor += predictor_loss * batch_size as f64;
+            predictor_samples += batch_size;
+        }
         total_cosine += primary_cosine * batch_size as f64;
         samples += batch_size;
         let mut teacher_forced_loss = None;
@@ -183,6 +251,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
                     batch_size,
                     device,
                     TttSupervisionMode::FinalTeacher,
+                    predictor_target,
                 )?
                 .detach(),
             )?;
@@ -269,6 +338,9 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
     Ok(TttEvalSummary {
         samples,
         loss: total / samples.max(1) as f64,
+        feature_loss: total_feature / samples.max(1) as f64,
+        predictor_loss: (predictor_samples > 0)
+            .then_some(total_predictor / predictor_samples as f64),
         cosine: total_cosine / samples.max(1) as f64,
         teacher_forced_loss: (teacher_forced_samples > 0)
             .then_some(total_teacher_forced_loss / teacher_forced_samples as f64),
@@ -287,7 +359,9 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
         stage,
         domains,
         utilization,
-        temporal_diagnostics,
+        temporal_diagnostics: temporal_diagnostics.finish(),
+        temporal_segments: temporal_segments.finish(),
+        stream: stream_state.metrics(config, false),
     })
 }
 
@@ -388,6 +462,7 @@ fn eval_temporal_diagnostics<B: step::TttSparsePatchifyTrainingBackend>(
         device,
     )?;
     Ok(TttTemporalDiagnosticMetrics {
+        samples: batch_size,
         reset_each_frame_loss: Some(reset_each_frame.0),
         reset_each_frame_cosine: Some(reset_each_frame.1),
         reset_each_tubelet_loss: Some(reset_each_tubelet.0),
@@ -399,6 +474,202 @@ fn eval_temporal_diagnostics<B: step::TttSparsePatchifyTrainingBackend>(
         freeze_fast_update_loss: Some(freeze_fast_update.0),
         freeze_fast_update_cosine: Some(freeze_fast_update.1),
     })
+}
+
+#[derive(Default)]
+struct TemporalDiagnosticAccumulator {
+    samples: usize,
+    reset_each_frame_loss: f64,
+    reset_each_frame_cosine: f64,
+    reset_each_tubelet_loss: f64,
+    reset_each_tubelet_cosine: f64,
+    reverse_order_loss: f64,
+    reverse_order_cosine: f64,
+    shuffle_order_loss: f64,
+    shuffle_order_cosine: f64,
+    freeze_fast_update_loss: f64,
+    freeze_fast_update_cosine: f64,
+}
+
+impl TemporalDiagnosticAccumulator {
+    fn add(&mut self, metrics: &TttTemporalDiagnosticMetrics, batch_size: usize) {
+        let weight = batch_size as f64;
+        self.samples += batch_size;
+        self.reset_each_frame_loss += metrics.reset_each_frame_loss.unwrap_or(0.0) * weight;
+        self.reset_each_frame_cosine += metrics.reset_each_frame_cosine.unwrap_or(0.0) * weight;
+        self.reset_each_tubelet_loss += metrics.reset_each_tubelet_loss.unwrap_or(0.0) * weight;
+        self.reset_each_tubelet_cosine += metrics.reset_each_tubelet_cosine.unwrap_or(0.0) * weight;
+        self.reverse_order_loss += metrics.reverse_order_loss.unwrap_or(0.0) * weight;
+        self.reverse_order_cosine += metrics.reverse_order_cosine.unwrap_or(0.0) * weight;
+        self.shuffle_order_loss += metrics.shuffle_order_loss.unwrap_or(0.0) * weight;
+        self.shuffle_order_cosine += metrics.shuffle_order_cosine.unwrap_or(0.0) * weight;
+        self.freeze_fast_update_loss += metrics.freeze_fast_update_loss.unwrap_or(0.0) * weight;
+        self.freeze_fast_update_cosine += metrics.freeze_fast_update_cosine.unwrap_or(0.0) * weight;
+    }
+
+    fn finish(self) -> Option<TttTemporalDiagnosticMetrics> {
+        let samples = self.samples;
+        (samples > 0).then(|| {
+            let denom = samples as f64;
+            TttTemporalDiagnosticMetrics {
+                samples,
+                reset_each_frame_loss: Some(self.reset_each_frame_loss / denom),
+                reset_each_frame_cosine: Some(self.reset_each_frame_cosine / denom),
+                reset_each_tubelet_loss: Some(self.reset_each_tubelet_loss / denom),
+                reset_each_tubelet_cosine: Some(self.reset_each_tubelet_cosine / denom),
+                reverse_order_loss: Some(self.reverse_order_loss / denom),
+                reverse_order_cosine: Some(self.reverse_order_cosine / denom),
+                shuffle_order_loss: Some(self.shuffle_order_loss / denom),
+                shuffle_order_cosine: Some(self.shuffle_order_cosine / denom),
+                freeze_fast_update_loss: Some(self.freeze_fast_update_loss / denom),
+                freeze_fast_update_cosine: Some(self.freeze_fast_update_cosine / denom),
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SegmentTotal {
+    tokens: usize,
+    values: usize,
+    squared_error: f64,
+    dot: f64,
+    left_norm: f64,
+    right_norm: f64,
+}
+
+struct TemporalSegmentAccumulator {
+    samples: usize,
+    grid_depth: usize,
+    segments: Vec<SegmentTotal>,
+}
+
+impl TemporalSegmentAccumulator {
+    fn new(segments: usize) -> Self {
+        Self {
+            samples: 0,
+            grid_depth: 0,
+            segments: vec![SegmentTotal::default(); segments.max(1)],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_batch<B: Backend>(
+        &mut self,
+        student_tokens: Tensor<B, 3>,
+        teacher_tokens: Tensor<B, 3>,
+        primary_mask: Option<&SparseMaskBatch<B>>,
+        rollout: TttRolloutKind,
+        grid: TokenGridShape,
+        batch_size: usize,
+        device: &B::Device,
+    ) -> Result<()> {
+        let rows = primary_token_rows(primary_mask, grid, batch_size);
+        let (student_tokens, teacher_tokens) = loss::align_primary_tokens(
+            student_tokens,
+            teacher_tokens,
+            primary_mask,
+            rollout,
+            batch_size,
+            device,
+        );
+        let [batch, tokens, dim] = student_tokens.shape().dims::<3>();
+        let student = student_tokens
+            .into_data()
+            .to_vec::<f32>()
+            .context("read student temporal segment tokens")?;
+        let teacher = teacher_tokens
+            .into_data()
+            .to_vec::<f32>()
+            .context("read teacher temporal segment tokens")?;
+        self.samples += batch;
+        self.grid_depth = self.grid_depth.max(grid.depth);
+        let frame_tokens = grid.tokens_per_frame().max(1);
+        for sample in 0..batch {
+            let row = rows
+                .get(sample)
+                .with_context(|| format!("missing temporal segment row {sample}"))?;
+            for token in 0..tokens {
+                let Some(&token_index) = row.get(token) else {
+                    continue;
+                };
+                let tubelet = (token_index / frame_tokens).min(grid.depth.saturating_sub(1));
+                let segment = ((tubelet * self.segments.len()) / grid.depth.max(1))
+                    .min(self.segments.len().saturating_sub(1));
+                let base = (sample * tokens + token) * dim;
+                let total = &mut self.segments[segment];
+                total.tokens += 1;
+                total.values += dim;
+                for offset in 0..dim {
+                    let left = student[base + offset] as f64;
+                    let right = teacher[base + offset] as f64;
+                    let diff = left - right;
+                    total.squared_error += diff * diff;
+                    total.dot += left * right;
+                    total.left_norm += left * left;
+                    total.right_norm += right * right;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Option<TttTemporalSegmentMetrics> {
+        if self.samples == 0 || self.segments.iter().all(|segment| segment.tokens == 0) {
+            return None;
+        }
+        let count = self.segments.len();
+        let grid_depth = self.grid_depth.max(count);
+        let segments = self
+            .segments
+            .into_iter()
+            .enumerate()
+            .map(|(segment, total)| {
+                let loss = if total.values > 0 {
+                    total.squared_error / total.values as f64
+                } else {
+                    0.0
+                };
+                let cosine = if total.left_norm > 0.0 && total.right_norm > 0.0 {
+                    total.dot / (total.left_norm.sqrt() * total.right_norm.sqrt())
+                } else {
+                    0.0
+                };
+                TttTemporalSegmentMetric {
+                    segment,
+                    start_tubelet: (segment * grid_depth).div_ceil(count),
+                    end_tubelet: ((segment + 1) * grid_depth).div_ceil(count),
+                    tokens: total.tokens,
+                    loss,
+                    cosine,
+                }
+            })
+            .collect::<Vec<_>>();
+        let first = segments.first();
+        let last = segments.last();
+        let late_minus_early_loss = first.zip(last).and_then(|(first, last)| {
+            (first.tokens > 0 && last.tokens > 0).then_some(last.loss - first.loss)
+        });
+        let late_minus_early_cosine = first.zip(last).and_then(|(first, last)| {
+            (first.tokens > 0 && last.tokens > 0).then_some(last.cosine - first.cosine)
+        });
+        Some(TttTemporalSegmentMetrics {
+            samples: self.samples,
+            late_minus_early_loss,
+            late_minus_early_cosine,
+            segments,
+        })
+    }
+}
+
+fn primary_token_rows<B: Backend>(
+    primary_mask: Option<&SparseMaskBatch<B>>,
+    grid: TokenGridShape,
+    batch_size: usize,
+) -> Vec<Vec<usize>> {
+    primary_mask
+        .map(SparseMaskBatch::rows)
+        .unwrap_or_else(|| (0..batch_size).map(|_| (0..grid.len()).collect()).collect())
 }
 
 fn reverse_video_frames<B: Backend>(video: Tensor<B, 5>) -> Tensor<B, 5> {
@@ -426,7 +697,7 @@ fn reorder_video_frames<B: Backend>(video: Tensor<B, 5>, order: Vec<usize>) -> T
 }
 
 fn diagnostic_loss_cosine<B: step::TttSparsePatchifyTrainingBackend>(
-    model: &VJepaTttModel<B>,
+    _model: &VJepaTttModel<B>,
     config: &BurnJepaTrainConfig,
     student: crate::VJepaEncoderOutput<B>,
     teacher_tokens: step::TeacherTokenTargets<B>,
@@ -435,27 +706,26 @@ fn diagnostic_loss_cosine<B: step::TttSparsePatchifyTrainingBackend>(
     batch_size: usize,
     device: &B::Device,
 ) -> Result<(f64, f64)> {
+    let primary_mask = masks.map(|masks| match rollout {
+        TttRolloutKind::Dense | TttRolloutKind::SparseTarget => &masks.target,
+        TttRolloutKind::SparseContext => &masks.context,
+    });
     let loss = tensor_scalar(
-        loss::training_loss(
-            model,
+        loss::primary_feature_loss(
             config,
-            &student,
-            &teacher_tokens,
-            masks,
+            student.tokens.clone(),
+            teacher_tokens.final_tokens.clone(),
+            primary_mask,
             rollout,
             batch_size,
             device,
-            TttSupervisionMode::FinalTeacher,
-        )?
+        )
         .detach(),
     )?;
     let cosine = loss::primary_cosine(
         student.tokens,
         teacher_tokens.final_tokens,
-        masks.map(|masks| match rollout {
-            TttRolloutKind::Dense | TttRolloutKind::SparseTarget => &masks.target,
-            TttRolloutKind::SparseContext => &masks.context,
-        }),
+        primary_mask,
         rollout,
         batch_size,
         device,

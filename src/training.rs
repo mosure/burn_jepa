@@ -7,8 +7,10 @@ mod report;
 mod ttt;
 
 pub use config::{
-    BurnJepaTrainConfig, JepaTrainBackend, TrainModelConfig, TrainingBatchingMode,
-    TrainingLoopConfig, TttDistillationConfig, TttSparsePatchifyTrainingMode, TttSparseRolloutMode,
+    BurnJepaTrainConfig, JepaDispatchBackend, JepaTrainBackend, LearningRateScheduleConfig,
+    LearningRateScheduleStats, TrainModelConfig, TrainingBatchingMode, TrainingLoopConfig,
+    TttDistillationConfig, TttSequenceCurriculumConfig, TttSparsePatchifyTrainingMode,
+    TttSparseRolloutMode, TttStreamTrainingConfig,
 };
 pub use dense::{DensePredictiveLoss, VJepaTrainingBatch, dense_predictive_loss, train_dense_jepa};
 pub use mask::{
@@ -17,9 +19,9 @@ pub use mask::{
 };
 pub use report::{
     DenseJepaTrainingReport, TttBackpropMetrics, TttDomainEvalMetric, TttEvalReport,
-    TttLayerUtilizationMetric, TttRolloutMetrics, TttRolloutReportMode,
-    TttTargetSupervisionMetrics, TttTemporalDiagnosticMetrics, TttTrainingReport,
-    TttUtilizationMetrics,
+    TttLayerUtilizationMetric, TttRolloutMetrics, TttRolloutReportMode, TttStreamStepKind,
+    TttStreamTrainingMetrics, TttTargetSupervisionMetrics, TttTemporalDiagnosticMetrics,
+    TttTemporalSegmentMetric, TttTemporalSegmentMetrics, TttTrainingReport, TttUtilizationMetrics,
 };
 pub use ttt::{
     TttDistillationLoss, TttSparsePatchifyTrainingBackend, evaluate_ttt_distillation,

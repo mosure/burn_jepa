@@ -557,7 +557,7 @@ fn ensure_min_keep(keep: &mut [bool], grid: TokenGridShape, min_keep_tokens: usi
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 mod tests {
     use super::*;
 

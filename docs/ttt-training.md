@@ -77,6 +77,11 @@ TTT modules. Set `ttt.freeze_pretrained = false` for full finetuning.
 Set `model.ttt_checkpoint_path` to resume/continue adapter training from a
 saved `ttt-model.mpk` while still resolving pretrained V-JEPA weights from
 `model.checkpoint_dir`.
+Set `training.lr_schedule.kind = "linear_warmup_cosine"` for long CUDA runs so
+the adapter stage can warm up from a small first update and decay toward a
+floor after the useful high-LR phase. Reports include `lr_schedule` and
+`lr_stats` so production artifacts record the actual first, final, min, and max
+learning rates.
 Set `loss.predictor_loss_weight > 0` to add the normal sparse JEPA predictor
 loss on top of feature distillation; the context/target masks come from
 `training.mask` when configured, otherwise the legacy
@@ -98,6 +103,103 @@ Reports include `target_supervision` to make memory updates and supervision
 explicit. `memory_update` describes what updates fast weights, while
 `supervision` describes the loss objective. This avoids conflating
 teacher-forced diagnostics with deployable sparse student inference.
+
+## Production Staging
+
+Use a staged schedule for production candidates:
+
+1. Generate real AutoGaze context/target masks into the manifests.
+2. Train encoder-only TTT adapters with frozen pretrained V-JEPA weights,
+   sparse context rollout, and frozen sparse patchify.
+3. Evaluate free-run sparse quality, temporal diagnostics, utilization metrics,
+   and cross-domain slices.
+4. Start a short low-LR unfrozen continuation only after the frozen adapter run
+   plateaus cleanly.
+
+The unfrozen continuation is an ablation, not the default first run. It may
+help reduce residual teacher-student mismatch after adapter saturation, but it
+uses dense autodiff patch embedding during training and can damage pretrained
+feature geometry if the learning rate or duration is too aggressive. Keep the
+stage-1 frozen adapter checkpoint as the deployable sparse baseline.
+
+## Stream and TBPTT Training
+
+Long video training can carry TTT fast-weight state across adjacent manifest
+windows. Enable this with `[training.stream]`:
+
+```toml
+[training.stream]
+enabled = true
+detach_between_steps = true
+reset_on_clip_change = true
+reset_on_non_monotonic_start = true
+reset_interval_steps = 4
+state_decay = 0.97
+state_l2_weight = 0.000001
+update_l2_weight = 0.00001
+
+[training.stream.curriculum]
+enabled = true
+initial_reset_interval_steps = 1
+final_reset_interval_steps = 4
+warmup_steps = 512
+```
+
+For single-stream debugging, use `training.batch_size = 1` with
+`training.batching = "sequential"`. For production stream training, use
+`training.batching = "packed_streams"` and set `training.batch_size` to the
+number of independent stream lanes to train per step. The packed loader groups
+manifest rows by `clip_id`/`source`, emits at most one window from each stream
+per batch, and advances each stream independently across steps. The carried TTT
+state is stored per stream key, then packed into the batch tensor for the
+forward/backward step and unpacked back into per-stream state afterward. This
+keeps the TTT memory device-resident and avoids the old single-stream
+`batch_size = 1` throughput limit. If a shard exposes fewer streams than
+`training.batch_size`, the loader emits a smaller valid batch instead of
+duplicating a stream lane, and the report `samples` field records the actual
+number of trained windows. Runtime validation still rejects duplicate stream
+keys in one batch because `A0,A1` for the same stream requires sequential state
+updates inside the batch.
+
+The loader uses manifest metadata (`clip_id`, `domain`, `source`, and
+`start_frame`) to reset state at new streams, non-monotonic windows, and
+scheduled reset intervals. Manifest stream rows must include `start_frame` plus
+either `clip_id` or `source`; anonymous manifest streams are rejected so
+unrelated windows cannot silently share state.
+`detach_between_steps = true` gives a TBPTT boundary between windows; the
+carried fast weights remain device tensors, but the previous window graph is not
+retained. `state_decay` applies a scheduled stability decay after each step,
+while `state_l2_weight` and `update_l2_weight` add device-side regularization
+terms to the training loss.
+
+Every stream window still receives a normal optimizer step. The curriculum does
+not run hidden no-grad warmup rollouts: steps with a fresh/reset state train the
+adapter to initialize from zero context, and carried steps train stability after
+the TBPTT boundary. Reports expose this directly through
+`stream.reset_optimizer_steps`, `stream.carried_optimizer_steps`,
+`stream.mixed_optimizer_steps`, and traced loss rows tagged with
+`stream_step = "reset"`, `"carried"`, or `"mixed"` when
+`training.loss_trace_interval` is enabled. Set `loss_trace_interval = 0` for
+throughput runs to avoid extra scalar readbacks.
+
+The sequence curriculum ramps the scheduled reset interval from short horizon
+to longer carried-state blocks. With 16-frame windows and
+`final_reset_interval_steps = 4`, the final training horizon is 64 frames before
+the next scheduled reset. Training reports include `stream.carried_steps`,
+`stream.reset_steps`, `stream.detached_steps`, `stream.decayed_steps`, and the
+effective final reset interval so experiment artifacts show whether the run
+actually trained with persistent state. Packed reports also include
+`stream.active_streams`, `stream.max_active_streams`, `stream.packed_batches`,
+and `stream.max_packed_batch_size` so throughput results can be interpreted as
+single-stream or multi-stream TBPTT.
+
+The same stream config is honored by `eval-ttt`. With stream enabled, eval
+carries free-run TTT state across adjacent manifest windows or packed stream
+lanes, reports the same stream counters, and still runs teacher-forced/full-grid
+diagnostics in fresh diagnostic states. Use
+`configs/production/vjepa21-ttt-stream-eval-cuda.toml` for the production
+long-form eval shape.
+
 The legacy `ttt.target` field still deserializes for old configs, but
 `print-config` omits its default value; new configs should use
 `ttt.memory_update` and `ttt.supervision`.
@@ -237,6 +339,7 @@ Real AutoGaze masks are generated as a manifest preprocessing step:
 [data.autogaze_masks]
 checkpoint_dir = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a"
 backend = "cuda"
+streaming = true
 context_density = 0.2
 target_density = 0.05
 max_gaze_tokens_each_frame = 32
@@ -244,19 +347,34 @@ top_k_overfetch = 1.25
 ```
 
 This writes `precomputed_context_indices` and `precomputed_target_indices` into
-the train/eval manifests. Real masks can now batch in three modes:
+the train/eval manifests. With `streaming = true`, mask preparation keeps an
+`AutoGazeStreamingCache` per `(domain, clip_id/source)` stream, resets at split
+boundaries and non-monotonic `start_frame`s, and therefore matches downstream
+online AutoGaze deployment more closely than independent per-window generation.
+With `streaming = false`, each manifest window is generated independently,
+which is useful only for isolated ablations. Real masks can now batch in three
+modes:
 
 ```toml
 [training]
 batching = "sequential"          # legacy order
 batching = "group_uniform_masks" # group identical context/target masks
 batching = "fixed_width_masks"   # group equal-width per-sample masks
+batching = "packed_streams"      # one window per manifest stream per batch
 ```
 
 `fixed_width_masks` supports different mask indices per sample when each row has
 the same context/target token count. The encoder and loss gather from batched
 `[batch, tokens]` index tensors, and the CUDA sparse-patchify bridge can consume
 fixed-width per-sample coordinate plans.
+
+`packed_streams` is the long-form TBPTT mode. It groups manifest rows by stream
+identity, selects one window from each stream per optimizer step, and hands the
+training loop a packed batch whose TTT state rows are carried independently.
+Use it with `training.stream.enabled = true` when a sorted manifest would
+otherwise create unsafe `A0,A1` duplicate-stream batches. Uneven stream counts
+or worker shards are handled by partial packed batches; uneven window counts
+wrap per stream and reset through the non-monotonic `start_frame` rule.
 
 Ragged per-sample masks are accepted for TTT training/eval. Internally the
 rollout groups samples by per-tubelet token-count shape, runs exact-token
@@ -305,10 +423,12 @@ the much larger backward cost of the three-adapter preset. Use `thirds` for the
 higher-capacity `[3, 7, 11]` ViT-B preset when longer quality-focused runs can
 afford the extra backward time.
 
-`ttt.predictor_layers` is reserved in the config schema, but predictor-layer TTT
-adapters are intentionally rejected today. The recurrent TTT state is trained to
-make the single-frame encoder behave like the temporal 3D encoder; the JEPA
-predictor is still trained through the normal sparse predictor loss.
+Production training should keep `ttt.predictor_layers = []`. The predictor
+remains available as the normal JEPA prediction head for parity and auxiliary
+loss experiments, but recurrent TTT adapters belong in the encoder for this
+project. The deployed artifact is the sparse temporal encoder; predictor-side
+TTT does not improve the encoder's sparse patch/token update path and violates
+the goal of shipping a compact per-frame sparse encoder student.
 
 ## Dataset Modes
 
@@ -347,8 +467,12 @@ cargo run --bin burn-jepa -- bench-ttt --config train.toml --steps 10
 cargo bench --bench ttt_training
 ```
 
-Set `training.backend` to `nd_array`, `wgpu`, `web_gpu`, or `cuda` and enable
-the matching Cargo feature for GPU training/bench dispatch.
+Set `training.backend` to `nd_array`, `flex`, `wgpu`, `web_gpu`, `cuda`, or
+`dispatch` and enable the matching Cargo feature. For Burn 0.21 dispatch runs,
+set `training.backend = "dispatch"` and optionally set
+`training.dispatch_backend` to `auto`, `flex`, `nd_array`, `web_gpu`, `wgpu`, or
+`cuda`. `auto` chooses the first enabled/available device in CUDA, WGPU, Flex,
+NdArray order, skipping CUDA when the runtime preflight cannot open a device.
 Use `eval-ttt --no-full-grid` for production sparse-rollout throughput. Use
 `--full-grid` for slower parity diagnostics that run the sparse rollout and an
 additional dense student rollout for full-token loss/cosine.
@@ -366,6 +490,18 @@ The Criterion TTT bench includes an explicit sparse-token training-step matrix:
 cargo bench --bench ttt_training \
   --no-default-features --features ndarray \
   -- ttt_sparsity_training_step_ndarray --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+cargo bench --bench ttt_training \
+  --no-default-features --features flex \
+  -- ttt_sparsity_training_step_flex --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+cargo bench --bench ttt_training \
+  --no-default-features --features dispatch,flex \
+  -- ttt_sparsity_training_step_dispatch_flex --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+cargo bench --bench ttt_training \
+  --no-default-features --features dispatch,webgpu \
+  -- ttt_sparsity_training_step_dispatch_wgpu --sample-size 10 --measurement-time 1 --warm-up-time 1
 
 cargo bench --bench ttt_training \
   --no-default-features --features ndarray,wgpu \
@@ -399,6 +535,50 @@ training-step surface, but route sparse rows through the flex-gmm frozen
 sparse-patchify bridge. Those rows skip dense image patch embedding before the
 TTT encoder and keep the benchmark on the pixel-skip path used by sparse
 adapter-only training when pretrained JEPA weights are frozen.
+
+The `ttt_tbptt_training_step_*` groups isolate TBPTT stream overhead. They
+measure the same one-window forward, loss, backward, and AdamW step, then add
+the state bookkeeping used by stream training: optional carry, detach, scheduled
+reset, and decay. This is the benchmark to check the expectation that TBPTT
+should run close to ordinary TTT training because it does not backpropagate
+through prior windows.
+
+```bash
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray \
+  -- ttt_tbptt_training_step_ndarray --sample-size 10 --measurement-time 1 --warm-up-time 0.2
+
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo bench --bench ttt_training \
+  --no-default-features --features ndarray,cuda \
+  -- ttt_tbptt_training_step_cuda --sample-size 10 --measurement-time 1 --warm-up-time 0.2
+```
+
+Local short Criterion TBPTT smoke from 2026-05-15, using the same tiny 64px
+fixture, one 50% sparse mask row, and full forward+backward+AdamW:
+
+| Backend | Case | Median step | Notes |
+|---|---|---:|---|
+| ndarray | no stream, fresh state | 10.321 ms | Non-TBPTT baseline. |
+| ndarray | TBPTT reset every step, decay 1.00 | 10.470 ms | Fresh-state curriculum step with optimizer update. |
+| ndarray | TBPTT carry 4, decay 1.00 | 10.475 ms | Carry+detach without decay. |
+| ndarray | TBPTT carry 4, decay 0.97 | 10.511 ms | Production-style decay. |
+| ndarray | TBPTT carry 4, decay 0.97, packed b4 | 49.529 ms | Live packed multi-stream sanity run; 80.8 samples/sec mean throughput. |
+| ndarray | TBPTT carry 4, decay 0.90 | 10.479 ms | Stronger decay sweep point. |
+| CUDA | TBPTT reset every step, decay 1.00 | 15.696 ms | WGPU/CUDA first-use noise makes the fresh no-stream row unstable in short runs. |
+| CUDA | TBPTT carry 4, decay 1.00 | 14.980 ms | No statistically significant change from reset-only TBPTT. |
+| CUDA | TBPTT carry 4, decay 0.97 | 15.913 ms | Production-style decay. |
+| CUDA | TBPTT carry 4, decay 0.90 | 13.695 ms | No statistically significant change in this short run. |
+
+Interpretation: on ndarray, single-stream TBPTT state carry+detach+decay adds
+about 1.5--1.9% over the fresh-state training step. The packed b4 row exercises
+the multi-stream state pack/unpack path and lands at about 4.7x the b1 median
+for 4x the samples in this tiny CPU fixture; it is a sanity row, not a tuned CPU
+throughput target. On CUDA, the short run is noisy but all stable single-stream
+TBPTT rows stay in the same 13.7--15.9 ms band. This supports the intended
+implementation model: long-form training cost is still dominated by the current
+window's forward/backward/optimizer work, not by copying or decaying the carried
+TTT memory.
 
 Local short Criterion smoke from 2026-05-14, using a tiny 64px fixture with 32
 dense tokens and `--sample-size 10 --measurement-time 1 --warm-up-time 0.2`:
@@ -510,6 +690,11 @@ budget; treat the previous `thirds` row as teacher-forced-only historical
 context until a dedicated longer run refreshes it. The synthetic depth-4
 confirmation still prefers `thirds`, which is why it remains the documented
 high-capacity preset.
+
+Predictor-side TTT ablations are intentionally omitted from production
+analysis. They are not the architecture we intend to ship: the sparse temporal
+student is an encoder module, and adding recurrent state to the predictor does
+not make the deployed sparse encoder more efficient or more temporally aware.
 
 Real-checkpoint CUDA mask/memory ablations from 2026-05-14 used the published
 V-JEPA 2.1 ViT-B checkpoint fixture under

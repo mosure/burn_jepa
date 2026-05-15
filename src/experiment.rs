@@ -120,12 +120,6 @@ impl ExperimentConfig {
             !self.ttt_layer_sets.is_empty(),
             "experiment.ttt_layer_sets must not be empty"
         );
-        for set in &self.ttt_layer_sets {
-            ensure!(
-                set.predictor_layers.is_empty(),
-                "experiment TTT predictor layer sets are not implemented yet; use encoder_layers or placement"
-            );
-        }
         if self.require_real_checkpoint {
             ensure!(
                 self.base.model.checkpoint_dir.is_some()
@@ -181,6 +175,7 @@ pub struct ExperimentDataConfig {
     pub eval_manifest: PathBuf,
     pub domain: Option<String>,
     pub domain_from_parent: bool,
+    pub domain_from_clip_prefix: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autogaze_masks: Option<ExperimentAutogazeMaskConfig>,
     pub eval_ratio: f32,
@@ -198,6 +193,7 @@ impl Default for ExperimentDataConfig {
             eval_manifest: PathBuf::from("target/burn-jepa-experiments/data/eval.jsonl"),
             domain: None,
             domain_from_parent: false,
+            domain_from_clip_prefix: false,
             autogaze_masks: None,
             eval_ratio: 0.2,
             window_frames: 64,
@@ -212,6 +208,7 @@ impl Default for ExperimentDataConfig {
 pub struct ExperimentAutogazeMaskConfig {
     pub checkpoint_dir: PathBuf,
     pub backend: Option<JepaTrainBackend>,
+    pub streaming: bool,
     pub context_density: Option<f32>,
     pub target_density: Option<f32>,
     pub max_gaze_tokens_each_frame: Option<usize>,
@@ -227,6 +224,7 @@ impl Default for ExperimentAutogazeMaskConfig {
                 "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a",
             ),
             backend: None,
+            streaming: false,
             context_density: None,
             target_density: None,
             max_gaze_tokens_each_frame: None,
@@ -262,8 +260,11 @@ pub enum ExperimentMaskPolicy {
 #[serde(default)]
 pub struct ExperimentTttLayerSet {
     pub name: String,
+    #[serde(default)]
     pub placement: Option<TttLayerPlacement>,
+    #[serde(default)]
     pub encoder_layers: Vec<usize>,
+    #[serde(default)]
     pub predictor_layers: Vec<usize>,
 }
 
@@ -289,7 +290,7 @@ impl ExperimentTttLayerSet {
     fn apply_to(&self, config: &mut BurnJepaTrainConfig) {
         if let Some(placement) = self.placement {
             config.ttt.layer_placement = placement;
-        } else if !self.encoder_layers.is_empty() {
+        } else {
             config.ttt.layer_placement = TttLayerPlacement::Explicit;
         }
         config.ttt.layers = self.encoder_layers.clone();
@@ -805,7 +806,7 @@ fn train_ttt_trial<B: crate::TttSparsePatchifyTrainingBackend>(
         mask_policy: trial.mask_policy,
         ttt_layer_set: trial_layer_set_name(config, trial),
         ttt_encoder_layers: report.memory.layers.clone(),
-        ttt_predictor_layers: config.ttt_layer_set(trial).predictor_layers.clone(),
+        ttt_predictor_layers: report.memory.predictor_layers.clone(),
         status: ExperimentTrialStatus::Completed,
         train_final_loss: Some(report.final_loss),
         train_best_loss: Some(report.best_loss),
@@ -1032,14 +1033,14 @@ fn evaluate_teacher_or_single_frame<B: AutodiffBackend>(
         total_teacher_cosine +=
             cosine_from_tensors(teacher_tokens.clone(), teacher_tokens.clone())?;
         let batch_size = batch.student.shape().dims::<5>()[0];
+        let [_, _, frames, height, width] = batch.student.shape().dims::<5>();
+        let actual_grid = video_token_grid(student.config(), frames, height, width)?;
         let mask_start = Instant::now();
         let resolved_masks = if let Some(mask) = &mask_config {
-            let [_, _, frames, height, width] = batch.student.shape().dims::<5>();
-            let grid = video_token_grid(student.config(), frames, height, width)?;
             Some(mask.resolve_masks_with_metadata(
                 &batch.student,
                 student.config(),
-                grid,
+                actual_grid,
                 &batch.metadata,
             )?)
         } else {
@@ -1096,13 +1097,34 @@ fn evaluate_teacher_or_single_frame<B: AutodiffBackend>(
                 teacher_tokens.clone(),
                 target_mask.to_tensor::<B>(batch_size, device),
             );
-            let predictions = student.predictor.forward_sparse(
+            let predictions = student.forward_predictor_sparse(
                 context_tokens,
                 &context_mask,
                 &target_mask,
-                student.config().token_grid(),
+                actual_grid,
                 0,
             )?;
+            let target_tokens = if predictions.target_predictions.shape().dims::<3>()
+                == target_tokens.shape().dims::<3>()
+            {
+                target_tokens
+            } else {
+                let teacher_context_tokens = apply_token_mask(
+                    teacher_tokens.clone(),
+                    context_mask.to_tensor::<B>(batch_size, device),
+                );
+                teacher
+                    .predictor
+                    .forward_sparse(
+                        teacher_context_tokens,
+                        &context_mask,
+                        &target_mask,
+                        actual_grid,
+                        0,
+                    )?
+                    .target_predictions
+                    .detach()
+            };
             feature_loss
                 + (predictions.target_predictions - target_tokens)
                     .powf_scalar(2.0)
@@ -1406,16 +1428,33 @@ fn video_files(input: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn clip_domain(clip: &FrameClip, config: &ExperimentDataConfig) -> Option<String> {
-    config.domain.clone().or_else(|| {
-        config.domain_from_parent.then(|| {
-            clip.source
-                .parent()
-                .and_then(|path| path.file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or("unknown")
-                .to_string()
+    config
+        .domain
+        .clone()
+        .or_else(|| config.domain_from_parent.then(|| parent_domain(clip)))
+        .or_else(|| {
+            config
+                .domain_from_clip_prefix
+                .then(|| clip_prefix_domain(&clip.clip_id))
         })
-    })
+}
+
+fn clip_prefix_domain(clip_id: &str) -> String {
+    clip_id
+        .split_once('_')
+        .map(|(prefix, _)| prefix)
+        .filter(|prefix| !prefix.trim().is_empty())
+        .unwrap_or(clip_id)
+        .to_string()
+}
+
+fn parent_domain(clip: &FrameClip) -> String {
+    clip.source
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn clip_rows(
@@ -1479,6 +1518,25 @@ fn prepare_autogaze_masks_if_configured(
             #[cfg(not(feature = "autogaze-ndarray"))]
             {
                 bail!("AutoGaze ndarray mask preparation requires the autogaze-ndarray feature")
+            }
+        }
+        JepaTrainBackend::Flex | JepaTrainBackend::Dispatch => {
+            #[cfg(feature = "autogaze-ndarray")]
+            {
+                let device = Default::default();
+                prepare_autogaze_masks_for_rows::<burn::backend::NdArray<f32>>(
+                    config,
+                    mask_config,
+                    train_rows,
+                    eval_rows,
+                    &device,
+                )
+            }
+            #[cfg(not(feature = "autogaze-ndarray"))]
+            {
+                bail!(
+                    "AutoGaze mask preparation for flex/dispatch training uses serialized masks and requires the autogaze-ndarray feature or an explicit AutoGaze mask backend"
+                )
             }
         }
         JepaTrainBackend::Cuda => {
@@ -1547,7 +1605,7 @@ fn prepare_autogaze_masks_for_rows<B: Backend>(
     eval_rows: &mut [JepaManifestRow],
     device: &B::Device,
 ) -> Result<usize> {
-    use burn_autogaze::AutoGazePipeline;
+    use burn_autogaze::{AutoGazePipeline, AutoGazeStreamingCache};
 
     let model_config = model_config(&config.base)?;
     let frames = round_up_to_multiple(
@@ -1599,11 +1657,38 @@ fn prepare_autogaze_masks_for_rows<B: Backend>(
     .build()?;
 
     let mut rows_written = 0usize;
-    for row in train_rows.iter_mut().chain(eval_rows.iter_mut()) {
+    let mut streaming_caches = BTreeMap::<String, AutoGazeStreamingCache<B>>::new();
+    let mut streaming_starts = BTreeMap::<String, usize>::new();
+    let train_rows_len = train_rows.len();
+    for (row_offset, row) in train_rows
+        .iter_mut()
+        .chain(eval_rows.iter_mut())
+        .enumerate()
+    {
+        if row_offset == train_rows_len {
+            streaming_caches.clear();
+            streaming_starts.clear();
+        }
+        let stream_key = autogaze_mask_stream_key(row, rows_written);
+        let start_frame = row.start_frame.unwrap_or(rows_written);
+        let reset_stream = streaming_starts
+            .get(&stream_key)
+            .is_some_and(|previous| start_frame <= *previous);
+        if reset_stream {
+            streaming_caches.remove(&stream_key);
+        }
+        streaming_starts.insert(stream_key.clone(), start_frame);
         let sample = row.to_sample(Path::new("."), config.base.dataset.sample_kind)?;
         let batch =
             load_jepa_tensor_batch::<B>(&sample, &config.base.dataset, &model_config, device)?;
-        let generated = plan.generate(&autogaze, batch.student);
+        let generated = if mask_config.streaming {
+            let cache = streaming_caches
+                .entry(stream_key)
+                .or_insert_with(|| AutoGazeStreamingCache::new(frames));
+            plan.generate_streaming(&autogaze, batch.student, cache)
+        } else {
+            plan.generate(&autogaze, batch.student)
+        };
         let masks = plan.project_generated_masks(&generated)?;
         row.precomputed_context_indices = Some(masks.context_mask.indices().to_vec());
         row.precomputed_target_indices = Some(masks.target_mask.indices().to_vec());
@@ -1611,6 +1696,21 @@ fn prepare_autogaze_masks_for_rows<B: Backend>(
     }
     B::sync(device).context("sync AutoGaze mask preparation backend")?;
     Ok(rows_written)
+}
+
+#[cfg(feature = "autogaze")]
+fn autogaze_mask_stream_key(row: &JepaManifestRow, fallback_index: usize) -> String {
+    row.clip_id
+        .as_ref()
+        .or(row.source.as_ref())
+        .map(|value| {
+            format!(
+                "{}:{}",
+                row.domain.as_deref().unwrap_or("unknown-domain"),
+                value
+            )
+        })
+        .unwrap_or_else(|| format!("anonymous-row-{fallback_index}"))
 }
 
 #[cfg(not(feature = "autogaze"))]

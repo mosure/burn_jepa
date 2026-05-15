@@ -583,7 +583,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
                 .collect::<Vec<_>>();
             let group_mask =
                 SparseMaskBatch::from_rows(group_rows, mask.dense_len(), &video.device())?;
-            let mut group_state = select_ttt_state_rows(state, &group);
+            let mut group_state = state.select_rows(&group);
             let encoded = self.forward_single_frame_rollout_batch_impl(
                 group_video,
                 &group_mask,
@@ -992,21 +992,6 @@ fn row_rollout_groups(rows: &[Vec<usize>], grid: TokenGridShape) -> Vec<Vec<usiz
     groups.into_values().collect()
 }
 
-fn select_ttt_state_rows<B: Backend>(state: &TttState<B>, rows: &[usize]) -> TttState<B> {
-    TttState {
-        layers: state
-            .layers
-            .iter()
-            .map(|layer| TttLayerState {
-                fast_weight: layer
-                    .fast_weight
-                    .as_ref()
-                    .map(|weight| select_batch_rows3(weight.clone(), rows)),
-            })
-            .collect(),
-    }
-}
-
 fn store_ttt_state_rows<B: Backend>(
     outputs: &mut [Vec<Option<Tensor<B, 3>>>],
     state: &TttState<B>,
@@ -1023,23 +1008,18 @@ fn store_ttt_state_rows<B: Backend>(
 }
 
 fn rebuild_ttt_state_from_rows<B: Backend>(outputs: Vec<Vec<Option<Tensor<B, 3>>>>) -> TttState<B> {
-    TttState {
-        layers: outputs
-            .into_iter()
-            .map(|layer_outputs| {
-                let fast_weight = layer_outputs.iter().any(Option::is_some).then(|| {
-                    Tensor::cat(
-                        layer_outputs
-                            .into_iter()
-                            .map(|weight| weight.expect("ragged rollout filled every state row"))
-                            .collect(),
-                        0,
-                    )
-                });
-                TttLayerState { fast_weight }
-            })
-            .collect(),
-    }
+    let rows = outputs.first().map(Vec::len).unwrap_or(0);
+    let row_states = (0..rows)
+        .map(|row| TttState {
+            layers: outputs
+                .iter()
+                .map(|layer_outputs| TttLayerState {
+                    fast_weight: layer_outputs[row].clone(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    TttState::pack_rows(&row_states)
 }
 
 fn select_batch_rows5<B: Backend>(tensor: Tensor<B, 5>, rows: &[usize]) -> Tensor<B, 5> {
@@ -1794,7 +1774,7 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
                 .collect::<Vec<_>>();
             let group_mask =
                 SparseMaskBatch::from_rows(group_rows, mask.dense_len(), &video.device())?;
-            let mut group_state = select_ttt_state_rows(state, &group);
+            let mut group_state = state.select_rows(&group);
             let encoded = self.forward_single_frame_rollout_sparse_patchify_wgpu_frozen_batch(
                 group_video,
                 &group_mask,
@@ -2397,7 +2377,7 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
                 .collect::<Vec<_>>();
             let group_mask =
                 SparseMaskBatch::from_rows(group_rows, mask.dense_len(), &video.device())?;
-            let mut group_state = select_ttt_state_rows(state, &group);
+            let mut group_state = state.select_rows(&group);
             let encoded = self
                 .forward_single_frame_rollout_sparse_patchify_cuda_fusion_frozen_batch(
                     group_video,

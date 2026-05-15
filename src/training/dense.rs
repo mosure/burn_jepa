@@ -86,7 +86,7 @@ pub fn train_dense_jepa<B: AutodiffBackend>(
         })?;
         final_loss = tensor_scalar(loss.loss.clone().detach())?;
         let grads = GradientsParams::from_grads(loss.loss.backward(), &model);
-        model = optim.step(config.training.learning_rate, model, grads);
+        model = optim.step(config.training.learning_rate_for_step(step), model, grads);
     }
     let elapsed_ms = start.elapsed().as_millis();
     let model_path = if config.model.save_model {

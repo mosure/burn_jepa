@@ -25,6 +25,8 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["ndarray", "webgpu"]
 ndarray = ["burn/ndarray"]
+flex = ["burn/flex"]
+dispatch = ["burn/dispatch"]
 webgpu = ["burn/webgpu"]
 wgpu = ["burn/wgpu", "burn-store/wgpu"]
 cuda = ["burn/cuda", "burn-store/cuda"]
@@ -90,11 +92,12 @@ tempfile = "3"
 [[bench]]
 name = "sparse_pipeline"
 harness = false
+required-features = ["ndarray"]
 
 [[bench]]
 name = "autogaze_sparse_jepa_pipeline"
 harness = false
-required-features = ["autogaze"]
+required-features = ["autogaze", "ndarray"]
 
 [[bench]]
 name = "ttt_training"

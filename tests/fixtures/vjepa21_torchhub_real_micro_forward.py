@@ -34,12 +34,33 @@ def load_official_vjepa21(checkpoint_dir: Path, weights_name: str, model_name: s
     return encoder, predictor
 
 
-def deterministic_video(config: dict) -> torch.Tensor:
-    frames = int(config.get("tubelet_size", 2))
-    channels = int(config.get("in_channels", 3))
+def parity_case(config: dict, name: str):
+    tubelet = int(config.get("tubelet_size", 2))
     patch = int(config.get("patch_size", 16))
-    height = patch * 2
-    width = patch * 2
+    if name == "micro":
+        return {
+            "frames": tubelet,
+            "height": patch * 2,
+            "width": patch * 2,
+            "context": [0, 2],
+            "target": [1, 3],
+        }
+    if name == "multi_grid":
+        return {
+            "frames": tubelet * 2,
+            "height": patch * 3,
+            "width": patch * 4,
+            "context": [0, 5, 11, 12, 17, 23],
+            "target": [1, 6, 13, 18],
+        }
+    raise ValueError(f"unknown V-JEPA 2.1 parity case: {name}")
+
+
+def deterministic_video(config: dict, case: dict) -> torch.Tensor:
+    frames = int(case["frames"])
+    channels = int(config.get("in_channels", 3))
+    height = int(case["height"])
+    width = int(case["width"])
     size = channels * frames * height * width
     values = torch.arange(size, dtype=torch.float32)
     values = ((values % 31) - 15) / 23.0
@@ -47,10 +68,10 @@ def deterministic_video(config: dict) -> torch.Tensor:
 
 
 def main() -> None:
-    if len(sys.argv) != 6:
+    if len(sys.argv) != 7:
         raise SystemExit(
             "usage: vjepa21_torchhub_real_micro_forward.py "
-            "<checkpoint_dir> <weights_name> <model_name> <num_frames> <output.json>"
+            "<checkpoint_dir> <weights_name> <model_name> <num_frames> <case> <output.json>"
         )
 
     os.environ.setdefault("TORCH_HOME", str(Path.home() / ".cache" / "torch"))
@@ -59,15 +80,18 @@ def main() -> None:
     weights_name = sys.argv[2]
     model_name = sys.argv[3]
     num_frames = int(sys.argv[4])
-    output_path = Path(sys.argv[5])
+    case_name = sys.argv[5]
+    output_path = Path(sys.argv[6])
     config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
     encoder, predictor = load_official_vjepa21(checkpoint_dir, weights_name, model_name, num_frames)
+    case = parity_case(config, case_name)
 
-    context = torch.tensor([[0, 2]], dtype=torch.long)
-    target = torch.tensor([[1, 3]], dtype=torch.long)
+    context = torch.tensor([case["context"]], dtype=torch.long)
+    target = torch.tensor([case["target"]], dtype=torch.long)
+    video = deterministic_video(config, case)
     with torch.no_grad():
-        dense = encoder(deterministic_video(config))
-        context_tokens = dense[:, context[0], :]
+        dense = encoder(video)
+        context_tokens = encoder(video, [context])
         predictions, _ = predictor(
             context_tokens,
             [context],
@@ -77,6 +101,7 @@ def main() -> None:
         targets = dense[:, target[0], :]
 
     payload = {
+        "context_tokens": context_tokens.contiguous().flatten().tolist(),
         "predictions": predictions.contiguous().flatten().tolist(),
         "targets": targets.contiguous().flatten().tolist(),
     }

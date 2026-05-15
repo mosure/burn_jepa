@@ -1,0 +1,65 @@
+[model]
+checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
+teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
+ttt_checkpoint_path = "target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk"
+config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
+weights_name = "model.pt"
+output_dir = "target/burn-jepa-production-final/stage2-unfrozen-low-lr"
+save_model = true
+
+[dataset]
+kind = "manifest"
+sample_kind = "video"
+train_manifest = "target/burn-jepa-production-final/data/train-real-autogaze.jsonl"
+eval_manifest = "target/burn-jepa-production-final/data/eval-real-autogaze.jsonl"
+frames = 16
+stride = 1
+image_size = 224
+synthetic_len = 1
+
+[ttt]
+layer_placement = "explicit"
+layers = [3, 7, 11]
+predictor_layers = []
+chunk_tokens = 196
+ttt_lr = 0.003
+use_projection = true
+conv_kernel = 3
+memory_update = "self_hidden"
+supervision = "final_teacher"
+hybrid_final_steps = 1
+rollout_blocks = 2
+backprop_mode = "final_feature"
+backprop_truncate_blocks = 1
+freeze_pretrained = false
+
+[training]
+backend = "cuda"
+batch_size = 1
+max_steps = 2048
+learning_rate = 0.0000005
+weight_decay = 0.000001
+context_keep_ratio = 0.75
+sparse_rollout = "context_mask"
+sparse_patchify_training = "dense_patch_embed"
+batching = "fixed_width_masks"
+loss_trace_interval = 32
+eval_steps = 11
+eval_batch_size = 16
+eval_full_grid = false
+eval_utilization_diagnostics = true
+eval_temporal_diagnostics = true
+cache_teacher_tokens = true
+save_steps = 256
+
+[training.lr_schedule]
+kind = "linear_warmup_cosine"
+warmup_steps = 128
+min_learning_rate = 0.00000005
+
+[training.mask]
+kind = "manifest_precomputed_masks"
+
+[loss]
+feature_loss_weight = 1.0
+predictor_loss_weight = 0.0

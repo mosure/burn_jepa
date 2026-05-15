@@ -11,8 +11,29 @@ type B = burn::backend::NdArray<f32>;
 
 #[derive(Debug, Deserialize)]
 struct TorchParityOutput {
+    #[serde(default)]
+    context_tokens: Option<Vec<f32>>,
     predictions: Vec<f32>,
     targets: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct TorchhubParityCase {
+    name: &'static str,
+    frames: usize,
+    height: usize,
+    width: usize,
+    context: Vec<usize>,
+    target: Vec<usize>,
+}
+
+impl TorchhubParityCase {
+    fn dense_len(&self, config: &VJepaConfig) -> usize {
+        let temporal = self.frames / config.tubelet_size.max(1);
+        let rows = self.height / config.patch_size.max(1);
+        let cols = self.width / config.patch_size.max(1);
+        temporal * rows * cols
+    }
 }
 
 #[test]
@@ -357,26 +378,43 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
         );
     } else if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY") && is_pytorch_weights_name(&weights_name)
     {
-        let torch_output = real_vjepa21_torchhub_micro_forward(
-            &checkpoint_dir,
-            &weights_name,
-            &config,
-            torchhub_model_name(&config),
-        );
-        let (burn_predictions, burn_targets) = real_torchhub_burn_micro_forward(
-            &model,
-            &config,
-            env_usize("BURN_JEPA_VJEPA21_MASK_INDEX", 1),
-        );
-        let prediction_diff = max_abs_diff(&burn_predictions, &torch_output.predictions);
-        let target_diff = max_abs_diff(&burn_targets, &torch_output.targets);
-        eprintln!(
-            "real V-JEPA 2.1 torchhub micro parity prediction_diff={prediction_diff:e} target_diff={target_diff:e}"
-        );
-        assert!(
-            prediction_diff <= 5.0e-4 && target_diff <= 5.0e-4,
-            "real V-JEPA 2.1 torchhub micro parity exceeded tolerance: prediction_diff={prediction_diff:e}, target_diff={target_diff:e}"
-        );
+        for case in torchhub_parity_cases(&config) {
+            let torch_output = real_vjepa21_torchhub_forward(
+                &checkpoint_dir,
+                &weights_name,
+                &config,
+                torchhub_model_name(&config),
+                &case,
+            );
+            let (burn_context, burn_predictions, burn_targets) = real_torchhub_burn_forward(
+                &model,
+                &config,
+                env_usize("BURN_JEPA_VJEPA21_MASK_INDEX", 1),
+                &case,
+            );
+            let context_diff = torch_output
+                .context_tokens
+                .as_ref()
+                .map(|torch_context| max_abs_diff(&burn_context, torch_context));
+            let prediction_diff = max_abs_diff(&burn_predictions, &torch_output.predictions);
+            let target_diff = max_abs_diff(&burn_targets, &torch_output.targets);
+            eprintln!(
+                "real V-JEPA 2.1 torchhub {} parity context_diff={:?} prediction_diff={prediction_diff:e} target_diff={target_diff:e}",
+                case.name, context_diff
+            );
+            if let Some(context_diff) = context_diff {
+                assert!(
+                    context_diff <= 5.0e-4,
+                    "real V-JEPA 2.1 torchhub {} sparse encoder parity exceeded tolerance: context_diff={context_diff:e}",
+                    case.name
+                );
+            }
+            assert!(
+                prediction_diff <= 5.0e-4 && target_diff <= 5.0e-4,
+                "real V-JEPA 2.1 torchhub {} parity exceeded tolerance: prediction_diff={prediction_diff:e}, target_diff={target_diff:e}",
+                case.name
+            );
+        }
     } else if env_bool("BURN_JEPA_VJEPA21_FORWARD_PARITY") {
         eprintln!(
             "skipping HF micro parity because this checkpoint is not a Hugging Face VJEPA2 fixture; running Burn real-weight micro forward smoke instead"
@@ -448,16 +486,47 @@ fn real_burn_micro_forward(
     (burn_predictions, burn_targets)
 }
 
-fn real_torchhub_burn_micro_forward(
+fn torchhub_parity_cases(config: &VJepaConfig) -> Vec<TorchhubParityCase> {
+    vec![
+        TorchhubParityCase {
+            name: "micro",
+            frames: config.tubelet_size.max(1),
+            height: config.patch_size.max(1) * 2,
+            width: config.patch_size.max(1) * 2,
+            context: vec![0, 2],
+            target: vec![1, 3],
+        },
+        TorchhubParityCase {
+            name: "multi_grid",
+            frames: config.tubelet_size.max(1) * 2,
+            height: config.patch_size.max(1) * 3,
+            width: config.patch_size.max(1) * 4,
+            context: vec![0, 5, 11, 12, 17, 23],
+            target: vec![1, 6, 13, 18],
+        },
+    ]
+}
+
+fn real_torchhub_burn_forward(
     model: &VJepa2_1Model<B>,
     config: &VJepaConfig,
     mask_index: usize,
-) -> (Vec<f32>, Vec<f32>) {
+    case: &TorchhubParityCase,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let device = Default::default();
-    let context = SparseTokenMask::new(vec![0, 2], 4).expect("torchhub micro context");
-    let target = SparseTokenMask::new(vec![1, 3], 4).expect("torchhub micro target");
-    let dense = model.encode_video(real_torchhub_micro_parity_video(config), None);
-    let context_tokens = apply_token_mask(dense.tokens.clone(), context.to_tensor(1, &device));
+    let context =
+        SparseTokenMask::new(case.context.clone(), case.dense_len(config)).expect("context mask");
+    let target =
+        SparseTokenMask::new(case.target.clone(), case.dense_len(config)).expect("target mask");
+    let video = real_torchhub_parity_video(config, case);
+    let context_output = model.encode_video(video.clone(), Some(&context));
+    let context_tokens = context_output.tokens;
+    let burn_context = context_tokens
+        .clone()
+        .to_data()
+        .to_vec::<f32>()
+        .expect("real torchhub burn context values");
+    let dense = model.encode_video(video, None);
     let predictor = model
         .predictor
         .forward_sparse(context_tokens, &context, &target, dense.grid, mask_index)
@@ -471,7 +540,7 @@ fn real_torchhub_burn_micro_forward(
         .to_data()
         .to_vec::<f32>()
         .expect("real torchhub burn target values");
-    (burn_predictions, burn_targets)
+    (burn_context, burn_predictions, burn_targets)
 }
 
 fn real_hf_micro_forward_available(checkpoint_dir: &std::path::Path) -> bool {
@@ -600,11 +669,11 @@ fn real_micro_parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
     )
 }
 
-fn real_torchhub_micro_parity_video(config: &VJepaConfig) -> Tensor<B, 5> {
+fn real_torchhub_parity_video(config: &VJepaConfig, case: &TorchhubParityCase) -> Tensor<B, 5> {
     let device = Default::default();
-    let frames = config.tubelet_size.max(1);
-    let height = config.patch_size.max(1) * 2;
-    let width = config.patch_size.max(1) * 2;
+    let frames = case.frames;
+    let height = case.height;
+    let width = case.width;
     let len = config.in_channels * frames * height * width;
     let values = (0..len)
         .map(|i| ((i % 31) as f32 - 15.0) / 23.0)
@@ -645,11 +714,12 @@ fn real_hf_micro_forward(checkpoint_dir: &std::path::Path) -> TorchParityOutput 
         .expect("parse real HF fixture output")
 }
 
-fn real_vjepa21_torchhub_micro_forward(
+fn real_vjepa21_torchhub_forward(
     checkpoint_dir: &std::path::Path,
     weights_name: &str,
     config: &VJepaConfig,
     model_name: &str,
+    case: &TorchhubParityCase,
 ) -> TorchParityOutput {
     if Command::new("python3")
         .arg("-c")
@@ -670,12 +740,13 @@ fn real_vjepa21_torchhub_micro_forward(
         .arg(weights_name)
         .arg(model_name)
         .arg(config.num_frames.to_string())
+        .arg(case.name)
         .arg(&output_path)
         .output()
-        .expect("run real torchhub V-JEPA 2.1 micro fixture");
+        .expect("run real torchhub V-JEPA 2.1 fixture");
     assert!(
         output.status.success(),
-        "real torchhub V-JEPA 2.1 micro fixture failed\nstdout:\n{}\nstderr:\n{}",
+        "real torchhub V-JEPA 2.1 fixture failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

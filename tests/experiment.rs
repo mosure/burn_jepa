@@ -40,6 +40,26 @@ fn experiment_config_plans_trial_matrix() {
 }
 
 #[test]
+fn experiment_config_accepts_predictor_layer_sets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut config = ExperimentConfig::default();
+    config.output_dir = temp.path().join("experiment");
+    config.seeds = vec![0];
+    config.densities = vec![0.25];
+    config.model_variants = vec![ExperimentModelVariant::TttSelfHidden];
+    config.mask_policies = vec![ExperimentMaskPolicy::PrecomputedMasks];
+    config.ttt_layer_sets = vec![burn_jepa::ExperimentTttLayerSet {
+        name: "predictor_last".to_string(),
+        placement: None,
+        encoder_layers: Vec::new(),
+        predictor_layers: vec![1],
+    }];
+
+    let report = write_experiment_plan(&config).expect("write predictor placement plan");
+    assert_eq!(report.trial_count, 1);
+}
+
+#[test]
 fn default_experiment_config_covers_full_synthetic_gate_matrix() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut config = ExperimentConfig::default();
@@ -78,6 +98,28 @@ fn default_experiment_config_covers_full_synthetic_gate_matrix() {
         config.ttt_layer_sets[0].placement,
         Some(TttLayerPlacement::FirstLast)
     );
+}
+
+#[test]
+fn production_autogaze_data_config_uses_clip_prefix_domains() {
+    let config: ExperimentConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-autogaze-mask-data.toml"
+    ))
+    .expect("parse production AutoGaze data config");
+
+    assert!(config.data.domain_from_clip_prefix);
+    assert!(!config.data.domain_from_parent);
+    assert!(config.data.autogaze_masks.is_some());
+    assert!(
+        config
+            .data
+            .autogaze_masks
+            .as_ref()
+            .is_some_and(|masks| masks.streaming),
+        "production AutoGaze mask prep should use the streaming cache path"
+    );
+    assert_eq!(config.data.window_frames, 16);
+    assert_eq!(config.data.window_stride, 8);
 }
 
 #[test]
@@ -141,6 +183,33 @@ fn experiment_prepare_data_records_domain_labels() {
     assert_eq!(report.domains, vec!["nature".to_string()]);
     let text = std::fs::read_to_string(report.train_manifest).expect("read train manifest");
     assert!(text.contains("\"domain\":\"nature\""));
+}
+
+#[test]
+fn experiment_prepare_data_can_infer_domain_from_clip_prefix() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = temp.path().join("frames");
+    let clip = input.join("cisco_001");
+    std::fs::create_dir_all(&clip).expect("clip");
+    for index in 0..3 {
+        image::RgbImage::from_pixel(2, 2, image::Rgb([0, 255, 0]))
+            .save(clip.join(format!("{index:03}.png")))
+            .expect("frame");
+    }
+
+    let mut config = ExperimentConfig::default();
+    config.data.input = Some(input);
+    config.data.output_dir = temp.path().join("out");
+    config.data.train_manifest = temp.path().join("out/train.jsonl");
+    config.data.eval_manifest = temp.path().join("out/eval.jsonl");
+    config.data.window_frames = 2;
+    config.data.window_stride = 2;
+    config.data.domain_from_clip_prefix = true;
+
+    let report = prepare_experiment_data(&config).expect("prepare data");
+    assert_eq!(report.domains, vec!["cisco".to_string()]);
+    let text = std::fs::read_to_string(report.train_manifest).expect("read train manifest");
+    assert!(text.contains("\"domain\":\"cisco\""));
 }
 
 #[test]
