@@ -2,17 +2,12 @@ use crate::VJepaConfig;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TttTargetMode {
+    #[default]
     TeacherFinal,
     SelfHidden,
-}
-
-impl Default for TttTargetMode {
-    fn default() -> Self {
-        Self::TeacherFinal
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

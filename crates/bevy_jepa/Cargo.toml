@@ -1,0 +1,80 @@
+[package]
+name = "bevy_jepa"
+version = "0.21.0"
+edition = "2024"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+description = "Bevy native and wasm viewer for the burn_jepa sparse JEPA feature pipeline"
+homepage = "https://github.com/mosure/burn_jepa"
+repository = "https://github.com/mosure/burn_jepa"
+readme = "README.md"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+anyhow = "1"
+burn = { version = "0.21.0", default-features = false, features = ["fusion", "std", "webgpu"] }
+burn_jepa = { path = "../..", default-features = false, features = ["autogaze-webgpu", "webgpu"] }
+bevy_burn = { git = "https://github.com/mosure/bevy_burn", rev = "6875d23ed22d341767e37f0e3b02897e7ff3a1cd" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dependencies.bevy]
+git = "https://github.com/bevyengine/bevy"
+rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce"
+default-features = false
+features = [
+  "bevy_asset",
+  "bevy_camera",
+  "bevy_core_pipeline",
+  "bevy_image",
+  "bevy_log",
+  "bevy_render",
+  "bevy_sprite",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_window",
+  "bevy_winit",
+  "debug",
+  "default_font",
+  "png",
+  "std",
+  "webgpu",
+  "x11",
+  "zstd_rust",
+]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.6", features = ["derive"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  "Location",
+  "Window",
+  "console",
+]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bevy_jepa"
+path = "src/main.rs"
+
+[[bench]]
+name = "viewer_pipeline"
+harness = false

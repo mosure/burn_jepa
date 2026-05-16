@@ -505,10 +505,10 @@ impl TttRolloutKind {
         }
     }
 
-    pub(super) fn select_mask<'a, B: Backend>(
+    pub(super) fn select_mask<B: Backend>(
         self,
-        masks: &'a ResolvedTttMasks<B>,
-    ) -> &'a SparseMaskBatch<B> {
+        masks: &ResolvedTttMasks<B>,
+    ) -> &SparseMaskBatch<B> {
         match self {
             Self::Dense | Self::SparseTarget => &masks.target,
             Self::SparseContext => &masks.context,

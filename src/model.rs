@@ -1,9 +1,10 @@
 use crate::config::VJepaConfig;
 use crate::positional::sparse_3d_sincos_pos_embed;
 #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
-use crate::sparse_patchify::SparsePatchifyPlan;
+use crate::sparse_patchify::{SparsePatchifyBatchPlan, SparsePatchifyPlan};
 use crate::tokens::{
-    SparseMaskBatch, SparseTokenMask, TokenGridShape, apply_token_mask, repeat_token_indices,
+    SparseMaskBatch, SparseTokenMask, TokenGridShape, apply_mask_batch, apply_token_mask,
+    repeat_token_indices,
 };
 use anyhow::{Result, ensure};
 use burn::module::{Module, Param};
@@ -494,6 +495,41 @@ impl<B: Backend> VJepaEncoder<B> {
         )
     }
 
+    pub fn forward_image_with_mask_batch(
+        &self,
+        image: Tensor<B, 4>,
+        mask: SparseMaskBatch<B>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        ensure!(
+            batch == mask.batch(),
+            "image batch does not match sparse mask batch"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "image channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            mask.dense_len() == grid.len(),
+            "sparse mask dense length must match image token grid"
+        );
+        let device = image.device();
+        let image = image.reshape([batch, channels, 1, height, width]);
+        let tokens = self.image_patch_embed.forward(image);
+        let tokens = if mask.len() < grid.len() {
+            apply_mask_batch(tokens, &mask)
+        } else {
+            tokens
+        };
+        let plan = SparseEncoderBatchPlan::new(&self.config, mask, grid, false, &device)?;
+        self.forward_sparse_tokens_with_batch_plan(tokens, &plan)
+    }
+
     fn forward_tokens_capture_layers(
         &self,
         tokens: Tensor<B, 3>,
@@ -694,6 +730,185 @@ fn layer_norm_for_capture<B: Backend>(
 
 #[cfg(feature = "sparse-patchify-wgpu")]
 impl VJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
+    pub fn sparse_patchify_image_wgpu(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        ensure!(
+            batch == plan.batch,
+            "image batch does not match sparse patchify plan"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "image channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            grid == plan.grid,
+            "image token grid does not match sparse patchify plan"
+        );
+        let device = image.device();
+        let patchify_config = burn_flex_gmm::SparsePatchify3dConfig {
+            in_channels: channels,
+            out_channels: self.config.encoder.embed_dim,
+            frames: 1,
+            height,
+            width,
+            tubelet_size: 1,
+            patch_h: self.config.patch_size,
+            patch_w: self.config.patch_size,
+        };
+        let bias = self
+            .image_patch_embed
+            .proj
+            .bias
+            .as_ref()
+            .map(|bias| bias.val())
+            .unwrap_or_else(|| {
+                Tensor::<burn_flex_gmm::wgpu::DefaultWgpuBackend, 1>::zeros(
+                    [self.config.encoder.embed_dim],
+                    &device,
+                )
+            });
+        burn_flex_gmm::wgpu::sparse_patchify3d_forward_wgpu(
+            &patchify_config,
+            image.reshape([batch, channels, 1, height, width]),
+            plan.coords.clone(),
+            self.image_patch_embed.proj.weight.val(),
+            bias,
+        )
+        .map_err(anyhow::Error::msg)
+        .map(|tokens| tokens.reshape([batch, plan.token_count(), self.config.encoder.embed_dim]))
+    }
+
+    pub fn sparse_patchify_image_wgpu_batch(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        ensure!(
+            batch == plan.batch,
+            "image batch does not match sparse patchify batch plan"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "image channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            grid == plan.grid,
+            "image token grid does not match sparse patchify batch plan"
+        );
+        let device = image.device();
+        let patchify_config = burn_flex_gmm::SparsePatchify3dConfig {
+            in_channels: channels,
+            out_channels: self.config.encoder.embed_dim,
+            frames: 1,
+            height,
+            width,
+            tubelet_size: 1,
+            patch_h: self.config.patch_size,
+            patch_w: self.config.patch_size,
+        };
+        let bias = self
+            .image_patch_embed
+            .proj
+            .bias
+            .as_ref()
+            .map(|bias| bias.val())
+            .unwrap_or_else(|| {
+                Tensor::<burn_flex_gmm::wgpu::DefaultWgpuBackend, 1>::zeros(
+                    [self.config.encoder.embed_dim],
+                    &device,
+                )
+            });
+        burn_flex_gmm::wgpu::sparse_patchify3d_forward_wgpu(
+            &patchify_config,
+            image.reshape([batch, channels, 1, height, width]),
+            plan.coords.clone(),
+            self.image_patch_embed.proj.weight.val(),
+            bias,
+        )
+        .map_err(anyhow::Error::msg)
+        .map(|tokens| tokens.reshape([batch, plan.token_count(), self.config.encoder.embed_dim]))
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        let encoder_plan = SparseEncoderPlan::new(
+            &self.config,
+            plan.mask.clone(),
+            plan.grid,
+            plan.batch,
+            false,
+            &image.device(),
+        )?;
+        self.forward_image_sparse_patchify_wgpu_with_plan(image, plan, &encoder_plan)
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_with_plan(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        patchify_plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        encoder_plan: &SparseEncoderPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        ensure!(
+            encoder_plan.mask == patchify_plan.mask
+                && encoder_plan.grid == patchify_plan.grid
+                && encoder_plan.batch == patchify_plan.batch
+                && !encoder_plan.video,
+            "sparse patchify and sparse encoder plans must match"
+        );
+        let tokens = self.sparse_patchify_image_wgpu(image, patchify_plan)?;
+        self.forward_sparse_tokens_with_plan(tokens, encoder_plan)
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_batch(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        let encoder_plan = SparseEncoderBatchPlan::new(
+            &self.config,
+            plan.mask.clone(),
+            plan.grid,
+            false,
+            &image.device(),
+        )?;
+        self.forward_image_sparse_patchify_wgpu_batch_with_plan(image, plan, &encoder_plan)
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_batch_with_plan(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        patchify_plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        encoder_plan: &SparseEncoderBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        ensure!(
+            encoder_plan.mask.rows() == patchify_plan.mask.rows()
+                && encoder_plan.grid == patchify_plan.grid
+                && encoder_plan.batch == patchify_plan.batch
+                && !encoder_plan.video,
+            "sparse patchify and sparse encoder batch plans must match"
+        );
+        let tokens = self.sparse_patchify_image_wgpu_batch(image, patchify_plan)?;
+        self.forward_sparse_tokens_with_batch_plan(tokens, encoder_plan)
+    }
+
     pub fn sparse_patchify_video_wgpu(
         &self,
         video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
@@ -787,6 +1002,185 @@ impl VJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
 
 #[cfg(feature = "sparse-patchify-cuda")]
 impl VJepaEncoder<burn_flex_gmm::cuda::DefaultCudaBackend> {
+    pub fn sparse_patchify_image_cuda(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 3>> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        ensure!(
+            batch == plan.batch,
+            "image batch does not match sparse patchify plan"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "image channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            grid == plan.grid,
+            "image token grid does not match sparse patchify plan"
+        );
+        let device = image.device();
+        let patchify_config = burn_flex_gmm::SparsePatchify3dConfig {
+            in_channels: channels,
+            out_channels: self.config.encoder.embed_dim,
+            frames: 1,
+            height,
+            width,
+            tubelet_size: 1,
+            patch_h: self.config.patch_size,
+            patch_w: self.config.patch_size,
+        };
+        let bias = self
+            .image_patch_embed
+            .proj
+            .bias
+            .as_ref()
+            .map(|bias| bias.val())
+            .unwrap_or_else(|| {
+                Tensor::<burn_flex_gmm::cuda::DefaultCudaBackend, 1>::zeros(
+                    [self.config.encoder.embed_dim],
+                    &device,
+                )
+            });
+        burn_flex_gmm::cuda::sparse_patchify3d_forward_cuda(
+            &patchify_config,
+            image.reshape([batch, channels, 1, height, width]),
+            plan.coords.clone(),
+            self.image_patch_embed.proj.weight.val(),
+            bias,
+        )
+        .map_err(anyhow::Error::msg)
+        .map(|tokens| tokens.reshape([batch, plan.token_count(), self.config.encoder.embed_dim]))
+    }
+
+    pub fn sparse_patchify_image_cuda_batch(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 3>> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        ensure!(
+            batch == plan.batch,
+            "image batch does not match sparse patchify batch plan"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "image channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            grid == plan.grid,
+            "image token grid does not match sparse patchify batch plan"
+        );
+        let device = image.device();
+        let patchify_config = burn_flex_gmm::SparsePatchify3dConfig {
+            in_channels: channels,
+            out_channels: self.config.encoder.embed_dim,
+            frames: 1,
+            height,
+            width,
+            tubelet_size: 1,
+            patch_h: self.config.patch_size,
+            patch_w: self.config.patch_size,
+        };
+        let bias = self
+            .image_patch_embed
+            .proj
+            .bias
+            .as_ref()
+            .map(|bias| bias.val())
+            .unwrap_or_else(|| {
+                Tensor::<burn_flex_gmm::cuda::DefaultCudaBackend, 1>::zeros(
+                    [self.config.encoder.embed_dim],
+                    &device,
+                )
+            });
+        burn_flex_gmm::cuda::sparse_patchify3d_forward_cuda(
+            &patchify_config,
+            image.reshape([batch, channels, 1, height, width]),
+            plan.coords.clone(),
+            self.image_patch_embed.proj.weight.val(),
+            bias,
+        )
+        .map_err(anyhow::Error::msg)
+        .map(|tokens| tokens.reshape([batch, plan.token_count(), self.config.encoder.embed_dim]))
+    }
+
+    pub fn forward_image_sparse_patchify_cuda(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        let encoder_plan = SparseEncoderPlan::new(
+            &self.config,
+            plan.mask.clone(),
+            plan.grid,
+            plan.batch,
+            false,
+            &image.device(),
+        )?;
+        self.forward_image_sparse_patchify_cuda_with_plan(image, plan, &encoder_plan)
+    }
+
+    pub fn forward_image_sparse_patchify_cuda_with_plan(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        patchify_plan: &SparsePatchifyPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        encoder_plan: &SparseEncoderPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        ensure!(
+            encoder_plan.mask == patchify_plan.mask
+                && encoder_plan.grid == patchify_plan.grid
+                && encoder_plan.batch == patchify_plan.batch
+                && !encoder_plan.video,
+            "sparse patchify and sparse encoder plans must match"
+        );
+        let tokens = self.sparse_patchify_image_cuda(image, patchify_plan)?;
+        self.forward_sparse_tokens_with_plan(tokens, encoder_plan)
+    }
+
+    pub fn forward_image_sparse_patchify_cuda_batch(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        let encoder_plan = SparseEncoderBatchPlan::new(
+            &self.config,
+            plan.mask.clone(),
+            plan.grid,
+            false,
+            &image.device(),
+        )?;
+        self.forward_image_sparse_patchify_cuda_batch_with_plan(image, plan, &encoder_plan)
+    }
+
+    pub fn forward_image_sparse_patchify_cuda_batch_with_plan(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        patchify_plan: &SparsePatchifyBatchPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        encoder_plan: &SparseEncoderBatchPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        ensure!(
+            encoder_plan.mask.rows() == patchify_plan.mask.rows()
+                && encoder_plan.grid == patchify_plan.grid
+                && encoder_plan.batch == patchify_plan.batch
+                && !encoder_plan.video,
+            "sparse patchify and sparse encoder batch plans must match"
+        );
+        let tokens = self.sparse_patchify_image_cuda_batch(image, patchify_plan)?;
+        self.forward_sparse_tokens_with_batch_plan(tokens, encoder_plan)
+    }
+
     pub fn sparse_patchify_video_cuda(
         &self,
         video: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 5>,
@@ -1174,6 +1568,22 @@ impl<B: Backend> VJepa2_1Model<B> {
         self.encoder.forward_video(video, mask)
     }
 
+    pub fn encode_image(
+        &self,
+        image: Tensor<B, 4>,
+        mask: Option<&SparseTokenMask>,
+    ) -> VJepaEncoderOutput<B> {
+        self.encoder.forward_image(image, mask)
+    }
+
+    pub fn encode_image_batch(
+        &self,
+        image: Tensor<B, 4>,
+        mask: SparseMaskBatch<B>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.encoder.forward_image_with_mask_batch(image, mask)
+    }
+
     pub fn encode_video_with_plan(
         &self,
         video: Tensor<B, 5>,
@@ -1223,6 +1633,36 @@ impl<B: Backend> VJepa2_1Model<B> {
 
 #[cfg(feature = "sparse-patchify-wgpu")]
 impl VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
+    pub fn encode_image_sparse_patchify_wgpu(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.encoder.forward_image_sparse_patchify_wgpu(image, plan)
+    }
+
+    pub fn encode_image_sparse_patchify_wgpu_with_plan(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        patchify_plan: &SparsePatchifyPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        encoder_plan: &SparseEncoderPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.encoder.forward_image_sparse_patchify_wgpu_with_plan(
+            image,
+            patchify_plan,
+            encoder_plan,
+        )
+    }
+
+    pub fn encode_image_sparse_patchify_wgpu_batch(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.encoder
+            .forward_image_sparse_patchify_wgpu_batch(image, plan)
+    }
+
     pub fn encode_video_sparse_patchify_wgpu(
         &self,
         video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
@@ -1281,6 +1721,36 @@ impl VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
 
 #[cfg(feature = "sparse-patchify-cuda")]
 impl VJepa2_1Model<burn_flex_gmm::cuda::DefaultCudaBackend> {
+    pub fn encode_image_sparse_patchify_cuda(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        plan: &SparsePatchifyPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        self.encoder.forward_image_sparse_patchify_cuda(image, plan)
+    }
+
+    pub fn encode_image_sparse_patchify_cuda_with_plan(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        patchify_plan: &SparsePatchifyPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+        encoder_plan: &SparseEncoderPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        self.encoder.forward_image_sparse_patchify_cuda_with_plan(
+            image,
+            patchify_plan,
+            encoder_plan,
+        )
+    }
+
+    pub fn encode_image_sparse_patchify_cuda_batch(
+        &self,
+        image: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::cuda::DefaultCudaBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        self.encoder
+            .forward_image_sparse_patchify_cuda_batch(image, plan)
+    }
+
     pub fn encode_video_sparse_patchify_cuda(
         &self,
         video: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 5>,

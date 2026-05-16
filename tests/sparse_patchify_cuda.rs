@@ -3,9 +3,11 @@
 use burn::tensor::Tensor;
 use burn::tensor::backend::BackendTypes;
 use burn_jepa::{
-    SparseImageTokenGrid, SparsePatchifyPlan, SparseTokenMask, TemporalSparseJepaStream,
-    TemporalSparseJepaStreamConfig, TttEncoderConfig, VJepa2_1Model, VJepaConfig, VJepaTttModel,
-    apply_token_mask,
+    AnyUp, AnyUpConfig, SparseImageTokenGrid, SparseJepaAnyUpPcaEncodePath,
+    SparseJepaAnyUpPcaMeasurementConfig, SparseJepaAnyUpPcaPipeline,
+    SparseJepaAnyUpPcaPipelineConfig, SparseMaskBatch, SparsePatchifyBatchPlan, SparsePatchifyPlan,
+    SparseTokenMask, TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TttEncoderConfig,
+    VJepa2_1Model, VJepaConfig, VJepaTttModel, apply_token_mask,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -77,6 +79,104 @@ fn cuda_sparse_patchify_matches_dense_encoder_on_selected_tokens() {
         .tokens
         .to_data();
     assert_close(&dense, &sparse, "cuda sparse patchify encoder");
+}
+
+#[test]
+fn cuda_sparse_image_patchify_matches_dense_image_encoder_on_selected_tokens() {
+    if !cuda_sparse_patchify_smoke_enabled() {
+        return;
+    }
+    let _guard = cuda_sparse_patchify_test_lock()
+        .lock()
+        .expect("CUDA sparse patchify test lock");
+
+    let device = <B as BackendTypes>::Device::default();
+    let config = cuda_tiny_config();
+    let model = VJepa2_1Model::<B>::new(&config, &device);
+    let grid = burn_jepa::TokenGridShape::new(1, config.grid_height(), config.grid_width());
+    let mask = SparseTokenMask::new(vec![0, 3], grid.len()).expect("mask");
+    let plan = SparsePatchifyPlan::<B>::new(mask.clone(), grid, 1, &device).expect("plan");
+    let values = (0..config.in_channels * config.image_size * config.image_size)
+        .map(|idx| (idx as f32).sin() * 0.01)
+        .collect::<Vec<_>>();
+    let image = Tensor::<B, 1>::from_floats(values.as_slice(), &device).reshape([
+        1,
+        config.in_channels,
+        config.image_size,
+        config.image_size,
+    ]);
+
+    let dense = model
+        .encode_image(image.clone(), Some(&mask))
+        .tokens
+        .to_data();
+    let sparse = model
+        .encode_image_sparse_patchify_cuda(image, &plan)
+        .expect("sparse image patchify encode")
+        .tokens
+        .to_data();
+    assert_close(&dense, &sparse, "cuda sparse image patchify encoder");
+}
+
+#[test]
+fn cuda_highres_pipeline_uses_sparse_image_patchify_encode_path() {
+    if !cuda_sparse_patchify_smoke_enabled() {
+        return;
+    }
+    let _guard = cuda_sparse_patchify_test_lock()
+        .lock()
+        .expect("CUDA sparse patchify test lock");
+
+    let device = <B as BackendTypes>::Device::default();
+    let config = cuda_tiny_config();
+    let jepa = VJepa2_1Model::<B>::new(&config, &device);
+    let anyup = AnyUp::<B>::new(AnyUpConfig::tiny_for_tests(), &device).expect("anyup");
+    let mut pipeline = SparseJepaAnyUpPcaPipeline::<B>::new(
+        jepa,
+        anyup,
+        &config,
+        SparseJepaAnyUpPcaPipelineConfig {
+            anyup_q_chunk_size: Some(1),
+            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
+            ..SparseJepaAnyUpPcaPipelineConfig::default()
+        },
+        1,
+        [config.image_size, config.image_size],
+        &device,
+    )
+    .expect("pipeline");
+    let image = Tensor::<B, 4>::ones([1, 3, config.image_size, config.image_size], &device);
+    let mask = SparseTokenMask::new(vec![0, 3], pipeline.grid().len()).expect("mask");
+    let mask_batch = SparseMaskBatch::uniform(mask, 1, &device).expect("mask batch");
+    let patchify_plan =
+        SparsePatchifyBatchPlan::new(mask_batch, pipeline.grid(), &device).expect("patchify plan");
+
+    let measured = pipeline
+        .step_image_with_sparse_patchify_plan_cuda_measured(
+            image,
+            &patchify_plan,
+            SparseJepaAnyUpPcaMeasurementConfig::enabled(),
+        )
+        .expect("sparse patchify high-res step");
+
+    assert_eq!(
+        measured.metrics.encode_path,
+        SparseJepaAnyUpPcaEncodePath::SparsePatchify
+    );
+    assert_eq!(
+        measured.output.encoded.tokens.shape().dims::<3>(),
+        [1, 2, 32]
+    );
+    assert_eq!(
+        measured.output.pca_display.shape().dims::<4>(),
+        [1, 3, config.image_size, config.image_size]
+    );
+    // CUDA teardown can race at test-process exit after this mixed sparse-kernel
+    // and generic tensor path has already completed. Keep the smoke focused on
+    // runtime correctness instead of backend drop ordering.
+    std::mem::forget(measured);
+    std::mem::forget(patchify_plan);
+    std::mem::forget(pipeline);
 }
 
 #[test]

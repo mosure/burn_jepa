@@ -87,7 +87,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
             TttBackpropMode::TruncatedFinal => self.backprop_truncate_blocks,
             TttBackpropMode::FinalFeature | TttBackpropMode::LayerLocal => self.rollout_blocks,
         };
-        blocks > 0 && (tubelet_index + 1) % blocks == 0 && tubelet_index + 1 < grid_depth
+        blocks > 0 && (tubelet_index + 1).is_multiple_of(blocks) && tubelet_index + 1 < grid_depth
     }
 
     fn should_early_exit_after_layer(&self, layer_index: usize) -> bool {
@@ -368,12 +368,11 @@ impl<B: Backend> VJepaTttEncoder<B> {
                 target_frame,
                 state,
                 update_fast_weight,
-                probes.as_mut().map(|records| &mut **records),
+                probes.as_deref_mut(),
             )?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -501,12 +500,11 @@ impl<B: Backend> VJepaTttEncoder<B> {
                 target_frame,
                 state,
                 update_fast_weight,
-                probes.as_mut().map(|records| &mut **records),
+                probes.as_deref_mut(),
             )?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -591,7 +589,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
                 &mut group_state,
                 update_fast_weight,
                 reset_mode,
-                probes.as_mut().map(|records| &mut **records),
+                probes.as_deref_mut(),
             )?;
             for (group_offset, &sample_index) in group.iter().enumerate() {
                 outputs[sample_index] = Some(pad_token_sequence(
@@ -602,9 +600,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
                     max_tokens,
                 ));
             }
-            for (layer_outputs, tokens) in hierarchical_outputs
-                .iter_mut()
-                .zip(encoded.hierarchical.into_iter())
+            for (layer_outputs, tokens) in hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
             {
                 for (group_offset, &sample_index) in group.iter().enumerate() {
                     layer_outputs[sample_index] = Some(pad_token_sequence(

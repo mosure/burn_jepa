@@ -397,7 +397,7 @@ fn patch_diff_context_mask<B: Backend>(
         "patch-diff sparsity grid must match the video shape"
     );
     let context_tokens = context_budget(grid, config.context_tokens)?;
-    let scores = patch_diff_scores(video, model_config, grid)?;
+    let scores = patch_diff_token_scores(video, model_config, grid)?;
     if config.threshold <= 0.0 && config.dilation == 0 {
         return patch_diff_topk_context_mask(scores, grid, context_tokens);
     }
@@ -458,6 +458,15 @@ fn patch_diff_context_mask<B: Backend>(
     SparseTokenMask::new(selected, grid.len())
 }
 
+pub fn patch_diff_context_mask_from_video<B: Backend>(
+    video: &Tensor<B, 5>,
+    model_config: &VJepaConfig,
+    grid: TokenGridShape,
+    config: &SparseJepaPatchDiffSparsityConfig,
+) -> Result<SparseTokenMask> {
+    patch_diff_context_mask(video, model_config, grid, config)
+}
+
 fn patch_diff_topk_context_mask<B: Backend>(
     scores: Tensor<B, 1>,
     grid: TokenGridShape,
@@ -475,7 +484,7 @@ fn patch_diff_topk_context_mask<B: Backend>(
     SparseTokenMask::new(indices, grid.len())
 }
 
-fn patch_diff_scores<B: Backend>(
+pub fn patch_diff_token_scores<B: Backend>(
     video: &Tensor<B, 5>,
     model_config: &VJepaConfig,
     grid: TokenGridShape,

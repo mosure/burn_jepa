@@ -269,8 +269,8 @@ fn ttt_training_benchmark_has_sparse_density_training_step_matrix() {
 fn cargo_features_expose_burn_021_flex_and_dispatch_lanes() {
     let manifest = include_str!("../Cargo.toml");
 
-    assert!(manifest.contains("flex = [\"burn/flex\"]"));
-    assert!(manifest.contains("dispatch = [\"burn/dispatch\"]"));
+    assert!(manifest.contains("flex = [\"burn/flex\", \"burn_anyup/flex\"]"));
+    assert!(manifest.contains("dispatch = [\"burn/dispatch\", \"burn_anyup/dispatch\"]"));
     assert!(
         manifest.contains("features = [\"autodiff\", \"fusion\", \"std\"]"),
         "Burn dependency should keep fusion enabled for GPU/backend benches"
@@ -279,6 +279,181 @@ fn cargo_features_expose_burn_021_flex_and_dispatch_lanes() {
         manifest.contains("required-features = [\"ndarray\"]"),
         "ndarray-only benches should stay feature-gated so flex/dispatch bench builds are narrow"
     );
+}
+
+#[test]
+fn feature_memory_benchmark_covers_sparse_update_density_matrix() {
+    let bench = include_str!("../benches/feature_memory.rs");
+    let compact = compact_source(bench);
+
+    assert!(bench.contains("FEATURE_MEMORY_CASES"));
+    assert!(bench.contains("vjepa224_b4"));
+    assert!(bench.contains("vjepa384_b1"));
+    assert!(bench.contains("label: \"1pct\""));
+    assert!(bench.contains("label: \"50pct\""));
+    assert!(bench.contains("label: \"100pct\""));
+    assert!(
+        bench.contains("feature_memory_cached_update_"),
+        "feature memory benches should measure cached sparse update latency"
+    );
+    assert!(
+        bench.contains("feature_memory_plan_build_update_"),
+        "feature memory benches should expose first-update plan build overhead"
+    );
+    assert!(
+        bench.contains("feature_memory_row_reset_"),
+        "feature memory benches should measure packed-stream row resets"
+    );
+    assert!(
+        compact.contains(".update_tokens(black_box(tokens),black_box(indices),"),
+        "bench should exercise sparse feature update with caller-owned sparse tokens and indices"
+    );
+    assert!(
+        compact.contains("Throughput::Elements((case.batch*keep)asu64)"),
+        "cached sparse-update rows should report sparse token throughput"
+    );
+    assert!(
+        bench.contains("feature_memory_flex")
+            && bench.contains("feature_memory_dispatch_flex")
+            && bench.contains("feature_memory_dispatch_wgpu")
+            && bench.contains("feature_memory_dispatch_cuda"),
+        "feature memory benches should include flex and dispatch backend lanes"
+    );
+
+    let docs = include_str!("../docs/interframe-feature-memory.md");
+    assert!(docs.contains("InterframeJepaFeatureMemory"));
+    assert!(docs.contains("features`, `observed`, and"));
+    assert!(docs.contains("scatter_nd(..., Assign)"));
+    assert!(docs.contains("cargo bench --bench feature_memory"));
+
+    let manifest = include_str!("../Cargo.toml");
+    assert!(manifest.contains("name = \"feature_memory\""));
+}
+
+#[test]
+fn highres_anyup_pca_pipeline_has_modular_bench_and_docs() {
+    let bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
+    let compact = bench.split_whitespace().collect::<String>();
+
+    assert!(
+        bench.contains("highres_pca_project_"),
+        "high-res bench should isolate PCA display projection"
+    );
+    assert!(
+        bench.contains("highres_anyup_from_token_cache_"),
+        "high-res bench should isolate AnyUp from the token cache"
+    );
+    assert!(
+        bench.contains("highres_sparse_cache_anyup_pca_"),
+        "high-res bench should measure sparse cache update plus AnyUp plus PCA"
+    );
+    assert!(
+        bench.contains("highres_sparse_jepa_anyup_pca_e2e_"),
+        "high-res bench should include an end-to-end sparse JEPA path"
+    );
+    assert!(
+        bench.contains("highres_sparse_patchify_jepa_anyup_pca_e2e_wgpu"),
+        "high-res bench should include the WGPU flex-gmm sparse patchify E2E path"
+    );
+    assert!(
+        bench.contains("highres_sparse_patchify_jepa_anyup_pca_e2e_cuda"),
+        "high-res bench should include the CUDA flex-gmm sparse patchify E2E path"
+    );
+    assert!(
+        bench.contains("highres_inflight_stream_"),
+        "high-res bench should include bounded in-flight stream batching"
+    );
+    assert!(
+        bench.contains("highres_inflight_stream_cached_mask_"),
+        "high-res bench should isolate cached sparse-mask stream batching"
+    );
+    assert!(
+        bench.contains("for batch_size in [1usize, 2, 4]"),
+        "in-flight stream bench should sweep multiple frame batch sizes"
+    );
+    assert!(
+        compact.contains("jepa_feature_tokens_to_nchw(tokens,grid)"),
+        "bench should use the shared token-cache NCHW view helper"
+    );
+    assert!(
+        compact.contains(".project_nchw_display(black_box(high_res))"),
+        "bench should measure the shared PCA display projector"
+    );
+    assert!(
+        bench.contains("BURN_JEPA_HIGHRES_BENCH_LARGE"),
+        "bench should keep large JEPA-like cases opt-in"
+    );
+    let pipeline = include_str!("../src/highres_pipeline.rs");
+    assert!(
+        pipeline.contains("cached_sparse_mask_batch") && pipeline.contains("CachedSparseMaskBatch"),
+        "in-flight stream should cache repeated sparse mask batches"
+    );
+
+    let docs = include_str!("../docs/highres-anyup-pca-pipeline.md");
+    assert!(docs.contains("FeatureFramePipeline"));
+    assert!(docs.contains("FeatureFrameStream"));
+    assert!(docs.contains("FeatureFrameRequest"));
+    assert!(docs.contains("FeatureFrameSchedule"));
+    assert!(docs.contains("backpressure"));
+    assert!(docs.contains("overwrite_newest"));
+    assert!(docs.contains("monotonic per-stream sequence"));
+    assert!(docs.contains("FeaturePcaProjector"));
+    assert!(docs.contains("backend-to-host reads"));
+    assert!(docs.contains("step_image_with_mask_batch_nodes_measured"));
+    assert!(docs.contains("process_next_ready_nodes"));
+    assert!(docs.contains("step_image_with_mask_sparse_patchify_wgpu"));
+    assert!(docs.contains("step_image_with_mask_sparse_patchify_cuda"));
+    assert!(docs.contains("step_image_with_sparse_patchify_plan_wgpu_measured"));
+    assert!(docs.contains("SparsePatchifyBatchPlan"));
+    assert!(docs.contains("encode_path"));
+    assert!(docs.contains("BURN_JEPA_HIGHRES_BENCH_LARGE=1"));
+
+    let manifest = include_str!("../Cargo.toml");
+    assert!(manifest.contains("name = \"highres_anyup_pca_pipeline\""));
+}
+
+#[test]
+fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
+    let viewer_bench = include_str!("../crates/bevy_jepa/benches/viewer_pipeline.rs");
+    let viewer_config = include_str!("../crates/bevy_jepa/src/config.rs");
+    let viewer_lib = include_str!("../crates/bevy_jepa/src/lib.rs");
+    let viewer_docs = include_str!("../crates/bevy_jepa/README.md");
+    let raw_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
+    let highres_docs = include_str!("../docs/highres-anyup-pca-pipeline.md");
+    let manifest = include_str!("../crates/bevy_jepa/Cargo.toml");
+
+    assert!(viewer_bench.contains("bevy_jepa_viewer_pipeline_wgpu"));
+    assert!(viewer_bench.contains("step_core_only"));
+    assert!(viewer_bench.contains("step_with_display_panels"));
+    assert!(viewer_bench.contains("aligns_with_stage_metrics"));
+    assert!(viewer_bench.contains("BevyJepaMaskSource::Autogaze"));
+    assert!(viewer_bench.contains("BevyJepaMaskSource::PatchDiff"));
+    assert!(viewer_bench.contains("{mask_source}_core_only"));
+    assert!(
+        viewer_bench.contains("gpu_panels") && viewer_bench.contains("cpu_panels"),
+        "viewer bench should make device-resident and host-transfer display costs explicit"
+    );
+    assert!(viewer_lib.contains("pub stage_metrics: FeatureFrameMetrics"));
+    assert!(viewer_lib.contains("pub fn aligns_with_stage_metrics(&self) -> bool"));
+    assert!(viewer_lib.contains("pub struct BevyJepaHeadlessPipeline"));
+    assert!(viewer_lib.contains("pub fn step_core_only(&mut self)"));
+    assert!(viewer_lib.contains("pub fn step_with_display_panels(&mut self)"));
+    assert!(viewer_config.contains("DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 0.15"));
+    assert!(
+        raw_bench.contains("viewer64_sparse25"),
+        "raw high-res E2E bench should include the default Bevy viewer config"
+    );
+    assert!(
+        raw_bench.contains("FeaturePcaUpdateConfig::rolling_low_res_every")
+            && raw_bench.contains("SparseJepaAnyUpPcaMeasurementConfig::enabled()"),
+        "raw viewer row should mirror Bevy's rolling PCA and stage-measurement config"
+    );
+    assert!(
+        viewer_docs.contains("highres_sparse_jepa_anyup_pca_e2e_wgpu/viewer64_sparse25")
+            && highres_docs.contains("viewer64_sparse25"),
+        "docs should tell users how to compare Bevy wrapper and raw pipeline rows"
+    );
+    assert!(manifest.contains("name = \"viewer_pipeline\""));
 }
 
 #[test]
@@ -356,7 +531,7 @@ fn e2e_benchmark_reuses_library_projection_and_patchify_core() {
     );
 
     let manifest = include_str!("../Cargo.toml");
-    assert!(manifest.contains("burn_autogaze = { version = \"0.21.5\""));
+    assert!(manifest.contains("burn_autogaze = { version = \"0.21.6\""));
     assert!(manifest.contains("burn_flex_gmm = { version = \"0.21.1\""));
     assert!(manifest.contains("sparse-patchify-cuda"));
     assert!(manifest.contains("autogaze-webgpu"));

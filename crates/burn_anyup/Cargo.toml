@@ -1,0 +1,37 @@
+[package]
+name = "burn_anyup"
+description = "Burn-native AnyUp universal feature upsampling with efficient local attention"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/mosure/burn_jepa"
+repository = "https://github.com/mosure/burn_jepa"
+readme = "README.md"
+categories = ["computer-vision", "science"]
+keywords = ["burn", "anyup", "upsampling", "attention", "vision"]
+
+[features]
+default = ["ndarray"]
+ndarray = ["burn/ndarray"]
+flex = ["burn/flex"]
+dispatch = ["burn/dispatch"]
+webgpu = ["burn/webgpu"]
+wgpu = ["burn/wgpu"]
+cuda = ["burn/cuda"]
+
+[dependencies]
+anyhow = "1"
+burn = { version = "0.21.0", default-features = false, features = ["fusion", "std"] }
+burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+criterion = "0.8.2"
+tempfile = "3"
+
+[[bench]]
+name = "anyup_forward"
+harness = false

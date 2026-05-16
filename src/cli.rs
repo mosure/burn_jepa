@@ -1,3 +1,15 @@
+#![cfg_attr(
+    not(any(
+        feature = "ndarray",
+        feature = "flex",
+        feature = "dispatch",
+        feature = "wgpu",
+        feature = "webgpu",
+        feature = "cuda"
+    )),
+    allow(dead_code, unused_imports, unused_variables)
+)]
+
 #[cfg(feature = "cuda")]
 use crate::runtime::{CUDA_TRAIN_FORCE_ENV, cuda_runtime_preflight};
 use crate::{

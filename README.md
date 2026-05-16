@@ -11,11 +11,27 @@ Meta V-JEPA 2.1 encoder/predictor recipe:
 - sparse context and target token masks without expanding work back to the full grid
 - sparse 3D positional encoding for `[frame, row, col]` token coordinates
 - sparse image-token to V-JEPA tubelet-token projection for AutoGaze-style masks
+- persistent interframe dense feature memory with sparse device-side updates
+- a workspace `burn_anyup` crate for AnyUp efficient local-window feature upsampling
 - ViT encoder, predictor, dense predictive loss, and backend-neutral Burn modules
 - safetensors loading path with PyTorch-to-Burn weight layout adaptation
 - simple symmetric int8 quantization helpers for checkpoint/tooling experiments
 - ndarray, WebGPU/WGPU, CUDA, and wasm feature gates
-- CI, a static docs/page shell, benchmarks, and a `bevy_burn_jepa` example crate
+- CI, a wasm GitHub Pages viewer, benchmarks, and a `bevy_jepa` example crate
+
+## Workspace Layout
+
+- `src/` contains the publishable `burn_jepa` library and the canonical
+  `burn-jepa` CLI only.
+- `crates/burn_anyup/` contains the AnyUp Burn module, loader, tests, and
+  benchmarks.
+- `crates/bevy_jepa/` contains the native/wasm Bevy viewer app.
+- `examples/` contains runnable diagnostics and artifact generators, including
+  the E2E video-gallery renderer.
+- `benches/` and `tests/` contain the root crate performance and correctness
+  surfaces.
+- `tools/` contains thin host-side wrappers for dataset/download orchestration;
+  heavy Burn work should live in Rust examples, benches, tests, or crates.
 
 ## Usage
 
@@ -109,6 +125,35 @@ patch embed followed by token masking, but still reuses sparse encoder and
 predictor plans when masks are stable.
 Use `forward_masks_sparse_patchify_wgpu` for the lowest-overhead stable-mask
 path when the caller can reuse precomputed V-JEPA masks.
+
+`InterframeJepaFeatureMemory` keeps a full dense V-JEPA token-feature canvas
+updated from sparse encoder observations. It returns dense features plus
+`observed` and `age_frames` metadata so downstream dense or memory tasks can
+distinguish fresh, stale, and never-observed token positions. Updates use cached
+scatter indices and stay device-side; the host row-reset helper is separate from
+the sparse update hot path. See `docs/interframe-feature-memory.md` for API
+details and sparse-update benchmark commands.
+
+`FeatureFramePipeline` composes the current high-resolution visualization
+path: image tensor, caller-owned sparse token mask, sparse V-JEPA image encoder,
+sparse update into `InterframeJepaFeatureMemory`, dense AnyUp full-resolution
+feature decode, and tensor-side PCA display projection. `FeaturePcaProjector`
+supports fixed components plus an explicit rolling PCA update node driven by
+`FeaturePcaUpdateConfig`; the updater consumes accumulated low-resolution batch
+features on its own cadence so display emission does not force basis updates.
+The pipeline step avoids backend-to-host reads; display readback belongs at the
+UI boundary. See `docs/highres-anyup-pca-pipeline.md` and
+`benches/highres_anyup_pca_pipeline.rs` for the API and modular timing matrix.
+The backend-neutral high-res entry point uses dense patch embedding followed by
+sparse encoder tokens; `sparse-patchify-wgpu` and `sparse-patchify-cuda` expose
+flex-gmm image patchify entry points that skip masked-out image patches before
+the encoder. `FeatureFrameRequest` and `FeatureFrameSchedule` let callers emit
+low-res PCA and high-res AnyUp/PCA at separate rates from the same sparse token
+cache update.
+For camera-style loops, `FeatureFrameStream` adds bounded in-flight
+queueing, fixed-width sparse-mask batching, per-stage metrics, queue-wait
+timing, monotonic frame sequencing, and reject/drop/overwrite backpressure
+policies.
 
 For AutoGaze-style sparse inputs, enable the optional `autogaze-*` feature and
 use `project_autogaze_generated_tokens` to turn `burn_autogaze` generated token
@@ -467,16 +512,15 @@ patchify parity smoke against dense masked V-JEPA output.
 ## Bevy Example
 
 ```sh
-cargo run -p bevy_burn_jepa
+cargo run -p bevy_jepa -- --mask-source autogaze
+cargo run -p bevy_jepa -- --mask-source patch-diff --image-size 128
 
-cd crates/bevy_burn_jepa
+cd crates/bevy_jepa
 npm run serve
 ```
 
-The native example renders a small live Bevy window and exercises the same Burn
-pipeline shape used by the crate tests. The wasm page is intentionally static by
-default so the bundled demo shell can be deployed without requiring large model
-weights. The `deploy github pages` workflow is manual/environment-dependent:
-this repository currently has GitHub Pages disabled by account plan, so the
-workflow is disabled remotely and the static shell remains checked in under
-`crates/bevy_burn_jepa/www`.
+The Bevy viewer uses the shared `bevy_burn` WebGPU device path to render input
+frames, sparse masks, low-resolution JEPA token-cache PCA, and high-resolution
+AnyUp PCA as GPU texture uploads. Press space to switch between AutoGaze-style
+sparse token masks and patch-diff sparse token masks. The GitHub Pages workflow
+builds the wasm target and publishes `crates/bevy_jepa/www`.

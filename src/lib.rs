@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 #[cfg(feature = "autogaze")]
 mod autogaze;
 #[cfg(not(target_arch = "wasm32"))]
@@ -5,8 +7,11 @@ pub mod cli;
 mod config;
 pub mod dataset;
 pub mod experiment;
+mod feature_memory;
+mod highres_pipeline;
 mod model;
 mod nodes;
+mod pca;
 mod pipeline;
 mod positional;
 mod quantization;
@@ -30,6 +35,7 @@ pub use autogaze::{
     generate_autogaze_streaming_with_budget, project_autogaze_generated_masks,
     project_autogaze_generated_tokens,
 };
+pub use burn_anyup::{AnyUp, AnyUpConfig, AnyUpImageContext, AnyUpImageGrid};
 pub use config::{
     VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig, VJepaPreprocessConfig,
 };
@@ -45,6 +51,26 @@ pub use experiment::{
     ExperimentTttLayerSet, analyze_experiment, prepare_experiment_data, run_experiment,
     write_experiment_plan,
 };
+pub use feature_memory::{
+    InterframeJepaFeatureAgeMode, InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig,
+    InterframeJepaFeatureMemoryOutput, InterframeJepaFeatureUpdateMode,
+    jepa_feature_tokens_to_nchw,
+};
+pub use highres_pipeline::{
+    FeatureFrameBatch, FeatureFrameEncodePath, FeatureFrameInput, FeatureFrameMeasureConfig,
+    FeatureFrameMetrics, FeatureFrameNode, FeatureFramePipeline, FeatureFramePipelineConfig,
+    FeatureFrameRequest, FeatureFrameSchedule, FeatureFrameStream, FeatureFrameStreamOutput,
+    FeatureFrameStreamStats, FrameId, FrameQueuePolicy, FrameQueueReport, FrameQueueTiming,
+    FrameStreamConfig, HighResFrameArtifacts, LowResFrameArtifacts, MeasuredFeatureFrameBatch,
+    SparseJepaAnyUpPcaBackpressurePolicy, SparseJepaAnyUpPcaEncodePath, SparseJepaAnyUpPcaFrameId,
+    SparseJepaAnyUpPcaFrameInput, SparseJepaAnyUpPcaMeasuredBatchOutput,
+    SparseJepaAnyUpPcaMeasuredOutput, SparseJepaAnyUpPcaMeasurementConfig,
+    SparseJepaAnyUpPcaOutput, SparseJepaAnyUpPcaPipeline, SparseJepaAnyUpPcaPipelineConfig,
+    SparseJepaAnyUpPcaQueueReport, SparseJepaAnyUpPcaQueuedFrameTiming,
+    SparseJepaAnyUpPcaStageMetrics, SparseJepaAnyUpPcaStepBatchOutput, SparseJepaAnyUpPcaStream,
+    SparseJepaAnyUpPcaStreamBatchOutput, SparseJepaAnyUpPcaStreamConfig,
+    SparseJepaAnyUpPcaStreamStats,
+};
 pub use model::{
     DensePredictionOutput, PatchEmbed2d, PatchEmbed3d, SparseEncoderBatchPlan, SparseEncoderPlan,
     SparsePredictorPlan, SparseVJepaForwardOutput, TokenSequencePosition, TransformerBlock,
@@ -55,7 +81,12 @@ pub use nodes::{
     FnOutputNode, RgbaVideoInput, SparseJepaAutogazeSparsityConfig, SparseJepaInputNode,
     SparseJepaOutputNode, SparseJepaPacket, SparseJepaPatchDiffSparsityConfig,
     SparseJepaSparsityDriverConfig, SparseJepaTensorPipeline, SparseJepaTensorPipelineConfig,
-    TensorVideoInput, VecOutputNode, empty_rgb_video_shape, resolve_sparsity_driver_masks,
+    TensorVideoInput, VecOutputNode, empty_rgb_video_shape, patch_diff_context_mask_from_video,
+    patch_diff_token_scores, resolve_sparsity_driver_masks,
+};
+pub use pca::{
+    FeaturePcaConfig, FeaturePcaProjector, FeaturePcaUpdateConfig, FeaturePcaUpdateDecision,
+    FeaturePcaUpdateMode, FeaturePcaUpdateScheduler,
 };
 pub use pipeline::{
     VJEPA_IMAGE_MEAN, VJEPA_IMAGE_STD, VJEPA_RESCALE_FACTOR, VJepaEmbedOutput, VJepaPipeline,

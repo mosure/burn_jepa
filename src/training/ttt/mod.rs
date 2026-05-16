@@ -157,7 +157,7 @@ impl<B: Backend> StreamStateTracker<B> {
         }
         let row_count = self.active_keys.len();
         let row_states = state.unpack_rows(row_count);
-        for (key, mut state) in self.active_keys.drain(..).zip(row_states.into_iter()) {
+        for (key, mut state) in self.active_keys.drain(..).zip(row_states) {
             if config.training.stream.detach_between_steps {
                 state.detach();
                 self.detached_steps += 1;
@@ -868,7 +868,7 @@ impl LossProgress {
     fn should_read_step(&self, step: usize, config: &BurnJepaTrainConfig) -> bool {
         step == config.training.max_steps
             || (config.training.loss_trace_interval > 0
-                && step % config.training.loss_trace_interval == 0)
+                && step.is_multiple_of(config.training.loss_trace_interval))
     }
 
     fn record(
@@ -882,7 +882,7 @@ impl LossProgress {
         self.initial_loss.get_or_insert(loss);
         self.best_loss = self.best_loss.min(loss);
         self.final_loss = loss;
-        if trace_interval > 0 && step % trace_interval == 0 {
+        if trace_interval > 0 && step.is_multiple_of(trace_interval) {
             self.loss_trace.push(TttStepMetric {
                 step,
                 loss,

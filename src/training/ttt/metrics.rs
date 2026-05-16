@@ -191,11 +191,10 @@ pub(super) fn ttt_utilization_metrics<B: Backend>(
     let mut accumulators = layers
         .iter()
         .enumerate()
-        .map(|(ttt_layer, &encoder_layer)| {
-            let mut acc = UtilizationAccumulator::default();
-            acc.encoder_layer = encoder_layer;
-            acc.ttt_layer = ttt_layer;
-            acc
+        .map(|(ttt_layer, &encoder_layer)| UtilizationAccumulator {
+            encoder_layer,
+            ttt_layer,
+            ..UtilizationAccumulator::default()
         })
         .collect::<Vec<_>>();
 

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/bevy_burn_jepa"]
+members = [".", "crates/bevy_jepa", "crates/burn_anyup"]
 default-members = ["."]
 resolver = "3"
 
@@ -17,19 +17,19 @@ documentation = "https://docs.rs/burn_jepa"
 readme = "README.md"
 categories = ["computer-vision", "science", "wasm"]
 keywords = ["burn", "jepa", "sparse", "video", "vision"]
-exclude = ["/.github/", "/crates/bevy_burn_jepa/", "/web/"]
+exclude = ["/.github/", "/crates/bevy_jepa/", "/web/"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["ndarray", "webgpu"]
-ndarray = ["burn/ndarray"]
-flex = ["burn/flex"]
-dispatch = ["burn/dispatch"]
-webgpu = ["burn/webgpu"]
-wgpu = ["burn/wgpu", "burn-store/wgpu"]
-cuda = ["burn/cuda", "burn-store/cuda"]
+ndarray = ["burn/ndarray", "burn_anyup/ndarray"]
+flex = ["burn/flex", "burn_anyup/flex"]
+dispatch = ["burn/dispatch", "burn_anyup/dispatch"]
+webgpu = ["burn/webgpu", "burn_anyup/webgpu"]
+wgpu = ["burn/wgpu", "burn-store/wgpu", "burn_anyup/wgpu"]
+cuda = ["burn/cuda", "burn-store/cuda", "burn_anyup/cuda"]
 autogaze = ["dep:burn_autogaze"]
 autogaze-ndarray = ["autogaze", "burn_autogaze/ndarray"]
 autogaze-webgpu = ["autogaze", "burn_autogaze/webgpu"]
@@ -60,7 +60,8 @@ burn-backend = { version = "0.21.0", default-features = false, optional = true }
 burn-fusion = { version = "0.21.0", default-features = false, optional = true }
 burn-ir = { version = "0.21.0", default-features = false, optional = true }
 burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
-burn_autogaze = { version = "0.21.5", default-features = false, optional = true }
+burn_anyup = { path = "crates/burn_anyup", version = "0.21.0", default-features = false }
+burn_autogaze = { version = "0.21.6", default-features = false, optional = true }
 burn_flex_gmm = { version = "0.21.1", default-features = false, optional = true }
 clap = { version = "4.6", features = ["derive"] }
 half = "2"
@@ -87,6 +88,7 @@ features = ["console"]
 
 [dev-dependencies]
 criterion = "0.8.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 tempfile = "3"
 
 [[bench]]
@@ -102,6 +104,19 @@ required-features = ["autogaze", "ndarray"]
 [[bench]]
 name = "ttt_training"
 harness = false
+
+[[bench]]
+name = "feature_memory"
+harness = false
+
+[[bench]]
+name = "highres_anyup_pca_pipeline"
+harness = false
+
+[[example]]
+name = "video_gallery_e2e"
+path = "examples/video_gallery_e2e.rs"
+required-features = ["ndarray"]
 
 [profile.dev]
 opt-level = 3

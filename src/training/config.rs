@@ -10,21 +10,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JepaTrainBackend {
+    #[default]
     NdArray,
     Flex,
     Wgpu,
     WebGpu,
     Cuda,
     Dispatch,
-}
-
-impl Default for JepaTrainBackend {
-    fn default() -> Self {
-        Self::NdArray
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

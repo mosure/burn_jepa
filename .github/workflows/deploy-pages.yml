@@ -26,10 +26,32 @@ jobs:
       - name: checkout repository
         uses: actions/checkout@v5
 
+      - name: setup nightly rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: install wasm-bindgen
+        run: cargo install wasm-bindgen-cli --locked
+
+      - name: build bevy_jepa wasm
+        run: |
+          cargo build -p bevy_jepa --target wasm32-unknown-unknown --release
+          wasm-bindgen \
+            --target web \
+            --out-dir crates/bevy_jepa/www/out \
+            --out-name bevy_jepa \
+            target/wasm32-unknown-unknown/release/bevy_jepa.wasm
+
       - name: prepare pages artifact
         run: |
-          touch crates/bevy_burn_jepa/www/.nojekyll
-          test -f crates/bevy_burn_jepa/www/index.html
+          touch crates/bevy_jepa/www/.nojekyll
+          test -f crates/bevy_jepa/www/index.html
+          test -f crates/bevy_jepa/www/out/bevy_jepa.js
+          test -f crates/bevy_jepa/www/out/bevy_jepa_bg.wasm
 
       - name: configure github pages
         uses: actions/configure-pages@v6
@@ -37,7 +59,7 @@ jobs:
       - name: upload pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: crates/bevy_burn_jepa/www
+          path: crates/bevy_jepa/www
 
       - name: deploy to github pages
         id: deployment

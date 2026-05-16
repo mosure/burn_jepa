@@ -1,8 +1,11 @@
 /target/
 **/*.rs.bk
+__pycache__/
+*.py[cod]
 node_modules/
 dist/
 pkg/
+crates/bevy_jepa/www/out/
 .cache/
 .direnv/
 .env

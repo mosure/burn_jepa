@@ -53,7 +53,7 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
 
       - name: check bevy
-        run: cargo check -p bevy_burn_jepa
+        run: cargo check -p bevy_jepa
 
       - name: check bevy static page
-        run: cd crates/bevy_burn_jepa && node tests/static-source.spec.mjs
+        run: cd crates/bevy_jepa && node tests/static-source.spec.mjs
