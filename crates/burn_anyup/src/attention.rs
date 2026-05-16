@@ -6,6 +6,7 @@ use burn::module::Module;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::{PaddingConfig2d, RmsNorm, RmsNormConfig};
 use burn::tensor::Tensor;
+use burn::tensor::TensorData;
 use burn::tensor::activation;
 use burn::tensor::backend::Backend;
 use burn::tensor::ops::PadMode;
@@ -200,6 +201,78 @@ impl<B: Backend> EfficientCrossAttentionBlock<B> {
         Tensor::cat(chunks, 2)
     }
 
+    pub fn forward_upstream_masked(
+        &self,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+        q_chunk_size: Option<usize>,
+    ) -> Tensor<B, 4> {
+        let q = self.conv.forward(q);
+        let [batch, _, hq, wq] = q.shape().dims::<4>();
+        let [_, _, hk, wk] = k.shape().dims::<4>();
+        let [_, value_dim, _, _] = v.shape().dims::<4>();
+        let q_tokens = hq * wq;
+        let k_tokens = hk * wk;
+
+        let q = self.norm_q.forward(flatten_nchw_to_nlc(q));
+        let k = self.norm_k.forward(flatten_nchw_to_nlc(k));
+        let q = pointwise_conv_tokens(&self.cross_attn.q_proj, q)
+            .reshape([
+                batch,
+                q_tokens,
+                self.cross_attn.num_heads,
+                self.cross_attn.head_dim,
+            ])
+            .permute([0, 2, 1, 3]);
+        let k = pointwise_conv_tokens(&self.cross_attn.k_proj, k)
+            .reshape([
+                batch,
+                k_tokens,
+                self.cross_attn.num_heads,
+                self.cross_attn.head_dim,
+            ])
+            .permute([0, 2, 1, 3]);
+        let k_t = k.swap_dims(2, 3);
+        let v = flatten_nchw_to_nlc(v);
+
+        let chunk_size = q_chunk_size.unwrap_or(q_tokens).max(1);
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < q_tokens {
+            let end = (start + chunk_size).min(q_tokens);
+            let q_chunk = q.clone().slice([
+                0..batch,
+                0..self.cross_attn.num_heads,
+                start..end,
+                0..self.cross_attn.head_dim,
+            ]);
+            let mut logits = q_chunk
+                .matmul(k_t.clone())
+                .mul_scalar(self.cross_attn.scale);
+            if self.window_ratio > 0.0 {
+                let device = logits.device();
+                logits = logits
+                    + upstream_attention_bias::<B>(
+                        start,
+                        end,
+                        [hq, wq],
+                        [hk, wk],
+                        self.window_ratio,
+                        &device,
+                    );
+            }
+            let attn =
+                activation::softmax(logits, 3)
+                    .mean_dim(1)
+                    .reshape([batch, end - start, k_tokens]);
+            chunks.push(attn.matmul(v.clone()));
+            start = end;
+        }
+
+        nlc_to_nchw(Tensor::cat(chunks, 1), hq, wq).reshape([batch, value_dim, hq, wq])
+    }
+
     pub fn forward_sparse(
         &self,
         q: Tensor<B, 4>,
@@ -328,6 +401,43 @@ fn shifted_start(origin: usize, pad: usize, offset: isize, dilation: usize) -> u
     let start = origin as isize + pad as isize + offset * dilation as isize;
     debug_assert!(start >= 0);
     start as usize
+}
+
+fn upstream_attention_bias<B: Backend>(
+    start: usize,
+    end: usize,
+    output_size: [usize; 2],
+    feature_size: [usize; 2],
+    ratio: f32,
+    device: &B::Device,
+) -> Tensor<B, 4> {
+    let [hq, wq] = output_size;
+    let [hk, wk] = feature_size;
+    let q_chunk = end.saturating_sub(start);
+    let k_tokens = hk * wk;
+    let mut values = Vec::with_capacity(q_chunk * k_tokens);
+    for query_index in start..end {
+        let row = query_index / wq;
+        let col = query_index % wq;
+        let row_pos = (row as f32 + 0.5) / hq as f32;
+        let col_pos = (col as f32 + 0.5) / wq as f32;
+        let row_start = ((row_pos - ratio).clamp(0.0, 1.0) * hk as f32).floor() as usize;
+        let row_end = ((row_pos + ratio).clamp(0.0, 1.0) * hk as f32).ceil() as usize;
+        let col_start = ((col_pos - ratio).clamp(0.0, 1.0) * wk as f32).floor() as usize;
+        let col_end = ((col_pos + ratio).clamp(0.0, 1.0) * wk as f32).ceil() as usize;
+        for key_row in 0..hk {
+            for key_col in 0..wk {
+                let allowed = key_row >= row_start
+                    && key_row < row_end
+                    && key_col >= col_start
+                    && key_col < col_end;
+                values.push(if allowed { 0.0 } else { -1.0e9 });
+            }
+        }
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(values, [q_chunk, k_tokens]), device)
+        .unsqueeze_dim::<3>(0)
+        .unsqueeze_dim::<4>(0)
 }
 
 #[cfg(test)]

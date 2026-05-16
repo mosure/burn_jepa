@@ -857,12 +857,15 @@ fn env_pca_update_config() -> FeaturePcaUpdateConfig {
     if every == 0 {
         FeaturePcaUpdateConfig::disabled()
     } else {
+        let sample_window_frames = env_usize("BURN_JEPA_PCA_SAMPLE_WINDOW", every.max(2)).max(1);
         FeaturePcaUpdateConfig {
             mode: FeaturePcaUpdateMode::RollingOja,
             every_n_frames: every as u64,
             warmup_frames: env_usize("BURN_JEPA_PCA_UPDATE_WARMUP", 0) as u64,
             min_tokens_per_update: env_usize("BURN_JEPA_PCA_UPDATE_MIN_TOKENS", 1),
             iterations_per_update: env_usize("BURN_JEPA_PCA_UPDATE_ITERS", 1),
+            sample_window_frames,
+            min_sample_frames: env_usize("BURN_JEPA_PCA_MIN_SAMPLE_FRAMES", sample_window_frames),
         }
     }
 }

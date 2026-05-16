@@ -25,5 +25,11 @@ cargo run --example video_gallery_e2e --no-default-features --features ndarray -
   --samples 16 \
   --frames 40 \
   --image-size 224 \
+  --anyup-weights /path/to/anyup_multi_backbone.pth \
+  --anyup-attention-mode upstream-masked \
   --force
 ```
+
+Omit `--anyup-weights` only for fast path smoke tests. In that mode the gallery
+uses the tiny untrained AnyUp module, so high-resolution PCA frames validate the
+Burn pipeline wiring rather than pretrained AnyUp visual quality.

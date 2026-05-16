@@ -1,9 +1,11 @@
 use crate::attention::EfficientCrossAttentionBlock;
-use crate::config::AnyUpConfig;
+use crate::config::{AnyUpAttentionMode, AnyUpConfig};
 use crate::layers::{AnyUpConvEncoder, AnyUpFeatureEncoder, aggregation_encoder};
 use crate::rope::AnyUpRoPE;
 use crate::sparse::{AnyUpSparseOutput, AnyUpSparseOutputPlan, sparse_low_features_to_nchw};
-use crate::tensor_ops::{adaptive_pool, coordinate_grid, flatten_nchw_to_nlc, nlc_to_nchw};
+use crate::tensor_ops::{
+    adaptive_pool, coordinate_grid, flatten_nchw_to_nlc, gather_tokens, nlc_to_nchw,
+};
 use anyhow::Result;
 use burn::module::Module;
 use burn::tensor::Tensor;
@@ -235,8 +237,18 @@ impl<B: Backend> AnyUp<B> {
         let k_feat = self.key_features_encoder.forward(key_features);
         let k = Tensor::cat(vec![context.image_key.clone(), k_feat], 1);
         let k = self.aggregation.forward(k);
-        self.cross_decode
-            .forward(context.query.clone(), k, values, q_chunk_size)
+        match self.config.attention_mode {
+            AnyUpAttentionMode::EfficientLocal => {
+                self.cross_decode
+                    .forward(context.query.clone(), k, values, q_chunk_size)
+            }
+            AnyUpAttentionMode::UpstreamMasked => self.cross_decode.forward_upstream_masked(
+                context.query.clone(),
+                k,
+                values,
+                q_chunk_size,
+            ),
+        }
     }
 
     pub fn upsample_sparse_with_context(
@@ -261,9 +273,25 @@ impl<B: Backend> AnyUp<B> {
         let k_feat = self.key_features_encoder.forward(features.clone());
         let k = Tensor::cat(vec![context.image_key.clone(), k_feat], 1);
         let k = self.aggregation.forward(k);
-        Ok(self
-            .cross_decode
-            .forward_sparse(context.query.clone(), k, features, plan))
+        Ok(match self.config.attention_mode {
+            AnyUpAttentionMode::EfficientLocal => {
+                self.cross_decode
+                    .forward_sparse(context.query.clone(), k, features, plan)
+            }
+            AnyUpAttentionMode::UpstreamMasked => {
+                let dense = self.cross_decode.forward_upstream_masked(
+                    context.query.clone(),
+                    k,
+                    features,
+                    None,
+                );
+                AnyUpSparseOutput {
+                    features: gather_tokens(flatten_nchw_to_nlc(dense), plan.indices.clone()),
+                    indices: plan.indices.clone(),
+                    output_size: plan.output_size,
+                }
+            }
+        })
     }
 
     pub fn upsample_sparse_low_features_with_context(

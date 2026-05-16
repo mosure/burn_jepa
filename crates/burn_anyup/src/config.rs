@@ -1,6 +1,62 @@
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnyUpAttentionMode {
+    #[default]
+    EfficientLocal,
+    UpstreamMasked,
+}
+
+impl AnyUpAttentionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EfficientLocal => "efficient-local",
+            Self::UpstreamMasked => "upstream-masked",
+        }
+    }
+
+    pub const fn valid_values() -> &'static [&'static str] {
+        &[
+            "efficient-local",
+            "efficient",
+            "local",
+            "natten",
+            "upstream-masked",
+            "upstream",
+            "paper",
+            "masked",
+        ]
+    }
+}
+
+impl fmt::Display for AnyUpAttentionMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AnyUpAttentionMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "efficient-local" | "efficient_local" | "efficient" | "local" | "natten" => {
+                Ok(Self::EfficientLocal)
+            }
+            "upstream-masked" | "upstream_masked" | "upstream" | "paper" | "masked"
+            | "masked-mha" | "masked_mha" => Ok(Self::UpstreamMasked),
+            other => Err(format!(
+                "unsupported AnyUp attention mode `{other}`; expected one of {}",
+                Self::valid_values().join(", ")
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
 pub struct AnyUpConfig {
     pub input_dim: usize,
     pub qk_dim: usize,
@@ -12,6 +68,7 @@ pub struct AnyUpConfig {
     pub group_norm_groups: usize,
     pub group_norm_eps: f64,
     pub rms_norm_eps: f64,
+    pub attention_mode: AnyUpAttentionMode,
 }
 
 impl Default for AnyUpConfig {
@@ -27,6 +84,7 @@ impl Default for AnyUpConfig {
             group_norm_groups: 8,
             group_norm_eps: 1.0e-5,
             rms_norm_eps: f32::EPSILON as f64,
+            attention_mode: AnyUpAttentionMode::EfficientLocal,
         }
     }
 }
@@ -48,7 +106,20 @@ impl AnyUpConfig {
             group_norm_groups: 2,
             group_norm_eps: 1.0e-5,
             rms_norm_eps: f32::EPSILON as f64,
+            attention_mode: AnyUpAttentionMode::EfficientLocal,
         }
+    }
+
+    pub fn upstream_masked() -> Self {
+        Self {
+            attention_mode: AnyUpAttentionMode::UpstreamMasked,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_attention_mode(mut self, attention_mode: AnyUpAttentionMode) -> Self {
+        self.attention_mode = attention_mode;
+        self
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {

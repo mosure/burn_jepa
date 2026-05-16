@@ -58,10 +58,12 @@ sparse encoder output already owns the token indices.
 - `Ema { alpha }`: optional smoothing mode; the first observation is assigned
   directly, then repeated observations blend with the prior memory value.
 
-Sparse updates use cached row-index tensors plus `scatter_nd(..., Assign)`.
-The update path does not call `to_data`, `into_data`, or construct host
-`TensorData`; the host-side `reset_row_indices` helper is intentionally outside
-the sparse update path.
+Sparse updates gather the previous selected slots, compute the desired delta,
+and apply `scatter(..., Add)` along the token dimension. This avoids backend
+differences in partial `scatter_nd` slice semantics and keeps dense and sparse
+cache writes correct on GPU backends. The update path does not call `to_data`,
+`into_data`, or construct host `TensorData`; the host-side `reset_row_indices`
+helper is intentionally outside the sparse update path.
 
 `reset` clears the whole canvas. `reset_rows` clears selected batch rows from a
 device index tensor, which is the preferred API for packed multi-stream video

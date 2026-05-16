@@ -3,12 +3,24 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeaturePcaDisplayMode {
+    SignedUnit,
+    #[default]
+    SemanticRgb,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FeaturePcaConfig {
     pub output_channels: usize,
     pub epsilon: f64,
     pub display_scale: f64,
+    pub display_mode: FeaturePcaDisplayMode,
+    pub display_momentum: f64,
+    pub display_std_floor: f64,
+    pub display_clip_sigma: f64,
     pub online_learning_rate: f64,
     pub mean_momentum: f64,
 }
@@ -19,8 +31,12 @@ impl Default for FeaturePcaConfig {
             output_channels: 3,
             epsilon: 1.0e-6,
             display_scale: 1.0,
-            online_learning_rate: 0.01,
-            mean_momentum: 0.01,
+            display_mode: FeaturePcaDisplayMode::SemanticRgb,
+            display_momentum: 0.2,
+            display_std_floor: 1.0e-3,
+            display_clip_sigma: 2.5,
+            online_learning_rate: 0.35,
+            mean_momentum: 0.25,
         }
     }
 }
@@ -35,6 +51,18 @@ impl FeaturePcaConfig {
         ensure!(
             self.display_scale > 0.0,
             "PCA display scale must be positive"
+        );
+        ensure!(
+            (0.0..=1.0).contains(&self.display_momentum),
+            "PCA display momentum must be in [0, 1]"
+        );
+        ensure!(
+            self.display_std_floor > 0.0,
+            "PCA display std floor must be positive"
+        );
+        ensure!(
+            self.display_clip_sigma > 0.0,
+            "PCA display clip sigma must be positive"
         );
         ensure!(
             (0.0..=1.0).contains(&self.online_learning_rate),
@@ -64,6 +92,8 @@ pub struct FeaturePcaUpdateConfig {
     pub warmup_frames: u64,
     pub min_tokens_per_update: usize,
     pub iterations_per_update: usize,
+    pub sample_window_frames: usize,
+    pub min_sample_frames: usize,
 }
 
 impl Default for FeaturePcaUpdateConfig {
@@ -74,6 +104,8 @@ impl Default for FeaturePcaUpdateConfig {
             warmup_frames: 0,
             min_tokens_per_update: 1,
             iterations_per_update: 1,
+            sample_window_frames: 1,
+            min_sample_frames: 1,
         }
     }
 }
@@ -86,16 +118,25 @@ impl FeaturePcaUpdateConfig {
             warmup_frames: 0,
             min_tokens_per_update: 1,
             iterations_per_update: 1,
+            sample_window_frames: 1,
+            min_sample_frames: 1,
         }
     }
 
     pub const fn rolling_low_res_every(every_n_frames: u64) -> Self {
+        let sample_frames = if every_n_frames < 2 {
+            2
+        } else {
+            every_n_frames as usize
+        };
         Self {
             mode: FeaturePcaUpdateMode::RollingOja,
             every_n_frames,
             warmup_frames: 0,
             min_tokens_per_update: 1,
-            iterations_per_update: 1,
+            iterations_per_update: 4,
+            sample_window_frames: sample_frames,
+            min_sample_frames: sample_frames,
         }
     }
 
@@ -111,6 +152,18 @@ impl FeaturePcaUpdateConfig {
         ensure!(
             self.iterations_per_update > 0,
             "PCA update iterations must be positive"
+        );
+        ensure!(
+            self.sample_window_frames > 0,
+            "PCA update sample window must be positive"
+        );
+        ensure!(
+            self.min_sample_frames > 0,
+            "PCA update minimum sample frames must be positive"
+        );
+        ensure!(
+            self.min_sample_frames <= self.sample_window_frames,
+            "PCA update minimum sample frames cannot exceed sample window"
         );
         Ok(())
     }
@@ -179,8 +232,13 @@ impl FeaturePcaUpdateScheduler {
         }
 
         self.observed_frames = self.observed_frames.saturating_add(frame_count as u64);
+        let min_observed_frames = self
+            .config
+            .warmup_frames
+            .saturating_add(self.config.min_sample_frames as u64);
         if !self.config.enabled()
             || tokens_per_frame < self.config.min_tokens_per_update
+            || self.observed_frames < min_observed_frames
             || self.observed_frames < self.next_update_frame
         {
             return FeaturePcaUpdateDecision {
@@ -210,6 +268,8 @@ pub struct FeaturePcaProjector<B: Backend> {
     feature_dim: usize,
     components: Tensor<B, 3>,
     mean: Tensor<B, 3>,
+    display_center: Tensor<B, 3>,
+    display_spread: Tensor<B, 3>,
 }
 
 impl<B: Backend> FeaturePcaProjector<B> {
@@ -230,6 +290,8 @@ impl<B: Backend> FeaturePcaProjector<B> {
                 device,
             ),
             mean: Tensor::<B, 3>::zeros([1, 1, feature_dim], device),
+            display_center: Tensor::<B, 3>::zeros([1, 1, config.output_channels], device),
+            display_spread: Tensor::<B, 3>::ones([1, 1, config.output_channels], device),
             config,
             feature_dim,
         })
@@ -256,6 +318,8 @@ impl<B: Backend> FeaturePcaProjector<B> {
             "PCA mean must have shape [1, 1, feature_dim]"
         );
         Ok(Self {
+            display_center: Tensor::<B, 3>::zeros([1, 1, output_channels], &components.device()),
+            display_spread: Tensor::<B, 3>::ones([1, 1, output_channels], &components.device()),
             config,
             feature_dim,
             components,
@@ -283,6 +347,14 @@ impl<B: Backend> FeaturePcaProjector<B> {
         self.mean.clone()
     }
 
+    pub fn display_center(&self) -> Tensor<B, 3> {
+        self.display_center.clone()
+    }
+
+    pub fn display_spread(&self) -> Tensor<B, 3> {
+        self.display_spread.clone()
+    }
+
     pub fn project_tokens(&self, tokens: Tensor<B, 3>) -> Result<Tensor<B, 3>> {
         let [_, _, feature_dim] = tokens.shape().dims::<3>();
         ensure!(
@@ -293,7 +365,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
     }
 
     pub fn project_tokens_display(&self, tokens: Tensor<B, 3>) -> Result<Tensor<B, 3>> {
-        Ok(self.display_normalize(self.project_tokens(tokens)?))
+        self.display_tokens(self.project_tokens(tokens)?)
     }
 
     pub fn project_nchw(&self, features: Tensor<B, 4>) -> Result<Tensor<B, 4>> {
@@ -312,7 +384,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
     }
 
     pub fn project_nchw_display(&self, features: Tensor<B, 4>) -> Result<Tensor<B, 4>> {
-        Ok(self.display_normalize(self.project_nchw(features)?))
+        self.display_nchw(self.project_nchw(features)?)
     }
 
     pub fn display_nchw(&self, components: Tensor<B, 4>) -> Result<Tensor<B, 4>> {
@@ -321,7 +393,10 @@ impl<B: Backend> FeaturePcaProjector<B> {
             channels == self.config.output_channels,
             "PCA display component channel count does not match projector output channels"
         );
-        Ok(self.display_normalize(components))
+        Ok(match self.config.display_mode {
+            FeaturePcaDisplayMode::SignedUnit => self.signed_unit_display(components),
+            FeaturePcaDisplayMode::SemanticRgb => self.semantic_nchw_display(components),
+        })
     }
 
     pub fn update_rolling_tokens(&mut self, tokens: Tensor<B, 3>) -> Result<()> {
@@ -345,6 +420,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
         let centered = tokens - self.mean.clone();
         let projected = centered.clone().matmul(self.components.clone());
         let update = centered
+            .clone()
             .swap_dims(1, 2)
             .matmul(projected)
             .mean_dim(0)
@@ -355,6 +431,8 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .mul_scalar(1.0 - self.config.online_learning_rate)
             + update.mul_scalar(self.config.online_learning_rate);
         self.components = self.stabilize_components(components);
+        let projected_stats = centered.matmul(self.components.clone());
+        self.update_display_stats_from_projected(projected_stats, None)?;
         Ok(())
     }
 
@@ -390,6 +468,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
             "PCA update weights must match token batch and token count"
         );
 
+        let stats_weights = weights.clone();
         let weights = weights.unsqueeze_dim::<3>(2);
         let denom = weights
             .clone()
@@ -404,7 +483,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .mul_scalar(1.0 - self.config.mean_momentum)
             + mean_update.mul_scalar(self.config.mean_momentum);
 
-        let centered = tokens - self.mean.clone();
+        let centered = tokens.clone() - self.mean.clone();
         let projected = centered.clone().matmul(self.components.clone());
         let update_denom = denom
             .repeat_dim(1, self.feature_dim)
@@ -420,6 +499,8 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .mul_scalar(1.0 - self.config.online_learning_rate)
             + update.mul_scalar(self.config.online_learning_rate);
         self.components = self.stabilize_components(components);
+        let projected_stats = (tokens - self.mean.clone()).matmul(self.components.clone());
+        self.update_display_stats_from_projected(projected_stats, Some(stats_weights))?;
         Ok(())
     }
 
@@ -496,7 +577,115 @@ impl<B: Backend> FeaturePcaProjector<B> {
         component / denom
     }
 
-    fn display_normalize<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
+    fn display_tokens(&self, components: Tensor<B, 3>) -> Result<Tensor<B, 3>> {
+        let [_, _, channels] = components.shape().dims::<3>();
+        ensure!(
+            channels == self.config.output_channels,
+            "PCA display token channel count does not match projector output channels"
+        );
+        Ok(match self.config.display_mode {
+            FeaturePcaDisplayMode::SignedUnit => self.signed_unit_display(components),
+            FeaturePcaDisplayMode::SemanticRgb => self.semantic_tokens_display(components),
+        })
+    }
+
+    fn update_display_stats_from_projected(
+        &mut self,
+        projected: Tensor<B, 3>,
+        weights: Option<Tensor<B, 2>>,
+    ) -> Result<()> {
+        if self.config.display_mode != FeaturePcaDisplayMode::SemanticRgb
+            || self.config.display_momentum == 0.0
+        {
+            return Ok(());
+        }
+        let [batch, token_count, channels] = projected.shape().dims::<3>();
+        ensure!(
+            channels == self.config.output_channels,
+            "PCA projected display channel count does not match projector output channels"
+        );
+        ensure!(
+            token_count > 0,
+            "PCA display statistics update requires at least one token"
+        );
+        let weights = match weights {
+            Some(weights) => {
+                let [weight_batch, weight_tokens] = weights.shape().dims::<2>();
+                ensure!(
+                    weight_batch == batch && weight_tokens == token_count,
+                    "PCA display statistics weights must match projected token shape"
+                );
+                weights
+            }
+            None => Tensor::<B, 2>::ones([batch, token_count], &projected.device()),
+        };
+        let weights = weights.unsqueeze_dim::<3>(2);
+        let denom = weights
+            .clone()
+            .sum_dim(1)
+            .sum_dim(0)
+            .add_scalar(self.config.epsilon)
+            .repeat_dim(2, channels);
+        let center = (projected.clone() * weights.clone()).sum_dim(1).sum_dim(0) / denom.clone();
+        let centered = projected - center.clone().repeat_dim(1, token_count);
+        let spread = ((centered.powf_scalar(2.0) * weights).sum_dim(1).sum_dim(0) / denom)
+            .add_scalar(self.config.epsilon)
+            .sqrt()
+            .add_scalar(self.config.display_std_floor);
+
+        self.display_center = self
+            .display_center
+            .clone()
+            .mul_scalar(1.0 - self.config.display_momentum)
+            + center.mul_scalar(self.config.display_momentum);
+        self.display_spread = self
+            .display_spread
+            .clone()
+            .mul_scalar(1.0 - self.config.display_momentum)
+            + spread.mul_scalar(self.config.display_momentum);
+        Ok(())
+    }
+
+    fn semantic_tokens_display(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [_, token_count, _] = x.shape().dims::<3>();
+        let centered = x - self.display_center.clone().repeat_dim(1, token_count);
+        let spread = self
+            .display_spread
+            .clone()
+            .repeat_dim(1, token_count)
+            .add_scalar(self.config.display_std_floor);
+        self.signed_unit_display(
+            (centered / spread)
+                .div_scalar(self.config.display_clip_sigma)
+                .mul_scalar(self.config.display_scale),
+        )
+    }
+
+    fn semantic_nchw_display(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let [batch, channels, height, width] = x.shape().dims::<4>();
+        let center = self
+            .display_center
+            .clone()
+            .reshape([1, channels, 1, 1])
+            .repeat_dim(0, batch)
+            .repeat_dim(2, height)
+            .repeat_dim(3, width);
+        let spread = self
+            .display_spread
+            .clone()
+            .reshape([1, channels, 1, 1])
+            .repeat_dim(0, batch)
+            .repeat_dim(2, height)
+            .repeat_dim(3, width)
+            .add_scalar(self.config.display_std_floor);
+        self.signed_unit_display(
+            ((x - center) / spread)
+                .div_scalar(self.config.display_clip_sigma)
+                .mul_scalar(self.config.display_scale),
+        )
+    }
+
+    fn signed_unit_display<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let scaled = x.mul_scalar(self.config.display_scale);
         let denom = scaled
             .clone()

@@ -1,8 +1,8 @@
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_anyup::{
-    AnyUp, AnyUpConfig, AnyUpHighResFeatureMemory, AnyUpHighResFeatureMemoryConfig,
-    AnyUpLoadOptions, AnyUpSparseFeatureMemoryWriteMode, AnyUpSparseFeatureUpdateMode,
-    AnyUpSparseOutputPlan, sparse_low_features_to_nchw,
+    AnyUp, AnyUpAttentionMode, AnyUpConfig, AnyUpHighResFeatureMemory,
+    AnyUpHighResFeatureMemoryConfig, AnyUpLoadOptions, AnyUpSparseFeatureMemoryWriteMode,
+    AnyUpSparseFeatureUpdateMode, AnyUpSparseOutputPlan, sparse_low_features_to_nchw,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,21 @@ fn anyup_forward_returns_requested_output_resolution_and_feature_dim() {
 fn chunked_attention_matches_unchunked_attention() {
     let device = Default::default();
     let config = AnyUpConfig::tiny_for_tests();
+    let model = AnyUp::<B>::new(config, &device).expect("AnyUp model");
+    let image = ramp([1, 3, 8, 8], &device);
+    let features = ramp([1, 5, 2, 2], &device);
+
+    let full = model.forward(image.clone(), features.clone(), None, None);
+    let chunked = model.forward(image, features, None, Some(1));
+
+    assert_close(&values(full), &values(chunked), 1.0e-4);
+}
+
+#[test]
+fn upstream_masked_attention_chunks_match() {
+    let device = Default::default();
+    let config =
+        AnyUpConfig::tiny_for_tests().with_attention_mode(AnyUpAttentionMode::UpstreamMasked);
     let model = AnyUp::<B>::new(config, &device).expect("AnyUp model");
     let image = ramp([1, 3, 8, 8], &device);
     let features = ramp([1, 5, 2, 2], &device);
@@ -299,7 +314,35 @@ fn tiny_anyup_matches_torch_fixture_and_loads_upstream_names() {
     let output = fused.forward(image.clone(), features.clone(), None, Some(1));
     assert_close(&values(output), &fixture.chunked_output, 1.0e-4);
 
-    let mut pth = AnyUp::<B>::new(AnyUpConfig::tiny_for_tests(), &device).expect("model");
+    let mut upstream_masked = AnyUp::<B>::new(
+        AnyUpConfig::tiny_for_tests().with_attention_mode(AnyUpAttentionMode::UpstreamMasked),
+        &device,
+    )
+    .expect("model");
+    let report = AnyUpLoadOptions::default()
+        .load_into(
+            &mut upstream_masked,
+            dir.path().join("paper_fused.safetensors"),
+            &device,
+        )
+        .expect("load upstream masked safetensors");
+    assert!(
+        report
+            .applied
+            .iter()
+            .any(|path| path == "cross_decode.cross_attn.q_proj.weight"),
+        "fused q projection should be split for upstream-masked mode: {report:?}"
+    );
+    let output = upstream_masked.forward(image.clone(), features.clone(), None, None);
+    assert_close(&values(output), &fixture.paper_output, 1.0e-4);
+    let output = upstream_masked.forward(image.clone(), features.clone(), None, Some(1));
+    assert_close(&values(output), &fixture.paper_chunked_output, 1.0e-4);
+
+    let mut pth = AnyUp::<B>::new(
+        AnyUpConfig::tiny_for_tests().with_attention_mode(AnyUpAttentionMode::UpstreamMasked),
+        &device,
+    )
+    .expect("model");
     let report = AnyUpLoadOptions::default()
         .load_into(&mut pth, dir.path().join("paper_fused.pth"), &device)
         .expect("load fused pth");
@@ -311,7 +354,7 @@ fn tiny_anyup_matches_torch_fixture_and_loads_upstream_names() {
         "fused k bias should be split from pth: {report:?}"
     );
     let output = pth.forward(image, features, None, None);
-    assert_close(&values(output), &fixture.output, 1.0e-4);
+    assert_close(&values(output), &fixture.paper_output, 1.0e-4);
 }
 
 #[test]
@@ -351,6 +394,43 @@ fn real_multi_backbone_checkpoint_matches_torch_efficient_reference() {
     assert_close(&values(chunked), &fixture.chunked_output, 1.0e-3);
 }
 
+#[test]
+#[ignore = "downloads or reads the published upstream AnyUp checkpoint"]
+fn real_multi_backbone_checkpoint_matches_torch_upstream_masked_reference() {
+    let Some(checkpoint) = real_checkpoint() else {
+        eprintln!(
+            "skipping real AnyUp checkpoint parity; set BURN_ANYUP_REAL_CHECKPOINT or BURN_ANYUP_DOWNLOAD_REAL=1"
+        );
+        return;
+    };
+    let (dir, fixture) = real_torch_fixture(&checkpoint).expect("real torch fixture");
+    let _dir = dir;
+    let device = Default::default();
+    let image = Tensor::<B, 4>::from_data(
+        TensorData::new(fixture.image.clone(), fixture.image_shape),
+        &device,
+    );
+    let features = Tensor::<B, 4>::from_data(
+        TensorData::new(fixture.features.clone(), fixture.features_shape),
+        &device,
+    );
+    let mut model = AnyUp::<B>::new(AnyUpConfig::upstream_masked(), &device).expect("AnyUp model");
+    let report = AnyUpLoadOptions::default()
+        .load_into(&mut model, checkpoint, &device)
+        .expect("load real AnyUp checkpoint");
+    assert!(
+        report
+            .applied
+            .iter()
+            .any(|path| path == "cross_decode.cross_attn.q_proj.weight"),
+        "fused q projection should be split from the real checkpoint: {report:?}"
+    );
+    let output = model.forward(image.clone(), features.clone(), None, None);
+    assert_close(&values(output), &fixture.paper_output, 1.0e-3);
+    let chunked = model.forward(image, features, None, Some(64));
+    assert_close(&values(chunked), &fixture.paper_chunked_output, 1.0e-3);
+}
+
 #[derive(Debug, Deserialize)]
 struct TorchFixture {
     image: Vec<f32>,
@@ -359,6 +439,8 @@ struct TorchFixture {
     features_shape: [usize; 4],
     output: Vec<f32>,
     chunked_output: Vec<f32>,
+    paper_output: Vec<f32>,
+    paper_chunked_output: Vec<f32>,
     output_shape: [usize; 4],
 }
 

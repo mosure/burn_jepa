@@ -29,7 +29,7 @@ pub enum AnyUpSparseFeatureMemoryWriteMode {
 impl AnyUpSparseFeatureMemoryWriteMode {
     fn resolved<B: Backend>(self) -> Self {
         match self {
-            Self::Auto if backend_is_cuda::<B>() => Self::ScatterAddDelta,
+            Self::Auto if backend_prefers_scatter_add_delta::<B>() => Self::ScatterAddDelta,
             Self::Auto => Self::ScatterNdAssign,
             mode => mode,
         }
@@ -567,15 +567,11 @@ pub fn sparse_low_features_to_nchw<B: Backend>(
     );
     let tokens = tokens + Tensor::<B, 3>::zeros([batch, sparse_len, channels], device);
     let dense_len = feature_size[0] * feature_size[1];
-    let rows = Tensor::<B, 1, Int>::arange(0..batch as i64, device)
-        .unsqueeze_dim::<2>(1)
-        .repeat_dim(1, sparse_len)
-        .unsqueeze_dim::<3>(2);
-    let scatter_indices = Tensor::cat(vec![rows, indices.unsqueeze_dim::<3>(2)], 2);
-    let dense = Tensor::<B, 3>::zeros([batch, dense_len, channels], device).scatter_nd(
-        scatter_indices,
+    let dense = Tensor::<B, 3>::zeros([batch, dense_len, channels], device).scatter(
+        1,
+        indices.unsqueeze_dim::<3>(2).repeat_dim(2, channels),
         tokens,
-        IndexingUpdateOp::Assign,
+        IndexingUpdateOp::Add,
     );
     Ok(dense
         .reshape([batch, feature_size[0], feature_size[1], channels])
@@ -590,7 +586,13 @@ fn gather_memory_tokens<B: Backend>(
     tokens.gather(1, indices.unsqueeze_dim::<3>(2).repeat_dim(2, channels))
 }
 
-fn backend_is_cuda<B: Backend>() -> bool {
+fn backend_prefers_scatter_add_delta<B: Backend>() -> bool {
     let name = std::any::type_name::<B>();
-    name.contains("Cuda") || name.contains("cuda") || name.contains("CUDA")
+    name.contains("Cuda")
+        || name.contains("cuda")
+        || name.contains("CUDA")
+        || name.contains("Wgpu")
+        || name.contains("wgpu")
+        || name.contains("WebGpu")
+        || name.contains("webgpu")
 }

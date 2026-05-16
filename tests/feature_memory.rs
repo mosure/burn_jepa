@@ -65,6 +65,84 @@ fn sparse_updates_accumulate_dense_features_observed_mask_and_age() {
 }
 
 #[test]
+fn sparse_updates_write_by_token_index_not_sparse_position() {
+    let device = Default::default();
+    let grid = TokenGridShape::new(1, 3, 3);
+    let mut memory = InterframeJepaFeatureMemory::<B>::new(
+        InterframeJepaFeatureMemoryConfig::default(),
+        1,
+        grid,
+        1,
+        &device,
+    )
+    .expect("feature memory");
+
+    let first = memory
+        .update_tokens(
+            tensor3(&[8.0, 0.0, 4.0], [1, 3, 1], &device),
+            indices(&[8, 0, 4], [1, 3], &device),
+            grid,
+        )
+        .expect("first sparse write");
+    assert_close(
+        &values3(first.features),
+        &[0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 8.0],
+    );
+    assert_close(
+        &values2(first.observed),
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
+
+    let second = memory
+        .update_tokens(
+            tensor3(&[2.0, 18.0], [1, 2, 1], &device),
+            indices(&[2, 8], [1, 2], &device),
+            grid,
+        )
+        .expect("second sparse write");
+    assert_close(
+        &values3(second.features),
+        &[0.0, 0.0, 2.0, 0.0, 4.0, 0.0, 0.0, 0.0, 18.0],
+    );
+    assert_close(
+        &values2(second.observed),
+        &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    assert_close(
+        &values2(second.age_frames),
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    );
+}
+
+#[test]
+fn sparse_updates_eventually_fill_spatial_cache_over_time() {
+    let device = Default::default();
+    let grid = TokenGridShape::new(1, 2, 2);
+    let mut memory = InterframeJepaFeatureMemory::<B>::new(
+        InterframeJepaFeatureMemoryConfig::default(),
+        1,
+        grid,
+        1,
+        &device,
+    )
+    .expect("feature memory");
+
+    for token in 0..grid.len() {
+        memory
+            .update_tokens(
+                tensor3(&[token as f32 + 1.0], [1, 1, 1], &device),
+                indices(&[token as i64], [1, 1], &device),
+                grid,
+            )
+            .expect("single-token sparse update");
+    }
+
+    let output = memory.snapshot();
+    assert_close(&values2(output.observed), &[1.0, 1.0, 1.0, 1.0]);
+    assert_close(&values3(output.features), &[1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
 fn ema_updates_assign_first_observation_then_blend_repeated_tokens() {
     let device = Default::default();
     let grid = TokenGridShape::new(1, 1, 2);
@@ -231,8 +309,11 @@ fn sparse_update_hot_path_has_no_host_readbacks_or_tensordata_construction() {
             "feature memory sparse update hot path should not contain {marker}"
         );
     }
-    assert!(hot_path.contains(".scatter_nd("));
-    assert!(hot_path.contains("scatter_indices.clone()"));
+    assert!(!hot_path.contains(".scatter_nd("));
+    assert!(hot_path.contains(".scatter("));
+    assert!(hot_path.contains("feature_indices"));
+    assert!(hot_path.contains("observed_delta"));
+    assert!(hot_path.contains("age_delta"));
 }
 
 fn tensor3(

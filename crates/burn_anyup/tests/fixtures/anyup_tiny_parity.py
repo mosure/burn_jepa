@@ -115,7 +115,7 @@ def lfu(features, basis):
         F.pad(mask, (p, p, p, p), value=0),
         torch.ones(1, 1, k, k, dtype=x.dtype),
     )
-    x = (x / denom).view(b, c, basis.shape[0], h, w).transpose(1, 2)
+    x = (x / denom).view(b, basis.shape[0], c, h, w)
     return F.softmax(x, dim=1).mean(dim=2)
 
 
@@ -220,11 +220,51 @@ def efficient_local_attention(q, k, v, q_chunk_size=None):
     return torch.cat(outputs, dim=2)
 
 
-def cross_decode(q, k, v, state, q_chunk_size=None):
+def attention_mask(hq, wq, hk, wk):
+    values = []
+    for row in range(hq):
+        for col in range(wq):
+            row_pos = (row + 0.5) / hq
+            col_pos = (col + 0.5) / wq
+            row_start = math.floor(max(0.0, row_pos - WINDOW_RATIO) * hk)
+            row_end = math.ceil(min(1.0, row_pos + WINDOW_RATIO) * hk)
+            col_start = math.floor(max(0.0, col_pos - WINDOW_RATIO) * wk)
+            col_end = math.ceil(min(1.0, col_pos + WINDOW_RATIO) * wk)
+            for key_row in range(hk):
+                for key_col in range(wk):
+                    allowed = row_start <= key_row < row_end and col_start <= key_col < col_end
+                    values.append(0.0 if allowed else -1.0e9)
+    return torch.tensor(values, dtype=torch.float32).view(hq * wq, hk * wk)
+
+
+def upstream_masked_attention(q, k, v, q_chunk_size=None):
+    b, q_tokens, qk_dim = q.shape
+    k_tokens = k.shape[1]
+    head_dim = qk_dim // HEADS
+    q = q.view(b, q_tokens, HEADS, head_dim).transpose(1, 2)
+    k = k.view(b, k_tokens, HEADS, head_dim).transpose(1, 2)
+    k_t = k.transpose(-2, -1)
+    chunk_size = q_tokens if q_chunk_size is None else max(1, q_chunk_size)
+    hq = int(math.sqrt(q_tokens))
+    wq = q_tokens // hq
+    hk = int(math.sqrt(k_tokens))
+    wk = k_tokens // hk
+    mask = attention_mask(hq, wq, hk, wk) if WINDOW_RATIO > 0 else None
+    outputs = []
+    for start in range(0, q_tokens, chunk_size):
+        end = min(q_tokens, start + chunk_size)
+        logits = (q[:, :, start:end] @ k_t) * (head_dim ** -0.5)
+        if mask is not None:
+            logits = logits + mask[start:end][None, None]
+        attn = torch.softmax(logits, dim=-1).mean(dim=1)
+        outputs.append(attn @ v)
+    return torch.cat(outputs, dim=1)
+
+
+def cross_decode(q, k, v, state, q_chunk_size=None, mode="efficient"):
     q = F.conv2d(q, state["cross_decode.conv2d.weight"], padding=1)
     b, _, hq, wq = q.shape
     _, _, hk, wk = k.shape
-    value_dim = v.shape[1]
     q = rms_norm(flatten(q), state["cross_decode.norm_q.weight"])
     k = rms_norm(flatten(k), state["cross_decode.norm_k.weight"])
     q = F.conv2d(
@@ -237,10 +277,16 @@ def cross_decode(q, k, v, state, q_chunk_size=None):
         state["cross_decode.cross_attn.k_proj.weight"],
         state["cross_decode.cross_attn.k_proj.bias"],
     )
-    return efficient_local_attention(q, k, v, q_chunk_size)
+    if mode == "efficient":
+        return efficient_local_attention(q, k, v, q_chunk_size)
+    q = flatten(q)
+    k = flatten(k)
+    v = flatten(v)
+    features = upstream_masked_attention(q, k, v, q_chunk_size)
+    return unflatten(features, hq, wq)
 
 
-def forward(image, features, state, q_chunk_size=None):
+def forward(image, features, state, q_chunk_size=None, mode="efficient"):
     enc = conv_encoder(image, state, "image_encoder")
     b, c, h, w = enc.shape
     enc = rope(flatten(enc), state["rope.freqs"])
@@ -249,7 +295,7 @@ def forward(image, features, state, q_chunk_size=None):
     k_img = F.adaptive_avg_pool2d(conv_encoder(enc, state, "key_encoder"), features.shape[-2:])
     k_feat = feature_encoder(features, state)
     k = conv_encoder(torch.cat([k_img, k_feat], dim=1), state, "aggregation")
-    return cross_decode(q, k, features, state, q_chunk_size=q_chunk_size)
+    return cross_decode(q, k, features, state, q_chunk_size=q_chunk_size, mode=mode)
 
 
 def fused_state_dict(state):
@@ -289,6 +335,8 @@ def main():
     features = torch.linspace(-0.5, 0.5, 1 * 5 * 2 * 2, dtype=torch.float32).view(1, 5, 2, 2)
     output = forward(image, features, state, q_chunk_size=None)
     chunked = forward(image, features, state, q_chunk_size=1)
+    paper_output = forward(image, features, state, q_chunk_size=None, mode="paper")
+    paper_chunked = forward(image, features, state, q_chunk_size=1, mode="paper")
     save_file(state, str(out / "efficient.safetensors"))
     fused = fused_state_dict(state)
     save_file(fused, str(out / "paper_fused.safetensors"))
@@ -302,6 +350,8 @@ def main():
                 "features_shape": list(features.shape),
                 "output": output.flatten().tolist(),
                 "chunked_output": chunked.flatten().tolist(),
+                "paper_output": paper_output.flatten().tolist(),
+                "paper_chunked_output": paper_chunked.flatten().tolist(),
                 "output_shape": list(output.shape),
             }
         )

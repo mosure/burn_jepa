@@ -323,7 +323,7 @@ fn feature_memory_benchmark_covers_sparse_update_density_matrix() {
     let docs = include_str!("../docs/interframe-feature-memory.md");
     assert!(docs.contains("InterframeJepaFeatureMemory"));
     assert!(docs.contains("features`, `observed`, and"));
-    assert!(docs.contains("scatter_nd(..., Assign)"));
+    assert!(docs.contains("scatter(..., Add)"));
     assert!(docs.contains("cargo bench --bench feature_memory"));
 
     let manifest = include_str!("../Cargo.toml");
@@ -417,40 +417,97 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     let viewer_bench = include_str!("../crates/bevy_jepa/benches/viewer_pipeline.rs");
     let viewer_config = include_str!("../crates/bevy_jepa/src/config.rs");
     let viewer_lib = include_str!("../crates/bevy_jepa/src/lib.rs");
+    let viewer_platform = include_str!("../crates/bevy_jepa/src/platform.rs");
     let viewer_docs = include_str!("../crates/bevy_jepa/README.md");
     let raw_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
     let highres_docs = include_str!("../docs/highres-anyup-pca-pipeline.md");
     let manifest = include_str!("../crates/bevy_jepa/Cargo.toml");
+    let pca = include_str!("../src/pca.rs");
+    let pca_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
 
     assert!(viewer_bench.contains("bevy_jepa_viewer_pipeline_wgpu"));
-    assert!(viewer_bench.contains("step_core_only"));
-    assert!(viewer_bench.contains("step_with_display_panels"));
+    assert!(viewer_bench.contains("low_res_cache_update"));
+    assert!(viewer_bench.contains("pca_projection"));
+    assert!(viewer_bench.contains("full_anyup_decode"));
+    assert!(viewer_bench.contains("display_upload_gpu"));
+    assert!(viewer_bench.contains("display_upload_cpu"));
+    assert!(viewer_bench.contains("step_with_display_request"));
+    assert!(viewer_bench.contains("step_with_stage_request"));
     assert!(viewer_bench.contains("aligns_with_stage_metrics"));
-    assert!(viewer_bench.contains("BevyJepaMaskSource::Autogaze"));
     assert!(viewer_bench.contains("BevyJepaMaskSource::PatchDiff"));
-    assert!(viewer_bench.contains("{mask_source}_core_only"));
     assert!(
-        viewer_bench.contains("gpu_panels") && viewer_bench.contains("cpu_panels"),
-        "viewer bench should make device-resident and host-transfer display costs explicit"
+        !viewer_bench.contains("BevyJepaMaskSource::Autogaze"),
+        "viewer bench must not time the reserved AutoGaze mode unless it is backed by a real model node"
     );
+    assert!(viewer_bench.contains("{mask_source}_{image_size}_{name}"));
     assert!(viewer_lib.contains("pub stage_metrics: FeatureFrameMetrics"));
+    assert!(viewer_lib.contains("pub encode_path: FeatureFrameEncodePath"));
     assert!(viewer_lib.contains("pub fn aligns_with_stage_metrics(&self) -> bool"));
     assert!(viewer_lib.contains("pub struct BevyJepaHeadlessPipeline"));
-    assert!(viewer_lib.contains("pub fn step_core_only(&mut self)"));
+    assert!(viewer_lib.contains("pub fn step_stage_only(&mut self)"));
     assert!(viewer_lib.contains("pub fn step_with_display_panels(&mut self)"));
-    assert!(viewer_config.contains("DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 0.15"));
+    assert!(viewer_lib.contains("pub fn step_with_display_request"));
+    assert!(viewer_lib.contains("pub fn step_with_stage_request"));
+    assert!(viewer_lib.contains("stage_request_for_frame"));
+    assert!(viewer_lib.contains("run_feature_frame_pipeline_sparse_patchify"));
+    assert!(viewer_lib.contains("pub mod platform"));
+    assert!(viewer_lib.contains("AsyncComputeTaskPool"));
+    assert!(viewer_lib.contains("pending_stage"));
+    assert!(viewer_lib.contains("pending_stage_image"));
+    assert!(viewer_lib.contains("prev_stage_image"));
+    assert!(viewer_lib.contains("source_stage_image"));
+    assert!(viewer_lib.contains("sparse_mask_to_rgba_tensor"));
+    assert!(viewer_lib.contains("apply_input_panel_to_world"));
+    assert!(viewer_lib.contains("apply_stage_panels_to_world"));
+    assert!(viewer_lib.contains("FeatureFrameRequest::low_res()"));
+    assert!(viewer_lib.contains("queue_overwritten_frames"));
+    assert!(viewer_platform.contains("frame_input"));
+    assert!(viewer_platform.contains("native_camera_thread_with_request"));
+    assert!(viewer_config.contains("pub enum BevyJepaFrameSource"));
+    assert!(viewer_config.contains("pub enum BevyJepaEncodePath"));
+    assert!(viewer_config.contains("MIN_PIPELINE_IMAGE_SIZE: usize = 256"));
+    assert!(viewer_config.contains("DEFAULT_IMAGE_SIZE: usize = 256"));
+    assert!(viewer_config.contains("DEFAULT_HIGH_RES_PCA_EVERY: u64 = 8"));
+    assert!(viewer_config.contains("DEFAULT_PATCH_DIFF_QUALITY: f32 = 0.85"));
+    assert!(viewer_config.contains("DEFAULT_MIN_CONTEXT_DENSITY: f32 = 0.0"));
+    assert!(viewer_config.contains("pub fn pipeline_image_size(&self) -> usize"));
+    assert!(viewer_config.contains("pub fn patch_diff_quality(&self) -> f32"));
     assert!(
-        raw_bench.contains("viewer64_sparse25"),
-        "raw high-res E2E bench should include the default Bevy viewer config"
+        viewer_config
+            .contains("DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 1.0 - DEFAULT_PATCH_DIFF_QUALITY")
+    );
+    assert!(viewer_lib.contains("DEFAULT_PATCH_DIFF_QUALITY"));
+    assert!(manifest.contains("sparse-patchify-wgpu = [\"burn_jepa/sparse-patchify-wgpu\"]"));
+    assert!(
+        viewer_bench.contains("const VIEWER_IMAGE_SIZES: [usize; 2] = [DEFAULT_IMAGE_SIZE, 512]")
+    );
+    assert!(viewer_docs.contains("--source camera"));
+    assert!(viewer_docs.contains("quality `0.85`, threshold `0.15`"));
+    assert!(viewer_docs.contains("quality value only changes the threshold"));
+    assert!(viewer_docs.contains("fixed 85%"));
+    assert!(
+        raw_bench.contains("viewer256_sparse100") && raw_bench.contains("viewer512_sparse100"),
+        "raw high-res E2E bench should include both supported V-JEPA 2.1 viewer resolutions"
     );
     assert!(
         raw_bench.contains("FeaturePcaUpdateConfig::rolling_low_res_every")
             && raw_bench.contains("SparseJepaAnyUpPcaMeasurementConfig::enabled()"),
         "raw viewer row should mirror Bevy's rolling PCA and stage-measurement config"
     );
+    assert!(pca.contains("pub enum FeaturePcaDisplayMode"));
+    assert!(pca.contains("SemanticRgb"));
+    assert!(pca.contains("display_center"));
+    assert!(pca.contains("display_spread"));
     assert!(
-        viewer_docs.contains("highres_sparse_jepa_anyup_pca_e2e_wgpu/viewer64_sparse25")
-            && highres_docs.contains("viewer64_sparse25"),
+        !pca.contains("into_data()") && !pca.contains("to_vec::<"),
+        "PCA visualization must not require host readback for display statistics"
+    );
+    assert!(pca_bench.contains("highres_semantic_pca_stats_update"));
+    assert!(pca_bench.contains("FeaturePcaDisplayMode::SemanticRgb"));
+    assert!(
+        viewer_docs.contains("highres_sparse_jepa_anyup_pca_e2e_wgpu/viewer512_sparse100")
+            && highres_docs.contains("viewer256_sparse100")
+            && highres_docs.contains("viewer512_sparse100"),
         "docs should tell users how to compare Bevy wrapper and raw pipeline rows"
     );
     assert!(manifest.contains("name = \"viewer_pipeline\""));

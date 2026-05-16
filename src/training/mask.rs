@@ -276,6 +276,9 @@ impl TrainingMaskConfig {
                 context_tokens: *context_tokens,
                 target_tokens: *target_tokens,
                 dilation: *dilation,
+                min_context_tokens: 1,
+                fill_to_context_tokens: true,
+                allow_full_context: false,
             }),
             Self::PrecomputedMasks {
                 context_indices,

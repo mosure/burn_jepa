@@ -149,7 +149,9 @@ sparse encoder tokens; `sparse-patchify-wgpu` and `sparse-patchify-cuda` expose
 flex-gmm image patchify entry points that skip masked-out image patches before
 the encoder. `FeatureFrameRequest` and `FeatureFrameSchedule` let callers emit
 low-res PCA and high-res AnyUp/PCA at separate rates from the same sparse token
-cache update.
+cache update. The Bevy viewer follows the production-friendly default of
+updating low-res token-cache PCA every processed stage frame while decimating
+the expensive high-res AnyUp/PCA stage.
 For camera-style loops, `FeatureFrameStream` adds bounded in-flight
 queueing, fixed-width sparse-mask batching, per-stage metrics, queue-wait
 timing, monotonic frame sequencing, and reject/drop/overwrite backpressure
@@ -512,8 +514,12 @@ patchify parity smoke against dense masked V-JEPA output.
 ## Bevy Example
 
 ```sh
-cargo run -p bevy_jepa -- --mask-source autogaze
-cargo run -p bevy_jepa -- --mask-source patch-diff --image-size 128
+cargo run -p bevy_jepa
+cargo run -p bevy_jepa -- --source static --image-path /path/to/frame.png
+cargo run -p bevy_jepa -- --mask-source patch-diff --image-size 512
+cargo run -p bevy_jepa -- --mask-source patch-diff --image-size 256
+cargo run -p bevy_jepa -- --source camera --anyup-weights /path/to/anyup_multi_backbone.pth --anyup-attention-mode upstream-masked
+cargo run -p bevy_jepa -- --encoder-source tiny-test --source synthetic-local-motion
 
 cd crates/bevy_jepa
 npm run serve
@@ -521,6 +527,44 @@ npm run serve
 
 The Bevy viewer uses the shared `bevy_burn` WebGPU device path to render input
 frames, sparse masks, low-resolution JEPA token-cache PCA, and high-resolution
-AnyUp PCA as GPU texture uploads. Press space to switch between AutoGaze-style
-sparse token masks and patch-diff sparse token masks. The GitHub Pages workflow
-builds the wasm target and publishes `crates/bevy_jepa/www`.
+AnyUp PCA as GPU texture uploads. The viewer pipeline runs at a minimum
+256x256 JEPA input resolution, defaults to 256x256 sparse encoding, and rounds
+larger requests to a multiple of the 16px V-JEPA patch size. Native camera input
+uses a latest-frame overwrite queue, center-crops the camera frame to preserve
+aspect ratio, and resizes the crop to the configured JEPA input size. The wasm
+page uses `getUserMedia` plus the exported
+`frame_input(...)` bridge. Native runs default to the trained encoder-only TTT
+V-JEPA 2.1 checkpoint at
+`target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk`; pass
+`--ttt-model`, set `BURN_JEPA_TTT_MODEL`, or use `--encoder-source
+base-checkpoint`/`tiny-test` for explicit alternatives.
+
+Input preview and stage processing are decoupled. The camera/input panel is
+updated immediately from the latest source frame, while the sparse JEPA ->
+feature-cache -> AnyUp/PCA stage runs on a single async worker with a one-frame
+overwrite queue. When AnyUp or high-res PCA is slower than the camera, the
+latest pending stage frame replaces the previous pending one; the overlay
+reports input FPS, low-res FPS, high-res FPS, in-flight frames, drops, and
+overwrites so backpressure is visible instead of silently stalling the app.
+Camera preview frames remain center-cropped RGBA until they are admitted into
+the stage worker, so pending preview updates do not build Burn tensors or run
+patch-diff scoring. The sparse-mask panel is the completed stage write map:
+the token positions shown are the positions overwritten in the low-resolution
+feature cache for that same stage frame.
+
+The viewer defaults to patch-diff masks so the sparse
+mask node is driven by the current camera/static frame. Patch-diff uses
+threshold-driven adaptive density by default: every patch above the threshold is
+updated, `--min-context-density` is only a near-static fallback floor, and
+`--bootstrap-context-density` controls the first frame token-cache fill.
+`--patch-diff-quality Q` mirrors the AutoGaze viewer mapping by setting the
+patch-diff threshold to `1 - Q`; it does not impose a fixed 85% token density.
+`--mask-source autogaze` requires a real
+model-backed AutoGaze node and fails clearly instead of generating a synthetic
+moving center prior. The GitHub Pages workflow builds the wasm target and
+publishes `crates/bevy_jepa/www`. If no AnyUp checkpoint is provided, the viewer
+uses the tiny untrained AnyUp test module; use
+`--anyup-weights` with `--anyup-attention-mode upstream-masked` for exact
+upstream Python AnyUp parity. PCA display follows the V-JEPA 2.1 dense-feature
+visualization protocol by mapping the first three rolling PCA components of
+observed patch features to RGB with device-resident normalization.

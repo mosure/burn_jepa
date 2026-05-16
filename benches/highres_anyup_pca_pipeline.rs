@@ -1,11 +1,12 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_jepa::{
-    AnyUp, AnyUpConfig, FeaturePcaConfig, FeaturePcaProjector, FeaturePcaUpdateConfig,
-    InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig, SparseJepaAnyUpPcaFrameId,
-    SparseJepaAnyUpPcaFrameInput, SparseJepaAnyUpPcaMeasurementConfig, SparseJepaAnyUpPcaPipeline,
-    SparseJepaAnyUpPcaPipelineConfig, SparseJepaAnyUpPcaStream, SparseJepaAnyUpPcaStreamConfig,
-    SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig, jepa_feature_tokens_to_nchw,
+    AnyUp, AnyUpConfig, FeaturePcaConfig, FeaturePcaDisplayMode, FeaturePcaProjector,
+    FeaturePcaUpdateConfig, InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig,
+    SparseJepaAnyUpPcaFrameId, SparseJepaAnyUpPcaFrameInput, SparseJepaAnyUpPcaMeasurementConfig,
+    SparseJepaAnyUpPcaPipeline, SparseJepaAnyUpPcaPipelineConfig, SparseJepaAnyUpPcaStream,
+    SparseJepaAnyUpPcaStreamConfig, SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig,
+    jepa_feature_tokens_to_nchw,
 };
 #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
 use burn_jepa::{SparseMaskBatch, SparsePatchifyBatchPlan};
@@ -125,28 +126,85 @@ fn bench_pca_projection<B, MakeDevice>(
         group.throughput(Throughput::Elements(
             (case.batch * case.image_hw * case.image_hw) as u64,
         ));
+        for (mode_label, display_mode) in [
+            ("semantic_rgb", FeaturePcaDisplayMode::SemanticRgb),
+            ("signed_unit", FeaturePcaDisplayMode::SignedUnit),
+        ] {
+            group.bench_function(format!("{}_{}", case.label, mode_label), |bench| {
+                bench.iter_batched(
+                    || {
+                        let device = make_device();
+                        let projector = FeaturePcaProjector::<B>::identity(
+                            case.embed_dim,
+                            FeaturePcaConfig {
+                                display_mode,
+                                ..FeaturePcaConfig::default()
+                            },
+                            &device,
+                        )
+                        .expect("pca projector");
+                        let features = Tensor::<B, 4>::ones(
+                            [case.batch, case.embed_dim, case.image_hw, case.image_hw],
+                            &device,
+                        );
+                        (device, projector, features)
+                    },
+                    |(device, projector, features)| {
+                        let projected = projector
+                            .project_nchw_display(black_box(features))
+                            .expect("pca project");
+                        B::sync(&device).expect("sync PCA backend");
+                        black_box(projected);
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+fn bench_semantic_pca_stats_update<B, MakeDevice>(
+    c: &mut Criterion,
+    backend_name: &str,
+    make_device: MakeDevice,
+) where
+    B: Backend,
+    MakeDevice: Fn() -> B::Device + Copy,
+{
+    let mut group = c.benchmark_group(format!("highres_semantic_pca_stats_update_{backend_name}"));
+    for case in CASES {
+        if case.large && !include_large_cases() {
+            continue;
+        }
+        group.throughput(Throughput::Elements((case.grid_hw * case.grid_hw) as u64));
         group.bench_function(case.label, |bench| {
             bench.iter_batched(
                 || {
                     let device = make_device();
                     let projector = FeaturePcaProjector::<B>::identity(
                         case.embed_dim,
-                        FeaturePcaConfig::default(),
+                        FeaturePcaConfig {
+                            display_mode: FeaturePcaDisplayMode::SemanticRgb,
+                            online_learning_rate: 0.05,
+                            mean_momentum: 0.05,
+                            display_momentum: 0.05,
+                            ..FeaturePcaConfig::default()
+                        },
                         &device,
                     )
                     .expect("pca projector");
-                    let features = Tensor::<B, 4>::ones(
-                        [case.batch, case.embed_dim, case.image_hw, case.image_hw],
-                        &device,
-                    );
-                    (device, projector, features)
+                    let token_count = case.grid_hw * case.grid_hw;
+                    let tokens = Tensor::<B, 3>::ones([1, token_count, case.embed_dim], &device);
+                    let observed = Tensor::<B, 2>::ones([1, token_count], &device);
+                    (device, projector, tokens, observed)
                 },
-                |(device, projector, features)| {
-                    let projected = projector
-                        .project_nchw_display(black_box(features))
-                        .expect("pca project");
-                    B::sync(&device).expect("sync PCA backend");
-                    black_box(projected);
+                |(device, mut projector, tokens, observed)| {
+                    projector
+                        .update_rolling_masked_tokens(black_box(tokens), black_box(observed))
+                        .expect("semantic PCA stats update");
+                    B::sync(&device).expect("sync semantic PCA update backend");
+                    black_box((projector.components(), projector.display_spread()));
                 },
                 BatchSize::SmallInput,
             );
@@ -353,10 +411,18 @@ fn bench_tiny_e2e_pipeline_step<B, MakeDevice>(
             measurement: SparseJepaAnyUpPcaMeasurementConfig::disabled(),
         },
         E2ePipelineCase {
-            label: "viewer64_sparse25",
-            image_hw: 64,
-            density: 0.25,
-            q_chunk_size: Some(4),
+            label: "viewer256_sparse100",
+            image_hw: 256,
+            density: 1.0,
+            q_chunk_size: Some(16),
+            pca_update_every: Some(16),
+            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
+        },
+        E2ePipelineCase {
+            label: "viewer512_sparse100",
+            image_hw: 512,
+            density: 1.0,
+            q_chunk_size: Some(16),
             pca_update_every: Some(16),
             measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
         },
@@ -716,6 +782,7 @@ where
     MakeDevice: Fn() -> B::Device + Copy,
 {
     bench_pca_projection::<B, _>(c, backend_name, make_device);
+    bench_semantic_pca_stats_update::<B, _>(c, backend_name, make_device);
     bench_pca_basis_update::<B, _>(c, backend_name, make_device);
     bench_anyup_from_token_cache::<B, _>(c, backend_name, make_device);
     bench_sparse_update_to_anyup_pca::<B, _>(c, backend_name, make_device);

@@ -147,9 +147,7 @@ impl<B: Backend> LearnedFeatureUnification<B> {
         let options = ConvOptions::new([1, 1], [0, 0], [1, 1], channels);
         let x = conv2d(x, basis, None, options)
             / depthwise_denominator::<B>(height, width, self.kernel_size, device);
-        let x = x
-            .reshape([batch, channels, self.out_channels, height, width])
-            .swap_dims(1, 2);
+        let x = x.reshape([batch, self.out_channels, channels, height, width]);
         let attn = activation::softmax(x, 1);
         attn.mean_dim(2)
             .reshape([batch, self.out_channels, height, width])

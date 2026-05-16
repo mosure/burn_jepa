@@ -36,8 +36,16 @@ low-resolution JEPA token cache to PCA components first, then runs AnyUp over
 only those display channels. This preserves the displayed image because AnyUp's
 attention weights are independent of value channels, while avoiding
 materialization of a full `[B, C, H, W]` high-resolution JEPA feature tensor.
-Use `FeatureFrameRequest::high_res()` or `FeatureFrameRequest::full()` when
+Use `FeatureFrameRequest::high_res_features()`,
+`FeatureFrameRequest::high_res()`, or `FeatureFrameRequest::full()` when
 downstream code needs the dense high-resolution feature tensor itself.
+
+AnyUp quality depends on the supplied AnyUp module. Tiny test configs are useful
+for checking control flow and device residency, but they are randomly
+initialized and can produce overly smooth high-resolution PCA displays. Use a
+loaded upstream AnyUp checkpoint and `AnyUpAttentionMode::UpstreamMasked` for
+exact upstream Python parity, or `EfficientLocal` for the portable NATTEN-style
+path used in performance runs.
 
 The sparse update and PCA projection stay in tensor ops. There are no
 backend-to-host reads in `FeatureFramePipeline::step_image_with_mask`;
@@ -74,7 +82,8 @@ valid sparse-token count, output pixels, `encode_path`, and per-stage
 microsecond durations for sparse encode, cache update, token-cache view, rolling
 PCA basis update, low-res PCA projection, AnyUp image context, AnyUp decode, and
 high-res PCA projection. `pca_update_applied` and `pca_update_tokens` identify
-whether that batch actually updated the display basis.
+whether that batch actually updated the display basis; `pca_sample_frames` and
+`pca_sample_window_frames` report the rolling frame window used for that update.
 `FeatureFrameMeasureConfig::disabled()` is the default; backend sync
 for true GPU wall-clock timing is an explicit opt-in through
 `enabled_with_backend_sync()`.
@@ -112,9 +121,32 @@ payload can therefore contain neither optional display artifact, only low-res
 PCA, only high-res AnyUp/PCA, or both. The full legacy `process_next_ready`
 method still returns high-res AnyUp/PCA every processed batch.
 
+The Bevy viewer uses the same node separation but keeps the live input preview
+outside the stage worker. Source frames update the input panel immediately; the
+JEPA/AnyUp/PCA stage owns one active async task plus one latest pending frame.
+New camera frames overwrite that pending stage frame when the worker is busy, so
+slow high-res PCA cannot build an unbounded queue or drag the input panel down
+to stage FPS. Bevy metrics report input/low-res/high-res FPS and
+drop/overwrite counts alongside the raw `FeatureFrameMetrics`.
+For camera sources, pending frames stay as resized RGBA until the worker admits
+them. The worker then converts the admitted frame to a Burn tensor, computes
+patch-diff against the previous admitted stage frame, runs JEPA, and renders the
+mask panel from the admitted sparse mask. The pipeline tests assert that this
+mask matches `encoded.token_indices` and the cache scatter positions. This makes
+the displayed mask a cache write map for the completed stage frame, not a
+speculative mask for a newer preview frame.
+
 ## PCA
 
-`FeaturePcaProjector` supports two basis modes:
+`FeaturePcaProjector` follows the V-JEPA 2.1 feature-map visualization protocol:
+compute PCA on dense patch features and map the first three principal components
+to RGB. The default `semantic_rgb` display mode is intended for these
+semantically coherent V-JEPA 2.1 features: it fits the PCA basis from a rolling
+multi-frame sample of observed token-cache features, projects low- or high-res
+features with that stable basis, and normalizes RGB channels with rolling
+projected-feature statistics instead of per-frame min/max.
+
+The projector supports two basis modes:
 
 - Fixed components, including the identity initializer used by tests and smoke
   pipelines.
@@ -125,9 +157,13 @@ method still returns high-res AnyUp/PCA every processed batch.
 PCA basis. This update node is independent from `FeatureFrameSchedule`: a frame
 can update the rolling PCA basis without emitting either low-res or high-res
 display artifacts, and a display artifact can use the last stable basis without
-forcing an update. Updates consume the accumulated low-resolution token-feature
-batch `[B, C, grid_h, grid_w]`, maintain a moving mean, nudge components toward
-the observed covariance directions, then normalize and orthogonalize the basis.
+forcing an update. Updates consume a rolling device-resident window of
+low-resolution token-cache snapshots. `rolling_low_res_every(N)` uses
+`max(N, 2)` sampled frames by default and waits until that many frames are
+buffered before the first update, so live PCA is fit from more than one frame
+instead of a single cache snapshot. Each scheduled update runs several
+orthogonalized Oja/power-iteration steps, maintains a moving mean, nudges
+components toward the observed covariance directions, then normalizes the basis.
 Because the basis is rolled forward instead of recomputed from scratch, signs and
 axes remain stable across frames, which reduces PCA color flicker. This is meant
 for live visualization and domain adaptation of the display basis, not as a
@@ -135,13 +171,17 @@ replacement for an offline PCA fit on a large feature corpus.
 
 The legacy `update_pca_online` config flag maps to
 `FeaturePcaUpdateConfig::rolling_low_res_every(1)` for compatibility. New code
-should prefer the explicit `pca_update` config. The pipeline update path uses
+should prefer the explicit `pca_update` config; even the compatibility mapping
+uses a two-frame sample window. The pipeline update path uses
 `InterframeJepaFeatureMemoryOutput::observed` as tensor-side weights, so
 never-observed cache slots do not bias the rolling PCA basis toward zero.
 
-Display normalization uses a bounded tensor transform instead of per-frame
-min/max host readbacks. This keeps the render path predictable on WGPU/CUDA and
-avoids synchronizing the backend just to colorize a frame.
+Display normalization is device-resident. `semantic_rgb` keeps rolling
+per-component center/spread statistics from the same observed token samples used
+to update the PCA basis, then softly clips projected z-scores into RGB. This
+keeps the color mapping robust to sparse-cache holes and outliers while avoiding
+host readbacks or per-frame min/max flicker. `signed_unit` remains available as a
+simple bounded signed projection mode for debugging.
 
 ## Benchmarks
 
@@ -163,13 +203,16 @@ By default the bench matrix runs small and mid-sized visualization cases. Set
 BURN_JEPA_HIGHRES_BENCH_LARGE=1 cargo bench --bench highres_anyup_pca_pipeline --no-default-features --features wgpu
 ```
 
-The raw E2E matrix includes a `viewer64_sparse25` row that mirrors the default
-`bevy_jepa` viewer configuration. Compare it with the headless Bevy wrapper
-bench to separate shared pipeline cost from display tensor preparation:
+The raw E2E matrix includes `viewer256_sparse100` and `viewer512_sparse100`
+rows for the V-JEPA 2.1 trained-resolution viewer paths. The Bevy app defaults
+to the 256x256 sparse-encoding path with a 16x16 token grid; 512x512 remains
+available as the larger 32x32-grid path. Compare these rows with the headless
+Bevy wrapper bench to separate shared pipeline cost from display tensor
+preparation:
 
 ```sh
 cargo bench -p bevy_jepa --bench viewer_pipeline -- --sample-size 10
-cargo bench --bench highres_anyup_pca_pipeline --no-default-features --features webgpu -- highres_sparse_jepa_anyup_pca_e2e_wgpu/viewer64_sparse25
+cargo bench --bench highres_anyup_pca_pipeline --no-default-features --features webgpu -- highres_sparse_jepa_anyup_pca_e2e_wgpu/viewer512_sparse100
 ```
 
 For stage-by-stage e2e latency and queue overwrite/drop accounting, use the
@@ -188,8 +231,9 @@ repeated small attention launches. CPU/ndarray can prefer smaller chunks because
 the larger intermediate attention tensors are less cache-friendly.
 Set `BURN_JEPA_PCA_UPDATE_EVERY=N` on the breakdown example to enable the
 rolling low-res PCA update node every N input frames; `BURN_JEPA_PCA_UPDATE_ITERS`,
-`BURN_JEPA_PCA_UPDATE_WARMUP`, and `BURN_JEPA_PCA_UPDATE_MIN_TOKENS` tune the
-update work and cadence.
+`BURN_JEPA_PCA_UPDATE_WARMUP`, `BURN_JEPA_PCA_UPDATE_MIN_TOKENS`,
+`BURN_JEPA_PCA_SAMPLE_WINDOW`, and `BURN_JEPA_PCA_MIN_SAMPLE_FRAMES` tune the
+update work, cadence, and sample window.
 
 The matrix splits the path into:
 

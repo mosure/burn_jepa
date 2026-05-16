@@ -43,7 +43,14 @@ wasm = [
   "dep:web-sys",
 ]
 bevy-web-demo = ["wasm"]
-sparse-patchify-wgpu = ["wgpu", "dep:burn_flex_gmm", "burn_flex_gmm/wgpu-kernel"]
+sparse-patchify-wgpu = [
+  "wgpu",
+  "dep:burn-backend",
+  "dep:burn-fusion",
+  "dep:burn-ir",
+  "dep:burn_flex_gmm",
+  "burn_flex_gmm/wgpu-kernel",
+]
 sparse-patchify-cuda = [
   "cuda",
   "dep:burn-backend",

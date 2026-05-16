@@ -318,8 +318,15 @@ fn real_vjepa_checkpoint_loads_when_fixture_is_set() {
     let checkpoint_dir = std::path::PathBuf::from(checkpoint_dir);
     let device = Default::default();
     let allow_partial = env_bool("BURN_JEPA_VJEPA21_ALLOW_PARTIAL");
-    let weights_name =
-        env::var("BURN_JEPA_VJEPA21_WEIGHTS").unwrap_or_else(|_| "model.safetensors".to_string());
+    let weights_name = env::var("BURN_JEPA_VJEPA21_WEIGHTS")
+        .or_else(|_| env::var("BURN_JEPA_VJEPA21_WEIGHTS_NAME"))
+        .unwrap_or_else(|_| {
+            if checkpoint_dir.join("model.pt").exists() {
+                "model.pt".to_string()
+            } else {
+                "model.safetensors".to_string()
+            }
+        });
     let (model, config, report) = VJepaLoadOptions {
         config_name: env::var("BURN_JEPA_VJEPA21_CONFIG")
             .unwrap_or_else(|_| "config.json".to_string()),

@@ -50,6 +50,8 @@ def main():
     with torch.no_grad():
         output = reference.forward(image, features, state, q_chunk_size=2)
         chunked = reference.forward(image, features, state, q_chunk_size=1)
+        paper_output = reference.forward(image, features, state, q_chunk_size=None, mode="paper")
+        paper_chunked = reference.forward(image, features, state, q_chunk_size=64, mode="paper")
 
     (out / "fixture.json").write_text(json.dumps({
         "image": image.flatten().tolist(),
@@ -58,6 +60,8 @@ def main():
         "features_shape": list(features.shape),
         "output": output.flatten().tolist(),
         "chunked_output": chunked.flatten().tolist(),
+        "paper_output": paper_output.flatten().tolist(),
+        "paper_chunked_output": paper_chunked.flatten().tolist(),
         "output_shape": list(output.shape),
     }))
 

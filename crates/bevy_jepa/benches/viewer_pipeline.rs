@@ -1,23 +1,69 @@
 use std::hint::black_box;
 
 use bevy_jepa::{
-    BevyJepaConfig, BevyJepaDisplayTransfer, BevyJepaHeadlessPipeline, BevyJepaMaskSource,
-    JepaBevyBackend, JepaBevyDevice,
+    BevyJepaConfig, BevyJepaDisplayTransfer, BevyJepaEncoderSource, BevyJepaFrameSource,
+    BevyJepaHeadlessPipeline, BevyJepaMaskSource, DEFAULT_IMAGE_SIZE, JepaBevyBackend,
+    JepaBevyDevice,
 };
 use burn::tensor::backend::Backend;
+use burn_jepa::FeatureFrameRequest;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
-const VIEWER_IMAGE_SIZE: usize = 64;
-const VIEWER_CONTEXT_DENSITY: f32 = 0.25;
+const VIEWER_IMAGE_SIZES: [usize; 2] = [DEFAULT_IMAGE_SIZE, 512];
+const VIEWER_CONTEXT_DENSITY: f32 = 1.0;
+
+#[derive(Clone, Copy)]
+enum ViewerBenchLane {
+    Stage {
+        name: &'static str,
+        request: FeatureFrameRequest,
+    },
+    Display {
+        name: &'static str,
+        request: FeatureFrameRequest,
+        transfer: BevyJepaDisplayTransfer,
+    },
+}
+
+const VIEWER_BENCH_LANES: [ViewerBenchLane; 5] = [
+    ViewerBenchLane::Stage {
+        name: "low_res_cache_update",
+        request: FeatureFrameRequest::none(),
+    },
+    ViewerBenchLane::Stage {
+        name: "pca_projection",
+        request: FeatureFrameRequest::low_res(),
+    },
+    ViewerBenchLane::Stage {
+        name: "full_anyup_decode",
+        request: FeatureFrameRequest::high_res_features(),
+    },
+    ViewerBenchLane::Display {
+        name: "display_upload_gpu",
+        request: FeatureFrameRequest::low_res(),
+        transfer: BevyJepaDisplayTransfer::Gpu,
+    },
+    ViewerBenchLane::Display {
+        name: "display_upload_cpu",
+        request: FeatureFrameRequest::low_res(),
+        transfer: BevyJepaDisplayTransfer::Cpu,
+    },
+];
 
 fn viewer_config(
+    image_size: usize,
     mask_source: BevyJepaMaskSource,
     display_transfer: BevyJepaDisplayTransfer,
 ) -> BevyJepaConfig {
     BevyJepaConfig {
+        encoder_source: BevyJepaEncoderSource::TinyTest,
+        ttt_model_path: None,
+        jepa_checkpoint_dir: None,
+        jepa_config_path: None,
+        source: BevyJepaFrameSource::SyntheticLocalMotion,
         mask_source,
         display_transfer,
-        image_size: VIEWER_IMAGE_SIZE,
+        image_size,
         context_density: VIEWER_CONTEXT_DENSITY,
         measure_stages: true,
         sync_measurements: false,
@@ -26,15 +72,18 @@ fn viewer_config(
 }
 
 fn prepare_pipeline(
+    image_size: usize,
     mask_source: BevyJepaMaskSource,
     display_transfer: BevyJepaDisplayTransfer,
 ) -> (JepaBevyDevice, BevyJepaHeadlessPipeline) {
     let device = JepaBevyDevice::default();
-    let mut pipeline =
-        BevyJepaHeadlessPipeline::new(viewer_config(mask_source, display_transfer), device.clone());
+    let mut pipeline = BevyJepaHeadlessPipeline::new(
+        viewer_config(image_size, mask_source, display_transfer),
+        device.clone(),
+    );
     if mask_source == BevyJepaMaskSource::PatchDiff {
         pipeline
-            .step_core_only()
+            .step_stage_only()
             .expect("seed patch-diff previous frame");
     }
     (device, pipeline)
@@ -42,67 +91,104 @@ fn prepare_pipeline(
 
 fn bench_viewer_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("bevy_jepa_viewer_pipeline_wgpu");
-    group.throughput(Throughput::Elements(
-        (VIEWER_IMAGE_SIZE * VIEWER_IMAGE_SIZE) as u64,
-    ));
 
-    for mask_source in [BevyJepaMaskSource::Autogaze, BevyJepaMaskSource::PatchDiff] {
-        group.bench_function(format!("{mask_source}_core_only"), |bench| {
-            bench.iter_batched(
-                || prepare_pipeline(mask_source, BevyJepaDisplayTransfer::Gpu),
-                |(device, mut pipeline)| {
-                    let output = pipeline.step_core_only().expect("core viewer step");
-                    JepaBevyBackend::sync(&device).expect("sync viewer backend");
-                    assert!(output.metrics.aligns_with_stage_metrics());
-                    assert_eq!(output.metrics.display_tensor_us, 0);
-                    black_box(output.metrics);
-                },
-                BatchSize::SmallInput,
-            );
-        });
-
-        group.bench_function(format!("{mask_source}_gpu_panels"), |bench| {
-            bench.iter_batched(
-                || prepare_pipeline(mask_source, BevyJepaDisplayTransfer::Gpu),
-                |(device, mut pipeline)| {
-                    let output = pipeline
-                        .step_with_display_panels()
-                        .expect("GPU display viewer step");
-                    JepaBevyBackend::sync(&device).expect("sync viewer backend");
-                    assert!(output.metrics.aligns_with_stage_metrics());
-                    assert_eq!(
-                        output.metrics.display_transfer,
-                        BevyJepaDisplayTransfer::Gpu
-                    );
-                    assert!(output.metrics.viewer_total_us >= output.metrics.total_us);
-                    black_box(output.metrics);
-                },
-                BatchSize::SmallInput,
-            );
-        });
-
-        group.bench_function(format!("{mask_source}_cpu_panels"), |bench| {
-            bench.iter_batched(
-                || prepare_pipeline(mask_source, BevyJepaDisplayTransfer::Cpu),
-                |(device, mut pipeline)| {
-                    let output = pipeline
-                        .step_with_display_panels()
-                        .expect("CPU display viewer step");
-                    JepaBevyBackend::sync(&device).expect("sync viewer backend");
-                    assert!(output.metrics.aligns_with_stage_metrics());
-                    assert_eq!(
-                        output.metrics.display_transfer,
-                        BevyJepaDisplayTransfer::Cpu
-                    );
-                    assert!(output.metrics.viewer_total_us >= output.metrics.total_us);
-                    black_box(output.metrics);
-                },
-                BatchSize::SmallInput,
-            );
-        });
+    for image_size in VIEWER_IMAGE_SIZES {
+        group.throughput(Throughput::Elements((image_size * image_size) as u64));
+        for mask_source in [BevyJepaMaskSource::PatchDiff] {
+            for lane in VIEWER_BENCH_LANES {
+                match lane {
+                    ViewerBenchLane::Stage { name, request } => {
+                        group.bench_function(
+                            format!("{mask_source}_{image_size}_{name}"),
+                            |bench| {
+                                bench.iter_batched(
+                                    || {
+                                        prepare_pipeline(
+                                            image_size,
+                                            mask_source,
+                                            BevyJepaDisplayTransfer::Gpu,
+                                        )
+                                    },
+                                    |(device, mut pipeline)| {
+                                        let output = pipeline
+                                            .step_with_stage_request(request)
+                                            .expect("viewer stage step");
+                                        JepaBevyBackend::sync(&device)
+                                            .expect("sync viewer backend");
+                                        assert!(output.metrics.aligns_with_stage_metrics());
+                                        assert_eq!(output.metrics.display_tensor_us, 0);
+                                        match name {
+                                            "low_res_cache_update" => {
+                                                assert_eq!(output.metrics.low_res_pca_us, 0);
+                                                assert_eq!(output.metrics.anyup_decode_us, 0);
+                                                assert_eq!(output.metrics.high_res_pca_us, 0);
+                                            }
+                                            "pca_projection" => {
+                                                assert_eq!(output.metrics.anyup_decode_us, 0);
+                                                assert_eq!(output.metrics.high_res_pca_us, 0);
+                                            }
+                                            "full_anyup_decode" => {
+                                                assert!(
+                                                    output
+                                                        .metrics
+                                                        .stage_metrics
+                                                        .has_high_res_work()
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                        black_box(output.metrics);
+                                    },
+                                    BatchSize::SmallInput,
+                                );
+                            },
+                        );
+                    }
+                    ViewerBenchLane::Display {
+                        name,
+                        request,
+                        transfer,
+                    } => {
+                        group.bench_function(
+                            format!("{mask_source}_{image_size}_{name}"),
+                            |bench| {
+                                bench.iter_batched(
+                                    || prepare_pipeline(image_size, mask_source, transfer),
+                                    |(device, mut pipeline)| {
+                                        let output = pipeline
+                                            .step_with_display_request(request)
+                                            .expect("display viewer step");
+                                        JepaBevyBackend::sync(&device)
+                                            .expect("sync viewer backend");
+                                        assert!(output.metrics.aligns_with_stage_metrics());
+                                        assert_eq!(output.metrics.display_transfer, transfer);
+                                        assert!(
+                                            output.metrics.viewer_total_us
+                                                >= output.metrics.total_us
+                                        );
+                                        black_box(output.metrics);
+                                    },
+                                    BatchSize::SmallInput,
+                                );
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     group.finish();
+}
+
+trait ViewerStageMetricsExt {
+    fn has_high_res_work(&self) -> bool;
+}
+
+impl ViewerStageMetricsExt for burn_jepa::FeatureFrameMetrics {
+    fn has_high_res_work(&self) -> bool {
+        self.anyup_decode_us > 0 || self.anyup_context_us > 0 || self.pca_project_us > 0
+    }
 }
 
 criterion_group!(benches, bench_viewer_pipeline);

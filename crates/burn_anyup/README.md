@@ -2,8 +2,8 @@
 
 Burn-native implementation of AnyUp universal feature upsampling.
 
-This crate ports the efficient local-window attention formulation used by the
-newer AnyUp path. It keeps the public input contract from upstream AnyUp:
+This crate ports AnyUp feature upsampling and keeps the public input contract
+from upstream AnyUp:
 
 - high-resolution normalized image tensor `[B, 3, H, W]`
 - low-resolution feature tensor `[B, C, h, w]`
@@ -26,13 +26,25 @@ assert_eq!(upsampled.shape().dims::<4>(), [1, 384, 224, 224]);
 # Ok::<(), anyhow::Error>(())
 ```
 
-`q_chunk_size` trades latency for memory by splitting high-resolution query rows
-while preserving the same local attention result.
+`q_chunk_size` trades latency for memory while preserving the same attention
+result. In `efficient_local` mode it follows upstream NATTEN's low-resolution
+row chunk convention; in `upstream_masked` mode it follows upstream
+`CrossAttentionBlock`'s query-token chunk convention.
 
-The cross-attention implementation follows upstream's `use_natten=True`
-conversion path: q/k are projected with 1x1 convolutions, k/v are nearest
-resized to the query resolution, and attention is computed over a local dilated
-2D window. It does not require the NATTEN package or custom CUDA kernels.
+## Attention Modes
+
+`AnyUpConfig::default()` uses `AnyUpAttentionMode::EfficientLocal`, the portable
+Burn equivalent of upstream's `use_natten=True` conversion path: q/k are
+projected with 1x1 convolutions, k/v are nearest-resized to the query
+resolution, and attention is computed over a local dilated 2D window. It does
+not require the NATTEN package or custom CUDA kernels.
+
+Use `AnyUpConfig::upstream_masked()` or
+`AnyUpConfig::default().with_attention_mode(AnyUpAttentionMode::UpstreamMasked)`
+when exact parity with upstream Python's default `use_natten=False` path is
+required. That path implements the original masked multi-head attention over
+low-resolution feature tokens and is intended for correctness checks and
+reference-quality runs rather than the real-time viewer path.
 
 For repeated feature upsampling against the same image, prepare an exact image
 context once and reuse it:
@@ -147,10 +159,11 @@ state dicts:
 
 ```rust,no_run
 use burn::backend::NdArray;
-use burn_anyup::{AnyUp, AnyUpConfig, AnyUpLoadOptions};
+use burn_anyup::{AnyUp, AnyUpAttentionMode, AnyUpConfig, AnyUpLoadOptions};
 
 let device = Default::default();
-let mut model = AnyUp::<NdArray<f32>>::new(AnyUpConfig::default(), &device)?;
+let config = AnyUpConfig::default().with_attention_mode(AnyUpAttentionMode::UpstreamMasked);
+let mut model = AnyUp::<NdArray<f32>>::new(config, &device)?;
 let report = AnyUpLoadOptions::default().load_into(&mut model, "anyup_paper.pth", &device)?;
 println!("loaded {} tensors", report.applied.len());
 # Ok::<(), anyhow::Error>(())
@@ -158,18 +171,20 @@ println!("loaded {} tensors", report.applied.len());
 
 Raw upstream paper checkpoints store q/k projection weights in
 `cross_decode.cross_attn.attention.in_proj_*`. The loader splits those fused
-PyTorch tensors into the efficient attention block's `q_proj` and `k_proj`
-parameters, matching upstream's `use_natten=True` conversion behavior.
+PyTorch tensors into the Burn `q_proj` and `k_proj` parameters. With
+`UpstreamMasked`, this matches upstream Python's default paper path; with
+`EfficientLocal`, it matches upstream's `use_natten=True` conversion behavior.
 
 ## Validation
 
 The test fixture `tests/fixtures/anyup_tiny_parity.py` builds a deterministic
 PyTorch AnyUp-compatible model, writes efficient and fused upstream-style
-checkpoints, and compares Burn forward output numerically against PyTorch.
+checkpoints, and compares Burn forward output numerically against both PyTorch
+attention modes.
 An ignored real-checkpoint parity test downloads or reads the published
-`anyup_multi_backbone.pth` checkpoint, converts its fused paper attention weights
-to the efficient q/k projection layout, and checks Burn output against the same
-portable PyTorch reference path.
+`anyup_multi_backbone.pth` checkpoint, splits its fused paper attention weights,
+and checks Burn output against both the upstream-masked reference path and the
+efficient-local conversion path.
 
 Run:
 
@@ -177,7 +192,7 @@ Run:
 cargo test -p burn_anyup --no-default-features --features ndarray
 cargo bench -p burn_anyup --bench anyup_forward --no-default-features --features ndarray
 BURN_ANYUP_DOWNLOAD_REAL=1 cargo test -p burn_anyup --no-default-features --features ndarray \
-  real_multi_backbone_checkpoint_matches_torch_efficient_reference -- --ignored --nocapture
+  real_multi_backbone_checkpoint_matches_torch -- --ignored --nocapture
 BURN_ANYUP_BENCH_LARGE=1 cargo bench -p burn_anyup --bench anyup_forward \
   --no-default-features --features webgpu -- anyup_forward_webgpu/jepa384
 BURN_ANYUP_BENCH_LARGE=1 BURN_ANYUP_BENCH_LOW_PRECISION=1 cargo bench -p burn_anyup \

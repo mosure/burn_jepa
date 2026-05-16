@@ -45,32 +45,39 @@ impl Default for JepaPanelTextures {
 #[derive(Component)]
 pub(crate) struct OneShotGpuUpload;
 
-pub(crate) enum PanelImageData {
-    TensorPanels(Box<JepaTensorPanels>),
-    HostPanels(Box<JepaHostPanels>),
+pub(crate) enum InputPanelData {
+    Tensor {
+        width: u32,
+        height: u32,
+        input_rgba: Tensor<JepaBevyBackend, 3>,
+    },
+    Host {
+        width: u32,
+        height: u32,
+        input_rgba: Vec<u8>,
+    },
 }
 
-pub(crate) struct JepaTensorPanels {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) input_rgba: Tensor<JepaBevyBackend, 3>,
-    pub(crate) mask_rgba: Tensor<JepaBevyBackend, 3>,
-    pub(crate) low_res_rgba: Tensor<JepaBevyBackend, 3>,
-    pub(crate) high_res_rgba: Tensor<JepaBevyBackend, 3>,
+pub(crate) enum StagePanelData {
+    Tensor {
+        width: u32,
+        height: u32,
+        mask_rgba: Tensor<JepaBevyBackend, 3>,
+        low_res_rgba: Tensor<JepaBevyBackend, 3>,
+        high_res_rgba: Option<Tensor<JepaBevyBackend, 3>>,
+    },
+    Host {
+        width: u32,
+        height: u32,
+        mask_rgba: Vec<u8>,
+        low_res_rgba: Vec<u8>,
+        high_res_rgba: Option<Vec<u8>>,
+    },
 }
 
-pub(crate) struct JepaHostPanels {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) input_rgba: Vec<u8>,
-    pub(crate) mask_rgba: Vec<u8>,
-    pub(crate) low_res_rgba: Vec<u8>,
-    pub(crate) high_res_rgba: Vec<u8>,
-}
-
-pub(crate) fn apply_panels_to_world(
+pub(crate) fn apply_input_panel_to_world(
     world: &mut World,
-    image_data: PanelImageData,
+    image_data: InputPanelData,
     transfer: BevyJepaDisplayTransfer,
 ) {
     let Some(texture) = world.get_resource::<JepaPanelTextures>().cloned() else {
@@ -78,25 +85,17 @@ pub(crate) fn apply_panels_to_world(
     };
     let mut panel_size = (texture.width, texture.height);
     match (image_data, transfer) {
-        (PanelImageData::TensorPanels(panels), BevyJepaDisplayTransfer::Gpu) => {
-            let JepaTensorPanels {
+        (
+            InputPanelData::Tensor {
                 width,
                 height,
                 input_rgba,
-                mask_rgba,
-                low_res_rgba,
-                high_res_rgba,
-            } = *panels;
+            },
+            BevyJepaDisplayTransfer::Gpu,
+        ) => {
             panel_size = (width, height);
             if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
-                for handle in [
-                    &texture.input_image,
-                    &texture.mask_image,
-                    &texture.low_res_image,
-                    &texture.high_res_image,
-                ] {
-                    set_gpu_visualization_image(handle, width, height, &mut images);
-                }
+                set_gpu_visualization_image(&texture.input_image, width, height, &mut images);
             }
             set_gpu_panel_upload_handle(
                 world,
@@ -104,6 +103,69 @@ pub(crate) fn apply_panels_to_world(
                 texture.input_image.clone(),
                 input_rgba,
             );
+        }
+        (
+            InputPanelData::Host {
+                width,
+                height,
+                input_rgba,
+            },
+            _,
+        ) => {
+            panel_size = (width, height);
+            remove_gpu_handle(world, texture.input_entity);
+            if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
+                set_host_visualization_image(
+                    &texture.input_image,
+                    width,
+                    height,
+                    input_rgba,
+                    &mut images,
+                );
+            }
+        }
+        (InputPanelData::Tensor { .. }, BevyJepaDisplayTransfer::Cpu) => {}
+    }
+    if let Some(mut texture) = world.get_resource_mut::<JepaPanelTextures>() {
+        texture.width = panel_size.0.max(1);
+        texture.height = panel_size.1.max(1);
+    }
+}
+
+pub(crate) fn apply_stage_panels_to_world(
+    world: &mut World,
+    image_data: StagePanelData,
+    transfer: BevyJepaDisplayTransfer,
+) {
+    let Some(texture) = world.get_resource::<JepaPanelTextures>().cloned() else {
+        return;
+    };
+    let mut panel_size = (texture.width, texture.height);
+    match (image_data, transfer) {
+        (
+            StagePanelData::Tensor {
+                width,
+                height,
+                mask_rgba,
+                low_res_rgba,
+                high_res_rgba,
+            },
+            BevyJepaDisplayTransfer::Gpu,
+        ) => {
+            panel_size = (width, height);
+            if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
+                for handle in [&texture.mask_image, &texture.low_res_image] {
+                    set_gpu_visualization_image(handle, width, height, &mut images);
+                }
+                if high_res_rgba.is_some() {
+                    set_gpu_visualization_image(
+                        &texture.high_res_image,
+                        width,
+                        height,
+                        &mut images,
+                    );
+                }
+            }
             set_gpu_panel_upload_handle(
                 world,
                 texture.mask_entity,
@@ -116,48 +178,54 @@ pub(crate) fn apply_panels_to_world(
                 texture.low_res_image.clone(),
                 low_res_rgba,
             );
-            set_gpu_panel_upload_handle(
-                world,
-                texture.high_res_entity,
-                texture.high_res_image.clone(),
-                high_res_rgba,
-            );
+            if let Some(high_res_rgba) = high_res_rgba {
+                set_gpu_panel_upload_handle(
+                    world,
+                    texture.high_res_entity,
+                    texture.high_res_image.clone(),
+                    high_res_rgba,
+                );
+            }
         }
-        (PanelImageData::HostPanels(panels), _) => {
-            panel_size = (panels.width, panels.height);
+        (
+            StagePanelData::Host {
+                width,
+                height,
+                mask_rgba,
+                low_res_rgba,
+                high_res_rgba,
+            },
+            _,
+        ) => {
+            panel_size = (width, height);
             remove_panel_gpu_handles(world, &texture);
             if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
                 set_host_visualization_image(
-                    &texture.input_image,
-                    panels.width,
-                    panels.height,
-                    panels.input_rgba,
-                    &mut images,
-                );
-                set_host_visualization_image(
                     &texture.mask_image,
-                    panels.width,
-                    panels.height,
-                    panels.mask_rgba,
+                    width,
+                    height,
+                    mask_rgba,
                     &mut images,
                 );
                 set_host_visualization_image(
                     &texture.low_res_image,
-                    panels.width,
-                    panels.height,
-                    panels.low_res_rgba,
+                    width,
+                    height,
+                    low_res_rgba,
                     &mut images,
                 );
-                set_host_visualization_image(
-                    &texture.high_res_image,
-                    panels.width,
-                    panels.height,
-                    panels.high_res_rgba,
-                    &mut images,
-                );
+                if let Some(high_res_rgba) = high_res_rgba {
+                    set_host_visualization_image(
+                        &texture.high_res_image,
+                        width,
+                        height,
+                        high_res_rgba,
+                        &mut images,
+                    );
+                }
             }
         }
-        (PanelImageData::TensorPanels(_), BevyJepaDisplayTransfer::Cpu) => {}
+        (StagePanelData::Tensor { .. }, BevyJepaDisplayTransfer::Cpu) => {}
     }
     if let Some(mut texture) = world.get_resource_mut::<JepaPanelTextures>() {
         texture.width = panel_size.0.max(1);
@@ -217,9 +285,15 @@ fn remove_panel_gpu_handles(world: &mut World, texture: &JepaPanelTextures) {
     .into_iter()
     .flatten()
     {
-        if let Ok(mut entity) = world.get_entity_mut(entity) {
-            entity.remove::<BevyBurnHandle<JepaBevyBackend>>();
-        }
+        remove_gpu_handle(world, Some(entity));
+    }
+}
+
+fn remove_gpu_handle(world: &mut World, entity: Option<Entity>) {
+    if let Some(entity) = entity
+        && let Ok(mut entity) = world.get_entity_mut(entity)
+    {
+        entity.remove::<BevyBurnHandle<JepaBevyBackend>>();
     }
 }
 

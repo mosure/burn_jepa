@@ -3,8 +3,8 @@ use crate::SparsePatchifyBatchPlan;
 use crate::{
     FeaturePcaConfig, FeaturePcaProjector, FeaturePcaUpdateConfig, FeaturePcaUpdateScheduler,
     InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig,
-    InterframeJepaFeatureMemoryOutput, SparseMaskBatch, SparseTokenMask, TokenGridShape,
-    VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, jepa_feature_tokens_to_nchw,
+    InterframeJepaFeatureMemoryOutput, SparseMaskBatch, SparseTokenMask, TokenGridShape, TttState,
+    VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaTttModel, jepa_feature_tokens_to_nchw,
 };
 use anyhow::{Result, bail, ensure};
 use burn::tensor::Tensor;
@@ -12,6 +12,7 @@ use burn::tensor::backend::Backend;
 use burn_anyup::{AnyUp, AnyUpImageGrid};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -52,6 +53,21 @@ pub enum SparseJepaAnyUpPcaEncodePath {
     SparsePatchify,
 }
 
+impl SparseJepaAnyUpPcaEncodePath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DensePatchEmbed => "dense-patch",
+            Self::SparsePatchify => "sparse-patchify",
+        }
+    }
+}
+
+impl fmt::Display for SparseJepaAnyUpPcaEncodePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureFrameNode {
@@ -89,6 +105,14 @@ impl FeatureFrameRequest {
             low_res_pca: false,
             high_res_pca: true,
             high_res_features: false,
+        }
+    }
+
+    pub const fn high_res_features() -> Self {
+        Self {
+            low_res_pca: false,
+            high_res_pca: false,
+            high_res_features: true,
         }
     }
 
@@ -134,8 +158,8 @@ pub struct FeatureFrameSchedule {
 impl Default for FeatureFrameSchedule {
     fn default() -> Self {
         Self {
-            low_res_pca_every: None,
-            high_res_pca_every: Some(1),
+            low_res_pca_every: Some(1),
+            high_res_pca_every: Some(8),
         }
     }
 }
@@ -191,6 +215,8 @@ pub struct SparseJepaAnyUpPcaStageMetrics {
     pub pca_update_us: u64,
     pub pca_online_us: u64,
     pub pca_project_us: u64,
+    pub pca_sample_window_frames: usize,
+    pub pca_sample_frames: usize,
     pub pca_update_applied: bool,
     pub pca_update_tokens: usize,
     pub total_us: u64,
@@ -336,13 +362,139 @@ pub struct SparseJepaAnyUpPcaMeasuredBatchOutput<B: Backend> {
     pub metrics: SparseJepaAnyUpPcaStageMetrics,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureFrameJepaEncoderKind {
+    #[default]
+    Base,
+    Ttt,
+}
+
+pub enum FeatureFrameJepaEncoder<B: Backend> {
+    Base(VJepa2_1Model<B>),
+    Ttt {
+        model: Box<VJepaTttModel<B>>,
+        state: TttState<B>,
+    },
+}
+
+impl<B: Backend> FeatureFrameJepaEncoder<B> {
+    pub fn base(model: VJepa2_1Model<B>) -> Self {
+        Self::Base(model)
+    }
+
+    pub fn ttt(model: VJepaTttModel<B>) -> Self {
+        let state = model.fresh_state();
+        Self::Ttt {
+            model: Box::new(model),
+            state,
+        }
+    }
+
+    pub fn kind(&self) -> FeatureFrameJepaEncoderKind {
+        match self {
+            Self::Base(_) => FeatureFrameJepaEncoderKind::Base,
+            Self::Ttt { .. } => FeatureFrameJepaEncoderKind::Ttt,
+        }
+    }
+
+    pub fn config(&self) -> &VJepaConfig {
+        match self {
+            Self::Base(model) => model.config(),
+            Self::Ttt { model, .. } => model.config(),
+        }
+    }
+
+    pub fn base_model(&self) -> Option<&VJepa2_1Model<B>> {
+        match self {
+            Self::Base(model) => Some(model),
+            Self::Ttt { .. } => None,
+        }
+    }
+
+    pub fn reset_state(&mut self) {
+        if let Self::Ttt { model, state } = self {
+            *state = model.fresh_state();
+        }
+    }
+
+    pub fn encode_image_batch(
+        &mut self,
+        image: Tensor<B, 4>,
+        mask: SparseMaskBatch<B>,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        match self {
+            Self::Base(model) => model.encode_image_batch(image, mask),
+            Self::Ttt { model, state } => {
+                model.encode_image_batch_with_state(image, mask, None, state)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl FeatureFrameJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
+    fn encode_image_sparse_patchify_wgpu_batch(
+        &mut self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        patchify_plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        match self {
+            Self::Base(model) => {
+                model.encode_image_sparse_patchify_wgpu_batch(image, patchify_plan)
+            }
+            Self::Ttt { model, state } => {
+                let Some(mask) = patchify_plan.mask.uniform_mask() else {
+                    bail!(
+                        "TTT sparse patchify currently requires a uniform sparse mask batch; group variable masks or use dense patch embed"
+                    );
+                };
+                let [batch, channels, height, width] = image.shape().dims::<4>();
+                ensure!(
+                    batch == patchify_plan.batch,
+                    "image batch does not match sparse patchify batch plan"
+                );
+                model.forward_single_frame_rollout_sparse_patchify_wgpu(
+                    image.reshape([batch, channels, 1, height, width]),
+                    mask,
+                    None,
+                    state,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl FeatureFrameJepaEncoder<burn::backend::Wgpu<f32, i32>> {
+    fn encode_image_sparse_patchify_wgpu_fusion_batch(
+        &mut self,
+        image: Tensor<burn::backend::Wgpu<f32, i32>, 4>,
+        patchify_plan: &SparsePatchifyBatchPlan<burn::backend::Wgpu<f32, i32>>,
+    ) -> Result<VJepaEncoderOutput<burn::backend::Wgpu<f32, i32>>> {
+        match self {
+            Self::Base(model) => {
+                model.encode_image_sparse_patchify_wgpu_fusion_batch(image, patchify_plan)
+            }
+            Self::Ttt { model, state } => model
+                .forward_image_sparse_patchify_wgpu_fusion_batch_state(
+                    image,
+                    patchify_plan,
+                    None,
+                    state,
+                ),
+        }
+    }
+}
+
 pub struct SparseJepaAnyUpPcaPipeline<B: Backend> {
-    jepa: VJepa2_1Model<B>,
+    encoder: FeatureFrameJepaEncoder<B>,
     anyup: AnyUp<B>,
     anyup_image_grid: AnyUpImageGrid<B>,
     token_memory: InterframeJepaFeatureMemory<B>,
     pca: FeaturePcaProjector<B>,
     pca_update_scheduler: FeaturePcaUpdateScheduler,
+    pca_samples: FeaturePcaSampleBuffer<B>,
     config: SparseJepaAnyUpPcaPipelineConfig,
     batch: usize,
     image_size: [usize; 2],
@@ -360,8 +512,33 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         image_size: [usize; 2],
         device: &B::Device,
     ) -> Result<Self> {
+        Self::new_with_encoder(
+            FeatureFrameJepaEncoder::base(jepa),
+            anyup,
+            jepa_config,
+            config,
+            batch,
+            image_size,
+            device,
+        )
+    }
+
+    pub fn new_with_encoder(
+        encoder: FeatureFrameJepaEncoder<B>,
+        anyup: AnyUp<B>,
+        jepa_config: &VJepaConfig,
+        config: SparseJepaAnyUpPcaPipelineConfig,
+        batch: usize,
+        image_size: [usize; 2],
+        device: &B::Device,
+    ) -> Result<Self> {
         config.validate()?;
         ensure!(batch > 0, "pipeline batch must be nonzero");
+        ensure!(
+            encoder.config().encoder.embed_dim == jepa_config.encoder.embed_dim
+                && encoder.config().patch_size == jepa_config.patch_size,
+            "feature-frame encoder config must match the pipeline V-JEPA config"
+        );
         ensure!(
             image_size[0] > 0 && image_size[1] > 0,
             "pipeline image size must be nonzero"
@@ -388,15 +565,18 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
             config.pca.clone(),
             device,
         )?;
-        let pca_update_scheduler = FeaturePcaUpdateScheduler::new(config.effective_pca_update())?;
+        let effective_pca_update = config.effective_pca_update();
+        let pca_update_scheduler = FeaturePcaUpdateScheduler::new(effective_pca_update.clone())?;
+        let pca_samples = FeaturePcaSampleBuffer::new(effective_pca_update.sample_window_frames)?;
         let anyup_image_grid = anyup.prepare_image_grid(image_size, device);
         Ok(Self {
-            jepa,
+            encoder,
             anyup,
             anyup_image_grid,
             token_memory,
             pca,
             pca_update_scheduler,
+            pca_samples,
             config,
             batch,
             image_size,
@@ -409,8 +589,16 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         &self.config
     }
 
-    pub fn jepa(&self) -> &VJepa2_1Model<B> {
-        &self.jepa
+    pub fn encoder(&self) -> &FeatureFrameJepaEncoder<B> {
+        &self.encoder
+    }
+
+    pub fn encoder_kind(&self) -> FeatureFrameJepaEncoderKind {
+        self.encoder.kind()
+    }
+
+    pub fn jepa(&self) -> Option<&VJepa2_1Model<B>> {
+        self.encoder.base_model()
     }
 
     pub fn anyup(&self) -> &AnyUp<B> {
@@ -454,8 +642,10 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
     }
 
     pub fn reset(&mut self) {
+        self.encoder.reset_state();
         self.token_memory.reset();
         self.pca_update_scheduler.reset();
+        self.pca_samples.reset();
     }
 
     pub fn step_image_keep_ratio(
@@ -597,17 +787,31 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         let pca_update = self
             .pca_update_scheduler
             .observe_batch(metrics.frame_count, self.grid.len());
-        if pca_update.update {
-            let iterations = self.pca_update_scheduler.config().iterations_per_update;
-            self.pca.update_rolling_masked_tokens_iterations(
+        if self.pca_update_scheduler.config().enabled() {
+            self.pca_samples.push(
                 token_cache.features.clone(),
                 token_cache.observed.clone(),
+                metrics.frame_count,
+            )?;
+            metrics.pca_sample_window_frames =
+                self.pca_update_scheduler.config().sample_window_frames;
+            metrics.pca_sample_frames = self.pca_samples.frame_count();
+        }
+        if pca_update.update {
+            let iterations = self.pca_update_scheduler.config().iterations_per_update;
+            let Some(pca_samples) = self.pca_samples.snapshot() else {
+                bail!("PCA update requested before any samples were buffered");
+            };
+            self.pca.update_rolling_masked_tokens_iterations(
+                pca_samples.features,
+                pca_samples.observed,
                 iterations,
             )?;
             metrics.pca_update_us = timer.mark::<B>(&self.device)?;
             metrics.pca_online_us = metrics.pca_update_us;
             metrics.pca_update_applied = true;
-            metrics.pca_update_tokens = metrics.frame_count * self.grid.len();
+            metrics.pca_sample_frames = pca_samples.frame_count;
+            metrics.pca_update_tokens = pca_samples.frame_count * self.grid.len();
         }
 
         let mut low_res_pca_components = None;
@@ -732,7 +936,9 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         );
         let mut timer = StageTimer::new(measurement);
 
-        let encoded = self.jepa.encode_image_batch(image.clone(), mask.clone())?;
+        let encoded = self
+            .encoder
+            .encode_image_batch(image.clone(), mask.clone())?;
         metrics.encode_us = timer.mark::<B>(&self.device)?;
         self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
     }
@@ -754,7 +960,9 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         );
         let mut timer = StageTimer::new(measurement);
 
-        let encoded = self.jepa.encode_image_batch(image.clone(), mask.clone())?;
+        let encoded = self
+            .encoder
+            .encode_image_batch(image.clone(), mask.clone())?;
         metrics.encode_us = timer.mark::<B>(&self.device)?;
         self.finish_encoded_batch_step(image, mask, encoded, timer, metrics)
     }
@@ -864,9 +1072,41 @@ impl SparseJepaAnyUpPcaPipeline<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         );
         let mut timer = StageTimer::new(measurement);
         let encoded = self
-            .jepa
+            .encoder
             .encode_image_sparse_patchify_wgpu_batch(image.clone(), patchify_plan)?;
         metrics.encode_us = timer.mark::<burn_flex_gmm::wgpu::DefaultWgpuBackend>(&self.device)?;
+        self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl SparseJepaAnyUpPcaPipeline<burn::backend::Wgpu<f32, i32>> {
+    pub fn step_image_with_sparse_patchify_plan_wgpu_nodes_measured(
+        &mut self,
+        image: Tensor<burn::backend::Wgpu<f32, i32>, 4>,
+        patchify_plan: &SparsePatchifyBatchPlan<burn::backend::Wgpu<f32, i32>>,
+        request: FeatureFrameRequest,
+        measurement: SparseJepaAnyUpPcaMeasurementConfig,
+    ) -> Result<MeasuredFeatureFrameBatch<burn::backend::Wgpu<f32, i32>>> {
+        ensure!(
+            patchify_plan.grid == self.grid && patchify_plan.batch == self.batch,
+            "sparse patchify plan must match the high-res pipeline grid and batch"
+        );
+        let mask = patchify_plan.mask.clone();
+        let [batch, _channels, height, width] = self.validate_batch_step_input(&image, &mask)?;
+        let mut metrics = self.initial_stage_metrics(
+            batch,
+            height,
+            width,
+            &mask,
+            measurement,
+            SparseJepaAnyUpPcaEncodePath::SparsePatchify,
+        );
+        let mut timer = StageTimer::new(measurement);
+        let encoded = self
+            .encoder
+            .encode_image_sparse_patchify_wgpu_fusion_batch(image.clone(), patchify_plan)?;
+        metrics.encode_us = timer.mark::<burn::backend::Wgpu<f32, i32>>(&self.device)?;
         self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
     }
 }
@@ -975,10 +1215,131 @@ impl SparseJepaAnyUpPcaPipeline<burn_flex_gmm::cuda::DefaultCudaBackend> {
         );
         let mut timer = StageTimer::new(measurement);
         let encoded = self
-            .jepa
+            .encoder
+            .base_model()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sparse-patchify CUDA high-res path currently requires the base V-JEPA encoder; use the dense-patch TTT path for trained TTT inference"
+                )
+            })?
             .encode_image_sparse_patchify_cuda_batch(image.clone(), patchify_plan)?;
         metrics.encode_us = timer.mark::<burn_flex_gmm::cuda::DefaultCudaBackend>(&self.device)?;
         self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
+    }
+}
+
+struct FeaturePcaSamples<B: Backend> {
+    features: Tensor<B, 3>,
+    observed: Tensor<B, 2>,
+    frame_count: usize,
+}
+
+struct FeaturePcaSampleEntry<B: Backend> {
+    features: Tensor<B, 3>,
+    observed: Tensor<B, 2>,
+    frame_count: usize,
+}
+
+struct FeaturePcaSampleBuffer<B: Backend> {
+    window_frames: usize,
+    frame_count: usize,
+    entries: VecDeque<FeaturePcaSampleEntry<B>>,
+}
+
+impl<B: Backend> FeaturePcaSampleBuffer<B> {
+    fn new(window_frames: usize) -> Result<Self> {
+        ensure!(window_frames > 0, "PCA sample window must be nonzero");
+        Ok(Self {
+            window_frames,
+            frame_count: 0,
+            entries: VecDeque::new(),
+        })
+    }
+
+    fn reset(&mut self) {
+        self.frame_count = 0;
+        self.entries.clear();
+    }
+
+    fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    fn push(
+        &mut self,
+        features: Tensor<B, 3>,
+        observed: Tensor<B, 2>,
+        frame_count: usize,
+    ) -> Result<()> {
+        let [feature_batch, _, _] = features.shape().dims::<3>();
+        let [observed_batch, _] = observed.shape().dims::<2>();
+        ensure!(
+            frame_count > 0 && feature_batch == frame_count && observed_batch == frame_count,
+            "PCA sample batch must match frame count"
+        );
+        self.entries.push_back(FeaturePcaSampleEntry {
+            features,
+            observed,
+            frame_count,
+        });
+        self.frame_count = self.frame_count.saturating_add(frame_count);
+        self.trim();
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Option<FeaturePcaSamples<B>> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(FeaturePcaSamples {
+            features: Tensor::cat(
+                self.entries
+                    .iter()
+                    .map(|entry| entry.features.clone())
+                    .collect::<Vec<_>>(),
+                0,
+            ),
+            observed: Tensor::cat(
+                self.entries
+                    .iter()
+                    .map(|entry| entry.observed.clone())
+                    .collect::<Vec<_>>(),
+                0,
+            ),
+            frame_count: self.frame_count,
+        })
+    }
+
+    fn trim(&mut self) {
+        while self.frame_count > self.window_frames {
+            let excess = self.frame_count - self.window_frames;
+            let Some(front_count) = self.entries.front().map(|entry| entry.frame_count) else {
+                self.frame_count = 0;
+                return;
+            };
+            if front_count <= excess {
+                self.frame_count -= front_count;
+                self.entries.pop_front();
+                continue;
+            }
+
+            let front = self
+                .entries
+                .front_mut()
+                .expect("front entry exists after previous check");
+            let [_, tokens, dim] = front.features.shape().dims::<3>();
+            front.features =
+                front
+                    .features
+                    .clone()
+                    .slice([excess..front.frame_count, 0..tokens, 0..dim]);
+            front.observed = front
+                .observed
+                .clone()
+                .slice([excess..front.frame_count, 0..tokens]);
+            front.frame_count -= excess;
+            self.frame_count -= excess;
+        }
     }
 }
 

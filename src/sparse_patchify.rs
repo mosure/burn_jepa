@@ -10,6 +10,12 @@ type FusionCudaBackend = burn::backend::Cuda<f32, i32>;
 #[cfg(feature = "sparse-patchify-cuda")]
 type RawCudaBackend = burn_flex_gmm::cuda::DefaultCudaBackend;
 
+#[cfg(feature = "sparse-patchify-wgpu")]
+type FusionWgpuBackend = burn::backend::Wgpu<f32, i32>;
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+type RawWgpuBackend = burn_flex_gmm::wgpu::DefaultWgpuBackend;
+
 #[derive(Clone, Debug)]
 pub struct SparsePatchifyPlan<B: Backend> {
     pub mask: SparseTokenMask,
@@ -26,6 +32,101 @@ pub struct SparsePatchifyBatchPlan<B: Backend> {
     pub batch: usize,
     pub coords: Tensor<B, 2, Int>,
     pub coords_host: Vec<[u32; 4]>,
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+pub fn sparse_patchify3d_forward_wgpu_fusion(
+    config: &burn_flex_gmm::SparsePatchify3dConfig,
+    input: Tensor<FusionWgpuBackend, 5>,
+    coords: Tensor<FusionWgpuBackend, 2, Int>,
+    weight: Tensor<FusionWgpuBackend, 5>,
+    bias: Tensor<FusionWgpuBackend, 1>,
+) -> Tensor<FusionWgpuBackend, 2> {
+    use burn::tensor::Tensor as BurnTensor;
+    use burn_backend::{DType, Shape, TensorPrimitive};
+    use burn_fusion::stream::{Operation, OperationStreams};
+    use burn_ir::{CustomOpIr, OperationIr, OperationOutput, TensorIr, TensorStatus};
+
+    #[derive(Debug)]
+    struct SparsePatchifyWgpuFusionOp {
+        config: burn_flex_gmm::SparsePatchify3dConfig,
+        desc: CustomOpIr,
+    }
+
+    impl Operation<<RawWgpuBackend as burn_fusion::FusionBackend>::FusionRuntime>
+        for SparsePatchifyWgpuFusionOp
+    {
+        fn execute(
+            &self,
+            handles: &mut burn_ir::HandleContainer<
+                burn_fusion::FusionHandle<
+                    <RawWgpuBackend as burn_fusion::FusionBackend>::FusionRuntime,
+                >,
+            >,
+        ) {
+            let (inputs, outputs) = self.desc.as_fixed::<4, 1>();
+            let input = BurnTensor::<RawWgpuBackend, 5>::from_primitive(TensorPrimitive::Float(
+                handles.get_float_tensor::<RawWgpuBackend>(&inputs[0]),
+            ));
+            let coords = BurnTensor::<RawWgpuBackend, 2, Int>::from_primitive(
+                handles.get_int_tensor::<RawWgpuBackend>(&inputs[1]),
+            );
+            let weight = BurnTensor::<RawWgpuBackend, 5>::from_primitive(TensorPrimitive::Float(
+                handles.get_float_tensor::<RawWgpuBackend>(&inputs[2]),
+            ));
+            let bias = BurnTensor::<RawWgpuBackend, 1>::from_primitive(TensorPrimitive::Float(
+                handles.get_float_tensor::<RawWgpuBackend>(&inputs[3]),
+            ));
+            let output = burn_flex_gmm::wgpu::sparse_patchify3d_forward_wgpu(
+                &self.config,
+                input,
+                coords,
+                weight,
+                bias,
+            )
+            .expect("sparse patchify WGPU fusion op failed");
+            handles.register_float_tensor::<RawWgpuBackend>(
+                &outputs[0].id,
+                output.into_primitive().tensor(),
+            );
+        }
+    }
+
+    let rows = coords.shape().dims::<2>()[0];
+    let input = input.into_primitive().tensor();
+    let coords = coords.into_primitive();
+    let weight = weight.into_primitive().tensor();
+    let bias = bias.into_primitive().tensor();
+    let client = input.client.clone();
+    let streams = OperationStreams::with_inputs([&input, &coords, &weight, &bias]);
+    let inputs = [
+        input.into_ir(),
+        coords.into_ir(),
+        weight.into_ir(),
+        bias.into_ir(),
+    ];
+    let output = TensorIr {
+        status: TensorStatus::NotInit,
+        shape: Shape::new([rows, config.out_channels]),
+        id: client.create_empty_handle(),
+        dtype: DType::F32,
+    };
+    let desc = CustomOpIr::new(
+        "burn_jepa::sparse_patchify3d_forward_wgpu",
+        &inputs,
+        std::slice::from_ref(&output),
+    );
+    let output = client
+        .register(
+            streams,
+            OperationIr::Custom(desc.clone()),
+            SparsePatchifyWgpuFusionOp {
+                config: *config,
+                desc,
+            },
+        )
+        .output();
+    Tensor::from_primitive(TensorPrimitive::Float(output))
 }
 
 #[cfg(feature = "sparse-patchify-cuda")]

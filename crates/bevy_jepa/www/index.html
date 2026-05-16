@@ -31,26 +31,223 @@
         width: 100%;
         height: 100%;
       }
+      #webcam {
+        display: none;
+      }
     </style>
   </head>
   <body>
     <div id="bevy-root">
       <canvas id="bevy"></canvas>
     </div>
+    <video id="webcam" autoplay muted playsinline></video>
     <div id="status">loading bevy_jepa...</div>
     <script type="module">
+      import init, { frame_input } from "./out/bevy_jepa.js";
+
       const status = document.querySelector("#status");
+      const video = document.querySelector("#webcam");
+      const params = new URLSearchParams(window.location.search);
+      window.__jepaFrameStats = {
+        count: 0,
+        firstFrameMs: null,
+        lastFrameMs: null,
+        lastWidth: 0,
+        lastHeight: 0,
+      };
+
       async function boot() {
         try {
-          const module = await import("./out/bevy_jepa.js");
-          await module.default();
-          status.textContent =
-            "bevy_jepa running; press space to switch sparse mask source";
+          await init();
+          if (usesStaticSource()) {
+            await startStaticSource();
+          } else if (usesCameraSource()) {
+            await startCameraSource();
+          } else {
+            throw new Error(
+              `unsupported wasm frame source: ${params.get("source")}; expected camera or static`,
+            );
+          }
         } catch (error) {
           console.error(error);
           status.textContent = `runtime error: ${error?.message ?? error}`;
         }
       }
+
+      function usesStaticSource() {
+        const source = params.get("source")?.toLowerCase();
+        return (
+          source === "static" ||
+          source === "image" ||
+          params.has("image-url") ||
+          params.has("static-frame")
+        );
+      }
+
+      function usesCameraSource() {
+        const source = params.get("source")?.toLowerCase();
+        return (
+          source == null ||
+          source === "camera" ||
+          source === "webcam" ||
+          source === "cam" ||
+          source === "live"
+        );
+      }
+
+      async function startCameraSource() {
+        try {
+          status.textContent = "bevy_jepa requesting camera source...";
+          const width = queryNumber(["camera-width", "width"], 256, 3840, 640);
+          const height = queryNumber(["camera-height", "height"], 256, 2160, 512);
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: width },
+              height: { ideal: height },
+              frameRate: { ideal: 30, max: 30 },
+            },
+            audio: false,
+          });
+          video.srcObject = stream;
+          await video.play();
+          status.textContent = "bevy_jepa camera source running";
+
+          if ("MediaStreamTrackProcessor" in window) {
+            const [track] = stream.getVideoTracks();
+            const processor = new MediaStreamTrackProcessor(track);
+            readVideoFrames(processor.readable.getReader());
+          } else {
+            const capture = document.createElement("canvas");
+            const context = capture.getContext("2d", { willReadFrequently: true });
+            captureWithCanvas(capture, context);
+          }
+        } catch (error) {
+          console.warn(error);
+          status.textContent = `camera source unavailable: ${error?.message ?? error}`;
+        }
+      }
+
+      async function startStaticSource() {
+        const frame = await loadStaticFrame();
+        const fps = clampNumber(params.get("static-fps"), 1, 60, 15);
+        const frameInterval = 1000 / fps;
+        let lastFrame = 0;
+        status.textContent = "bevy_jepa static source running";
+
+        function pump(now) {
+          if (now - lastFrame >= frameInterval) {
+            submitFrame(frame.data, frame.width, frame.height);
+            lastFrame = now;
+          }
+          requestAnimationFrame(pump);
+        }
+
+        requestAnimationFrame(pump);
+      }
+
+      async function loadStaticFrame() {
+        const imageUrl = params.get("image-url");
+        if (imageUrl) {
+          return loadImageFrame(imageUrl);
+        }
+
+        const width = queryNumber(["static-width", "width"], 256, 3840, 512);
+        const height = queryNumber(["static-height", "height"], 256, 2160, 512);
+        return generatedFrame(width, height);
+      }
+
+      async function loadImageFrame(url) {
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.decoding = "async";
+        image.src = url;
+        await image.decode();
+
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth || image.width;
+        canvas.height = image.naturalHeight || image.height;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+        return {
+          data: new Uint8Array(pixels.data),
+          width: canvas.width,
+          height: canvas.height,
+        };
+      }
+
+      function generatedFrame(width, height) {
+        const data = new Uint8Array(width * height * 4);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const offset = (y * width + x) * 4;
+            const checker = ((x >> 5) + (y >> 5)) & 1;
+            data[offset] = Math.round((x / Math.max(1, width - 1)) * 220 + checker * 24);
+            data[offset + 1] = Math.round((y / Math.max(1, height - 1)) * 220 + 20);
+            data[offset + 2] = checker ? 230 : 92;
+            data[offset + 3] = 255;
+          }
+        }
+        return { data, width, height };
+      }
+
+      async function readVideoFrames(reader) {
+        const { value: frame, done } = await reader.read();
+        if (done) {
+          return;
+        }
+        const format = "RGBA";
+        const pixelBuffer = new Uint8Array(frame.allocationSize({ format }));
+        try {
+          await frame.copyTo(pixelBuffer, { format });
+          submitFrame(pixelBuffer, frame.displayWidth, frame.displayHeight);
+        } finally {
+          frame.close();
+        }
+        requestAnimationFrame(() => readVideoFrames(reader));
+      }
+
+      function captureWithCanvas(canvas, context) {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          }
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const image = context.getImageData(0, 0, canvas.width, canvas.height);
+          submitFrame(new Uint8Array(image.data), canvas.width, canvas.height);
+        }
+        requestAnimationFrame(() => captureWithCanvas(canvas, context));
+      }
+
+      function submitFrame(data, width, height) {
+        frame_input(data, width, height);
+        const stats = window.__jepaFrameStats;
+        const now = performance.now();
+        stats.count += 1;
+        stats.firstFrameMs ??= now;
+        stats.lastFrameMs = now;
+        stats.lastWidth = width;
+        stats.lastHeight = height;
+      }
+
+      function clampNumber(value, min, max, fallback) {
+        const number = Number.parseInt(value, 10);
+        if (!Number.isFinite(number)) {
+          return fallback;
+        }
+        return Math.min(max, Math.max(min, number));
+      }
+
+      function queryNumber(names, min, max, fallback) {
+        for (const name of names) {
+          if (params.has(name)) {
+            return clampNumber(params.get(name), min, max, fallback);
+          }
+        }
+        return fallback;
+      }
+
       boot();
     </script>
   </body>

@@ -8,7 +8,7 @@ mod sparse;
 mod tensor_ops;
 
 pub use attention::{EfficientCrossAttention, EfficientCrossAttentionBlock};
-pub use config::AnyUpConfig;
+pub use config::{AnyUpAttentionMode, AnyUpConfig};
 pub use layers::{AnyUpConvEncoder, AnyUpFeatureEncoder, AnyUpResBlock, LearnedFeatureUnification};
 pub use loading::{AnyUpLoadOptions, AnyUpLoadReport};
 pub use model::{AnyUp, AnyUpImageContext, AnyUpImageGrid};

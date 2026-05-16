@@ -100,6 +100,9 @@ pub struct SparseJepaPatchDiffSparsityConfig {
     pub context_tokens: usize,
     pub target_tokens: usize,
     pub dilation: usize,
+    pub min_context_tokens: usize,
+    pub fill_to_context_tokens: bool,
+    pub allow_full_context: bool,
 }
 
 impl SparseJepaPatchDiffSparsityConfig {
@@ -109,11 +112,46 @@ impl SparseJepaPatchDiffSparsityConfig {
             context_tokens,
             target_tokens,
             dilation: 0,
+            min_context_tokens: 1,
+            fill_to_context_tokens: true,
+            allow_full_context: false,
+        }
+    }
+
+    pub fn adaptive_threshold(
+        threshold: f32,
+        min_context_tokens: usize,
+        max_context_tokens: usize,
+        target_tokens: usize,
+    ) -> Self {
+        Self {
+            threshold,
+            context_tokens: max_context_tokens,
+            target_tokens,
+            dilation: 0,
+            min_context_tokens,
+            fill_to_context_tokens: false,
+            allow_full_context: true,
         }
     }
 
     pub fn with_dilation(mut self, dilation: usize) -> Self {
         self.dilation = dilation;
+        self
+    }
+
+    pub fn with_min_context_tokens(mut self, min_context_tokens: usize) -> Self {
+        self.min_context_tokens = min_context_tokens;
+        self
+    }
+
+    pub fn with_fill_to_context_tokens(mut self, fill_to_context_tokens: bool) -> Self {
+        self.fill_to_context_tokens = fill_to_context_tokens;
+        self
+    }
+
+    pub fn with_allow_full_context(mut self, allow_full_context: bool) -> Self {
+        self.allow_full_context = allow_full_context;
         self
     }
 }
@@ -396,9 +434,17 @@ fn patch_diff_context_mask<B: Backend>(
         expected_grid == grid,
         "patch-diff sparsity grid must match the video shape"
     );
-    let context_tokens = context_budget(grid, config.context_tokens)?;
+    let context_tokens = if config.allow_full_context {
+        config.context_tokens.max(1).min(grid.len())
+    } else {
+        context_budget(grid, config.context_tokens)?
+    };
     let scores = patch_diff_token_scores(video, model_config, grid)?;
-    if config.threshold <= 0.0 && config.dilation == 0 {
+    if config.threshold <= 0.0
+        && config.dilation == 0
+        && !config.allow_full_context
+        && config.fill_to_context_tokens
+    {
         return patch_diff_topk_context_mask(scores, grid, context_tokens);
     }
 
@@ -406,10 +452,32 @@ fn patch_diff_context_mask<B: Backend>(
         .into_data()
         .to_vec::<f32>()
         .map_err(|err| anyhow::anyhow!("failed to read patch-diff score tensor: {err}"))?;
+    patch_diff_context_mask_from_scores(score_values, grid, config)
+}
+
+pub fn patch_diff_context_mask_from_scores(
+    score_values: Vec<f32>,
+    grid: TokenGridShape,
+    config: &SparseJepaPatchDiffSparsityConfig,
+) -> Result<SparseTokenMask> {
     ensure!(
         score_values.len() == grid.len(),
-        "patch-diff sparsity received unexpected score tensor length"
+        "patch-diff sparsity received unexpected score length"
     );
+    ensure!(
+        config.threshold.is_finite() && config.threshold >= 0.0,
+        "patch-diff sparsity threshold must be finite and non-negative"
+    );
+    let context_tokens = if config.allow_full_context {
+        config.context_tokens.max(1).min(grid.len())
+    } else {
+        context_budget(grid, config.context_tokens)?
+    };
+    let min_context_tokens = config
+        .min_context_tokens
+        .max(1)
+        .min(context_tokens)
+        .min(grid.len());
     let mut scores = score_values
         .into_iter()
         .enumerate()
@@ -423,7 +491,12 @@ fn patch_diff_context_mask<B: Backend>(
     });
 
     let mut keep = vec![false; grid.len()];
-    let mut selected = Vec::with_capacity(context_tokens);
+    let threshold_context_tokens = if config.allow_full_context {
+        grid.len()
+    } else {
+        context_tokens
+    };
+    let mut selected = Vec::with_capacity(threshold_context_tokens);
     for &(index, score) in &scores {
         if score < config.threshold {
             break;
@@ -434,13 +507,18 @@ fn patch_diff_context_mask<B: Backend>(
             config.dilation,
             &mut keep,
             &mut selected,
-            context_tokens,
+            threshold_context_tokens,
         );
-        if selected.len() >= context_tokens {
+        if selected.len() >= threshold_context_tokens {
             break;
         }
     }
-    if selected.len() < context_tokens {
+    let fill_target = if config.fill_to_context_tokens {
+        context_tokens
+    } else {
+        min_context_tokens
+    };
+    if selected.len() < fill_target {
         for &(index, _) in &scores {
             push_dilated_sparse_index(
                 index,
@@ -448,9 +526,9 @@ fn patch_diff_context_mask<B: Backend>(
                 config.dilation,
                 &mut keep,
                 &mut selected,
-                context_tokens,
+                fill_target,
             );
-            if selected.len() >= context_tokens {
+            if selected.len() >= fill_target {
                 break;
             }
         }

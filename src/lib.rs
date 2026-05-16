@@ -35,7 +35,10 @@ pub use autogaze::{
     generate_autogaze_streaming_with_budget, project_autogaze_generated_masks,
     project_autogaze_generated_tokens,
 };
-pub use burn_anyup::{AnyUp, AnyUpConfig, AnyUpImageContext, AnyUpImageGrid};
+pub use burn_anyup::{
+    AnyUp, AnyUpAttentionMode, AnyUpConfig, AnyUpImageContext, AnyUpImageGrid, AnyUpLoadOptions,
+    AnyUpLoadReport,
+};
 pub use config::{
     VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig, VJepaPreprocessConfig,
 };
@@ -57,17 +60,18 @@ pub use feature_memory::{
     jepa_feature_tokens_to_nchw,
 };
 pub use highres_pipeline::{
-    FeatureFrameBatch, FeatureFrameEncodePath, FeatureFrameInput, FeatureFrameMeasureConfig,
-    FeatureFrameMetrics, FeatureFrameNode, FeatureFramePipeline, FeatureFramePipelineConfig,
-    FeatureFrameRequest, FeatureFrameSchedule, FeatureFrameStream, FeatureFrameStreamOutput,
-    FeatureFrameStreamStats, FrameId, FrameQueuePolicy, FrameQueueReport, FrameQueueTiming,
-    FrameStreamConfig, HighResFrameArtifacts, LowResFrameArtifacts, MeasuredFeatureFrameBatch,
-    SparseJepaAnyUpPcaBackpressurePolicy, SparseJepaAnyUpPcaEncodePath, SparseJepaAnyUpPcaFrameId,
-    SparseJepaAnyUpPcaFrameInput, SparseJepaAnyUpPcaMeasuredBatchOutput,
-    SparseJepaAnyUpPcaMeasuredOutput, SparseJepaAnyUpPcaMeasurementConfig,
-    SparseJepaAnyUpPcaOutput, SparseJepaAnyUpPcaPipeline, SparseJepaAnyUpPcaPipelineConfig,
-    SparseJepaAnyUpPcaQueueReport, SparseJepaAnyUpPcaQueuedFrameTiming,
-    SparseJepaAnyUpPcaStageMetrics, SparseJepaAnyUpPcaStepBatchOutput, SparseJepaAnyUpPcaStream,
+    FeatureFrameBatch, FeatureFrameEncodePath, FeatureFrameInput, FeatureFrameJepaEncoder,
+    FeatureFrameJepaEncoderKind, FeatureFrameMeasureConfig, FeatureFrameMetrics, FeatureFrameNode,
+    FeatureFramePipeline, FeatureFramePipelineConfig, FeatureFrameRequest, FeatureFrameSchedule,
+    FeatureFrameStream, FeatureFrameStreamOutput, FeatureFrameStreamStats, FrameId,
+    FrameQueuePolicy, FrameQueueReport, FrameQueueTiming, FrameStreamConfig, HighResFrameArtifacts,
+    LowResFrameArtifacts, MeasuredFeatureFrameBatch, SparseJepaAnyUpPcaBackpressurePolicy,
+    SparseJepaAnyUpPcaEncodePath, SparseJepaAnyUpPcaFrameId, SparseJepaAnyUpPcaFrameInput,
+    SparseJepaAnyUpPcaMeasuredBatchOutput, SparseJepaAnyUpPcaMeasuredOutput,
+    SparseJepaAnyUpPcaMeasurementConfig, SparseJepaAnyUpPcaOutput, SparseJepaAnyUpPcaPipeline,
+    SparseJepaAnyUpPcaPipelineConfig, SparseJepaAnyUpPcaQueueReport,
+    SparseJepaAnyUpPcaQueuedFrameTiming, SparseJepaAnyUpPcaStageMetrics,
+    SparseJepaAnyUpPcaStepBatchOutput, SparseJepaAnyUpPcaStream,
     SparseJepaAnyUpPcaStreamBatchOutput, SparseJepaAnyUpPcaStreamConfig,
     SparseJepaAnyUpPcaStreamStats,
 };
@@ -81,12 +85,12 @@ pub use nodes::{
     FnOutputNode, RgbaVideoInput, SparseJepaAutogazeSparsityConfig, SparseJepaInputNode,
     SparseJepaOutputNode, SparseJepaPacket, SparseJepaPatchDiffSparsityConfig,
     SparseJepaSparsityDriverConfig, SparseJepaTensorPipeline, SparseJepaTensorPipelineConfig,
-    TensorVideoInput, VecOutputNode, empty_rgb_video_shape, patch_diff_context_mask_from_video,
-    patch_diff_token_scores, resolve_sparsity_driver_masks,
+    TensorVideoInput, VecOutputNode, empty_rgb_video_shape, patch_diff_context_mask_from_scores,
+    patch_diff_context_mask_from_video, patch_diff_token_scores, resolve_sparsity_driver_masks,
 };
 pub use pca::{
-    FeaturePcaConfig, FeaturePcaProjector, FeaturePcaUpdateConfig, FeaturePcaUpdateDecision,
-    FeaturePcaUpdateMode, FeaturePcaUpdateScheduler,
+    FeaturePcaConfig, FeaturePcaDisplayMode, FeaturePcaProjector, FeaturePcaUpdateConfig,
+    FeaturePcaUpdateDecision, FeaturePcaUpdateMode, FeaturePcaUpdateScheduler,
 };
 pub use pipeline::{
     VJEPA_IMAGE_MEAN, VJEPA_IMAGE_STD, VJEPA_RESCALE_FACTOR, VJepaEmbedOutput, VJepaPipeline,

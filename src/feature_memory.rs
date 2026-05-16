@@ -89,9 +89,7 @@ struct InterframeJepaFeatureUpdatePlan<B: Backend> {
     token_count: usize,
     dense_tokens: usize,
     embed_dim: usize,
-    scatter_rows: Tensor<B, 3, Int>,
     observed_values: Tensor<B, 2>,
-    reset_age_values: Tensor<B, 2>,
 }
 
 impl<B: Backend> InterframeJepaFeatureUpdatePlan<B> {
@@ -102,18 +100,12 @@ impl<B: Backend> InterframeJepaFeatureUpdatePlan<B> {
         embed_dim: usize,
         device: &B::Device,
     ) -> Self {
-        let rows = Tensor::<B, 1, Int>::arange(0..batch as i64, device)
-            .unsqueeze_dim::<2>(1)
-            .repeat_dim(1, token_count)
-            .unsqueeze_dim::<3>(2);
         Self {
             batch,
             token_count,
             dense_tokens,
             embed_dim,
-            scatter_rows: rows,
             observed_values: Tensor::<B, 2>::ones([batch, token_count], device),
-            reset_age_values: Tensor::<B, 2>::zeros([batch, token_count], device),
         }
     }
 
@@ -130,14 +122,10 @@ impl<B: Backend> InterframeJepaFeatureUpdatePlan<B> {
             && self.embed_dim == embed_dim
     }
 
-    fn scatter_indices(&self, token_indices: Tensor<B, 2, Int>) -> Tensor<B, 3, Int> {
-        Tensor::cat(
-            vec![
-                self.scatter_rows.clone(),
-                token_indices.unsqueeze_dim::<3>(2),
-            ],
-            2,
-        )
+    fn feature_scatter_indices(&self, token_indices: Tensor<B, 2, Int>) -> Tensor<B, 3, Int> {
+        token_indices
+            .unsqueeze_dim::<3>(2)
+            .repeat_dim(2, self.embed_dim)
     }
 }
 
@@ -261,24 +249,28 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
             "sparse update must include at least one token"
         );
 
-        let (scatter_indices, observed_values, reset_age_values) =
+        let (feature_indices, observed_values) =
             self.scatter_update_plan(token_indices.clone(), token_count);
+        let previous = apply_token_mask(self.features.clone(), token_indices.clone());
         let update_values = match self.config.update_mode {
             InterframeJepaFeatureUpdateMode::AssignLatest => tokens,
             InterframeJepaFeatureUpdateMode::Ema { alpha } => {
-                let previous = apply_token_mask(self.features.clone(), token_indices.clone());
-                let observed =
-                    apply_token_mask(self.observed.clone().unsqueeze_dim::<3>(2), token_indices)
-                        .repeat_dim(2, embed_dim);
-                let blended = previous.mul_scalar(1.0 - alpha) + tokens.clone().mul_scalar(alpha);
+                let observed = apply_token_mask(
+                    self.observed.clone().unsqueeze_dim::<3>(2),
+                    token_indices.clone(),
+                )
+                .repeat_dim(2, embed_dim);
+                let blended =
+                    previous.clone().mul_scalar(1.0 - alpha) + tokens.clone().mul_scalar(alpha);
                 let first_observation = observed.clone().mul_scalar(-1.0) + 1.0;
                 blended * observed + tokens * first_observation
             }
         };
-        self.features = self.features.clone().scatter_nd(
-            scatter_indices.clone(),
-            update_values,
-            IndexingUpdateOp::Assign,
+        self.features = self.features.clone().scatter(
+            1,
+            feature_indices,
+            update_values - previous,
+            IndexingUpdateOp::Add,
         );
 
         if self.step > 0 {
@@ -288,16 +280,23 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
                 }
             }
         }
-        self.observed = self.observed.clone().scatter_nd(
-            scatter_indices.clone(),
-            observed_values,
-            IndexingUpdateOp::Assign,
+        let observed_delta =
+            observed_values - self.observed.clone().gather(1, token_indices.clone());
+        self.observed = self.observed.clone().scatter(
+            1,
+            token_indices.clone(),
+            observed_delta,
+            IndexingUpdateOp::Add,
         );
-        self.age_frames = self.age_frames.clone().scatter_nd(
-            scatter_indices,
-            reset_age_values,
-            IndexingUpdateOp::Assign,
-        );
+        let age_delta = self
+            .age_frames
+            .clone()
+            .gather(1, token_indices.clone())
+            .mul_scalar(-1.0);
+        self.age_frames =
+            self.age_frames
+                .clone()
+                .scatter(1, token_indices, age_delta, IndexingUpdateOp::Add);
         self.step += 1;
         self.last_updated_tokens = batch * token_count;
         Ok(self.output(self.last_updated_tokens))
@@ -361,7 +360,7 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
         &mut self,
         token_indices: Tensor<B, 2, Int>,
         token_count: usize,
-    ) -> (Tensor<B, 3, Int>, Tensor<B, 2>, Tensor<B, 2>) {
+    ) -> (Tensor<B, 3, Int>, Tensor<B, 2>) {
         if self.update_plan.as_ref().is_none_or(|plan| {
             !plan.matches(self.batch, token_count, self.dense_tokens(), self.embed_dim)
         }) {
@@ -375,9 +374,8 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
         }
         let plan = self.update_plan.as_ref().expect("update plan initialized");
         (
-            plan.scatter_indices(token_indices),
+            plan.feature_scatter_indices(token_indices),
             plan.observed_values.clone(),
-            plan.reset_age_values.clone(),
         )
     }
 

@@ -561,7 +561,7 @@ impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend:
 #[cfg(feature = "dispatch")]
 impl TttSparsePatchifyTrainingBackend for burn::Dispatch {}
 
-#[cfg(feature = "webgpu")]
+#[cfg(all(feature = "webgpu", not(feature = "wgpu")))]
 impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::WebGpu<f32, i32>> {}
 
 #[cfg(feature = "wgpu")]
