@@ -65,6 +65,14 @@ cache writes correct on GPU backends. The update path does not call `to_data`,
 `into_data`, or construct host `TensorData`; the host-side `reset_row_indices`
 helper is intentionally outside the sparse update path.
 
+When `sparse-feature-memory-wgpu` or `sparse-feature-memory-cuda` is enabled,
+the sparse-patchify WGPU/CUDA high-res pipeline uses a backend-specific tiled sparse assignment
+kernel for `AssignLatest` memory updates. The kernel copies the dense cache
+device-side, applies observed-token aging, and writes sparse feature/metadata
+tiles directly, avoiding the portable gather plus scatter-add sequence in that
+hot path. EMA updates still use the portable path because they need the previous
+selected values for blending.
+
 `reset` clears the whole canvas. `reset_rows` clears selected batch rows from a
 device index tensor, which is the preferred API for packed multi-stream video
 serving. `reset_row_indices` is a host convenience for control-plane resets.
@@ -84,6 +92,8 @@ cargo bench --bench feature_memory --no-default-features --features flex
 cargo bench --bench feature_memory --no-default-features --features dispatch,flex
 cargo bench --bench feature_memory --no-default-features --features cuda
 cargo bench --bench feature_memory --no-default-features --features webgpu
+cargo bench --bench feature_memory --no-default-features --features sparse-feature-memory-wgpu
+cargo bench --bench feature_memory --no-default-features --features sparse-feature-memory-cuda
 ```
 
 Benchmark rows encode the grid/resolution proxy, density, batch size, and sparse

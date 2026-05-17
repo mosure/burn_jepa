@@ -90,6 +90,8 @@ struct InterframeJepaFeatureUpdatePlan<B: Backend> {
     dense_tokens: usize,
     embed_dim: usize,
     observed_values: Tensor<B, 2>,
+    token_zero_values: Tensor<B, 2>,
+    zero_values: Tensor<B, 2>,
 }
 
 impl<B: Backend> InterframeJepaFeatureUpdatePlan<B> {
@@ -106,6 +108,8 @@ impl<B: Backend> InterframeJepaFeatureUpdatePlan<B> {
             dense_tokens,
             embed_dim,
             observed_values: Tensor::<B, 2>::ones([batch, token_count], device),
+            token_zero_values: Tensor::<B, 2>::zeros([batch, token_count], device),
+            zero_values: Tensor::<B, 2>::zeros([batch, dense_tokens], device),
         }
     }
 
@@ -226,6 +230,70 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
         token_indices: Tensor<B, 2, Int>,
         grid: TokenGridShape,
     ) -> Result<InterframeJepaFeatureMemoryOutput<B>> {
+        let (batch, token_count, embed_dim) =
+            self.validate_sparse_update_inputs(&tokens, &token_indices, grid)?;
+
+        if self.step > 0 {
+            match self.config.age_mode {
+                InterframeJepaFeatureAgeMode::ObservedFrames => {
+                    self.age_frames = self.age_frames.clone() + self.observed.clone();
+                }
+            }
+        }
+        let (feature_indices, observed_values, age_values) =
+            self.scatter_update_plan(token_indices.clone(), token_count);
+        let previous = apply_token_mask(self.features.clone(), token_indices.clone());
+        let update_delta = match self.config.update_mode {
+            InterframeJepaFeatureUpdateMode::AssignLatest => tokens - previous,
+            InterframeJepaFeatureUpdateMode::Ema { alpha } => {
+                let observed = apply_token_mask(
+                    self.observed.clone().unsqueeze_dim::<3>(2),
+                    token_indices.clone(),
+                )
+                .repeat_dim(2, embed_dim);
+                let blended =
+                    previous.clone().mul_scalar(1.0 - alpha) + tokens.clone().mul_scalar(alpha);
+                let first_observation = observed.clone().mul_scalar(-1.0) + 1.0;
+                (blended * observed + tokens * first_observation) - previous
+            }
+        };
+        self.features =
+            self.features
+                .clone()
+                .scatter(1, feature_indices, update_delta, IndexingUpdateOp::Add);
+
+        let previous_observed = apply_token_mask(
+            self.observed.clone().unsqueeze_dim::<3>(2),
+            token_indices.clone(),
+        )
+        .reshape([batch, token_count]);
+        self.observed = self.observed.clone().scatter(
+            1,
+            token_indices.clone(),
+            observed_values - previous_observed,
+            IndexingUpdateOp::Add,
+        );
+        let previous_age = apply_token_mask(
+            self.age_frames.clone().unsqueeze_dim::<3>(2),
+            token_indices.clone(),
+        )
+        .reshape([batch, token_count]);
+        self.age_frames = self.age_frames.clone().scatter(
+            1,
+            token_indices,
+            age_values - previous_age,
+            IndexingUpdateOp::Add,
+        );
+        self.step += 1;
+        self.last_updated_tokens = batch * token_count;
+        Ok(self.output(self.last_updated_tokens))
+    }
+
+    pub fn update_dense_ordered_tokens(
+        &mut self,
+        tokens: Tensor<B, 3>,
+        grid: TokenGridShape,
+    ) -> Result<InterframeJepaFeatureMemoryOutput<B>> {
         ensure!(
             grid == self.grid,
             "encoder output grid does not match feature memory grid"
@@ -236,67 +304,31 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
             "encoder output batch does not match feature memory batch"
         );
         ensure!(
+            token_count == self.dense_tokens(),
+            "dense ordered update must include every token in the feature memory grid"
+        );
+        ensure!(
             embed_dim == self.embed_dim,
             "encoder output dim does not match feature memory dim"
         );
-        let [index_batch, index_count] = token_indices.shape().dims::<2>();
-        ensure!(
-            index_batch == batch && index_count == token_count,
-            "token index shape must match sparse encoder token shape"
-        );
-        ensure!(
-            token_count > 0,
-            "sparse update must include at least one token"
-        );
 
-        let (feature_indices, observed_values) =
-            self.scatter_update_plan(token_indices.clone(), token_count);
-        let previous = apply_token_mask(self.features.clone(), token_indices.clone());
-        let update_values = match self.config.update_mode {
+        self.features = match self.config.update_mode {
             InterframeJepaFeatureUpdateMode::AssignLatest => tokens,
             InterframeJepaFeatureUpdateMode::Ema { alpha } => {
-                let observed = apply_token_mask(
-                    self.observed.clone().unsqueeze_dim::<3>(2),
-                    token_indices.clone(),
-                )
-                .repeat_dim(2, embed_dim);
-                let blended =
-                    previous.clone().mul_scalar(1.0 - alpha) + tokens.clone().mul_scalar(alpha);
+                let observed = self
+                    .observed
+                    .clone()
+                    .unsqueeze_dim::<3>(2)
+                    .repeat_dim(2, embed_dim);
+                let blended = self.features.clone().mul_scalar(1.0 - alpha)
+                    + tokens.clone().mul_scalar(alpha);
                 let first_observation = observed.clone().mul_scalar(-1.0) + 1.0;
                 blended * observed + tokens * first_observation
             }
         };
-        self.features = self.features.clone().scatter(
-            1,
-            feature_indices,
-            update_values - previous,
-            IndexingUpdateOp::Add,
-        );
-
-        if self.step > 0 {
-            match self.config.age_mode {
-                InterframeJepaFeatureAgeMode::ObservedFrames => {
-                    self.age_frames = self.age_frames.clone() + self.observed.clone();
-                }
-            }
-        }
-        let observed_delta =
-            observed_values - self.observed.clone().gather(1, token_indices.clone());
-        self.observed = self.observed.clone().scatter(
-            1,
-            token_indices.clone(),
-            observed_delta,
-            IndexingUpdateOp::Add,
-        );
-        let age_delta = self
-            .age_frames
-            .clone()
-            .gather(1, token_indices.clone())
-            .mul_scalar(-1.0);
-        self.age_frames =
-            self.age_frames
-                .clone()
-                .scatter(1, token_indices, age_delta, IndexingUpdateOp::Add);
+        let (observed_values, age_values) = self.dense_metadata_values();
+        self.observed = observed_values;
+        self.age_frames = age_values;
         self.step += 1;
         self.last_updated_tokens = batch * token_count;
         Ok(self.output(self.last_updated_tokens))
@@ -356,11 +388,42 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
         self.reset_rows(row_tensor)
     }
 
+    fn validate_sparse_update_inputs(
+        &self,
+        tokens: &Tensor<B, 3>,
+        token_indices: &Tensor<B, 2, Int>,
+        grid: TokenGridShape,
+    ) -> Result<(usize, usize, usize)> {
+        ensure!(
+            grid == self.grid,
+            "encoder output grid does not match feature memory grid"
+        );
+        let [batch, token_count, embed_dim] = tokens.shape().dims::<3>();
+        ensure!(
+            batch == self.batch,
+            "encoder output batch does not match feature memory batch"
+        );
+        ensure!(
+            embed_dim == self.embed_dim,
+            "encoder output dim does not match feature memory dim"
+        );
+        let [index_batch, index_count] = token_indices.shape().dims::<2>();
+        ensure!(
+            index_batch == batch && index_count == token_count,
+            "token index shape must match sparse encoder token shape"
+        );
+        ensure!(
+            token_count > 0,
+            "sparse update must include at least one token"
+        );
+        Ok((batch, token_count, embed_dim))
+    }
+
     fn scatter_update_plan(
         &mut self,
         token_indices: Tensor<B, 2, Int>,
         token_count: usize,
-    ) -> (Tensor<B, 3, Int>, Tensor<B, 2>) {
+    ) -> (Tensor<B, 3, Int>, Tensor<B, 2>, Tensor<B, 2>) {
         if self.update_plan.as_ref().is_none_or(|plan| {
             !plan.matches(self.batch, token_count, self.dense_tokens(), self.embed_dim)
         }) {
@@ -376,7 +439,25 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
         (
             plan.feature_scatter_indices(token_indices),
             plan.observed_values.clone(),
+            plan.token_zero_values.clone(),
         )
+    }
+
+    fn dense_metadata_values(&mut self) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let dense_tokens = self.dense_tokens();
+        if self.update_plan.as_ref().is_none_or(|plan| {
+            !plan.matches(self.batch, dense_tokens, dense_tokens, self.embed_dim)
+        }) {
+            self.update_plan = Some(InterframeJepaFeatureUpdatePlan::new(
+                self.batch,
+                dense_tokens,
+                dense_tokens,
+                self.embed_dim,
+                &self.device,
+            ));
+        }
+        let plan = self.update_plan.as_ref().expect("update plan initialized");
+        (plan.observed_values.clone(), plan.zero_values.clone())
     }
 
     fn row_token_indices(&self, rows: Tensor<B, 1, Int>, row_count: usize) -> Tensor<B, 3, Int> {
@@ -429,5 +510,127 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
             updated_tokens,
             dense_tokens: self.dense_tokens(),
         }
+    }
+}
+
+#[cfg(feature = "sparse-feature-memory-wgpu")]
+impl InterframeJepaFeatureMemory<burn::backend::Wgpu<f32, i32>> {
+    pub fn update_tokens_tiled_assign_wgpu(
+        &mut self,
+        tokens: Tensor<burn::backend::Wgpu<f32, i32>, 3>,
+        token_indices: Tensor<burn::backend::Wgpu<f32, i32>, 2, Int>,
+        grid: TokenGridShape,
+    ) -> Result<InterframeJepaFeatureMemoryOutput<burn::backend::Wgpu<f32, i32>>> {
+        if self.config.update_mode != InterframeJepaFeatureUpdateMode::AssignLatest {
+            return self.update_tokens(tokens, token_indices, grid);
+        }
+        let (batch, token_count, _embed_dim) =
+            self.validate_sparse_update_inputs(&tokens, &token_indices, grid)?;
+        let output = crate::sparse_feature_memory::sparse_feature_memory_assign_latest_wgpu_fusion(
+            self.features.clone(),
+            self.observed.clone(),
+            self.age_frames.clone(),
+            tokens,
+            token_indices,
+            self.step > 0,
+        );
+        self.features = output.features;
+        self.observed = output.observed;
+        self.age_frames = output.age_frames;
+        self.step += 1;
+        self.last_updated_tokens = batch * token_count;
+        Ok(self.output(self.last_updated_tokens))
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl InterframeJepaFeatureMemory<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
+    pub fn update_tokens_tiled_assign_wgpu_raw(
+        &mut self,
+        tokens: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>,
+        token_indices: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 2, Int>,
+        grid: TokenGridShape,
+    ) -> Result<InterframeJepaFeatureMemoryOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        if self.config.update_mode != InterframeJepaFeatureUpdateMode::AssignLatest {
+            return self.update_tokens(tokens, token_indices, grid);
+        }
+        let (batch, token_count, _embed_dim) =
+            self.validate_sparse_update_inputs(&tokens, &token_indices, grid)?;
+        let output = crate::sparse_feature_memory::sparse_feature_memory_assign_latest_wgpu_raw(
+            self.features.clone(),
+            self.observed.clone(),
+            self.age_frames.clone(),
+            tokens,
+            token_indices,
+            self.step > 0,
+        )
+        .map_err(anyhow::Error::msg)?;
+        self.features = output.features;
+        self.observed = output.observed;
+        self.age_frames = output.age_frames;
+        self.step += 1;
+        self.last_updated_tokens = batch * token_count;
+        Ok(self.output(self.last_updated_tokens))
+    }
+}
+
+#[cfg(feature = "sparse-feature-memory-cuda")]
+impl InterframeJepaFeatureMemory<burn::backend::Cuda<f32, i32>> {
+    pub fn update_tokens_tiled_assign_cuda(
+        &mut self,
+        tokens: Tensor<burn::backend::Cuda<f32, i32>, 3>,
+        token_indices: Tensor<burn::backend::Cuda<f32, i32>, 2, Int>,
+        grid: TokenGridShape,
+    ) -> Result<InterframeJepaFeatureMemoryOutput<burn::backend::Cuda<f32, i32>>> {
+        if self.config.update_mode != InterframeJepaFeatureUpdateMode::AssignLatest {
+            return self.update_tokens(tokens, token_indices, grid);
+        }
+        let (batch, token_count, _embed_dim) =
+            self.validate_sparse_update_inputs(&tokens, &token_indices, grid)?;
+        let output = crate::sparse_feature_memory::sparse_feature_memory_assign_latest_cuda_fusion(
+            self.features.clone(),
+            self.observed.clone(),
+            self.age_frames.clone(),
+            tokens,
+            token_indices,
+            self.step > 0,
+        );
+        self.features = output.features;
+        self.observed = output.observed;
+        self.age_frames = output.age_frames;
+        self.step += 1;
+        self.last_updated_tokens = batch * token_count;
+        Ok(self.output(self.last_updated_tokens))
+    }
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+impl InterframeJepaFeatureMemory<burn_flex_gmm::cuda::DefaultCudaBackend> {
+    pub fn update_tokens_tiled_assign_cuda_raw(
+        &mut self,
+        tokens: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 3>,
+        token_indices: Tensor<burn_flex_gmm::cuda::DefaultCudaBackend, 2, Int>,
+        grid: TokenGridShape,
+    ) -> Result<InterframeJepaFeatureMemoryOutput<burn_flex_gmm::cuda::DefaultCudaBackend>> {
+        if self.config.update_mode != InterframeJepaFeatureUpdateMode::AssignLatest {
+            return self.update_tokens(tokens, token_indices, grid);
+        }
+        let (batch, token_count, _embed_dim) =
+            self.validate_sparse_update_inputs(&tokens, &token_indices, grid)?;
+        let output = crate::sparse_feature_memory::sparse_feature_memory_assign_latest_cuda_raw(
+            self.features.clone(),
+            self.observed.clone(),
+            self.age_frames.clone(),
+            tokens,
+            token_indices,
+            self.step > 0,
+        )
+        .map_err(anyhow::Error::msg)?;
+        self.features = output.features;
+        self.observed = output.observed;
+        self.age_frames = output.age_frames;
+        self.step += 1;
+        self.last_updated_tokens = batch * token_count;
+        Ok(self.output(self.last_updated_tokens))
     }
 }

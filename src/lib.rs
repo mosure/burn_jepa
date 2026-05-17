@@ -17,6 +17,11 @@ mod positional;
 mod quantization;
 pub mod runtime;
 mod safetensors_io;
+#[cfg(any(
+    feature = "sparse-feature-memory-wgpu",
+    feature = "sparse-feature-memory-cuda"
+))]
+mod sparse_feature_memory;
 mod sparse_patchify;
 mod temporal;
 mod tokens;

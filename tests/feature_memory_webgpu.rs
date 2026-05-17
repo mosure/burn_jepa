@@ -83,6 +83,64 @@ fn sparse_updates_overwrite_only_selected_spatial_tokens_webgpu() {
     assert_eq!(values2(second.observed), vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
 }
 
+#[cfg(feature = "sparse-feature-memory-wgpu")]
+#[test]
+fn tiled_sparse_assign_matches_portable_sparse_update_webgpu() {
+    let device = Default::default();
+    let grid = TokenGridShape::new(1, 2, 4);
+    let mut portable = InterframeJepaFeatureMemory::<B>::new(
+        InterframeJepaFeatureMemoryConfig::default(),
+        1,
+        grid,
+        3,
+        &device,
+    )
+    .expect("portable memory");
+    let mut tiled = InterframeJepaFeatureMemory::<B>::new(
+        InterframeJepaFeatureMemoryConfig::default(),
+        1,
+        grid,
+        3,
+        &device,
+    )
+    .expect("tiled memory");
+
+    for (values, selected) in [
+        (
+            vec![1.0, 2.0, 3.0, 20.0, 21.0, 22.0, 70.0, 71.0, 72.0],
+            vec![0, 2, 7],
+        ),
+        (
+            vec![30.0, 31.0, 32.0, 40.0, 41.0, 42.0, 50.0, 51.0, 52.0],
+            vec![2, 4, 5],
+        ),
+    ] {
+        let tokens = tensor3(values.as_slice(), [1, selected.len(), 3], &device);
+        let token_indices = indices(
+            selected
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [1, selected.len()],
+            &device,
+        );
+        portable
+            .update_tokens(tokens.clone(), token_indices.clone(), grid)
+            .expect("portable update");
+        tiled
+            .update_tokens_tiled_assign_wgpu(tokens, token_indices, grid)
+            .expect("tiled update");
+    }
+
+    let portable = portable.snapshot();
+    let tiled = tiled.snapshot();
+    assert_eq!(values3(tiled.features), values3(portable.features));
+    assert_eq!(values2(tiled.observed), values2(portable.observed));
+    assert_eq!(values2(tiled.age_frames), values2(portable.age_frames));
+}
+
 fn tensor3(
     values: &[f32],
     shape: [usize; 3],

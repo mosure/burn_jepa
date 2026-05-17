@@ -18,12 +18,30 @@ struct DensityCase {
     density: f32,
 }
 
-const FEATURE_MEMORY_CASES: [FeatureMemoryCase; 4] = [
+const FEATURE_MEMORY_CASES: [FeatureMemoryCase; 7] = [
     FeatureMemoryCase {
         label: "tiny_stream",
         grid: TokenGridShape::new(2, 4, 4),
         embed_dim: 128,
         batch: 1,
+    },
+    FeatureMemoryCase {
+        label: "bevy256_b1",
+        grid: TokenGridShape::new(1, 16, 16),
+        embed_dim: 768,
+        batch: 1,
+    },
+    FeatureMemoryCase {
+        label: "bevy512_b1",
+        grid: TokenGridShape::new(1, 32, 32),
+        embed_dim: 768,
+        batch: 1,
+    },
+    FeatureMemoryCase {
+        label: "bevy512_b4",
+        grid: TokenGridShape::new(1, 32, 32),
+        embed_dim: 768,
+        batch: 4,
     },
     FeatureMemoryCase {
         label: "vjepa224_b1",
@@ -45,7 +63,7 @@ const FEATURE_MEMORY_CASES: [FeatureMemoryCase; 4] = [
     },
 ];
 
-const DENSITY_CASES: [DensityCase; 6] = [
+const DENSITY_CASES: [DensityCase; 10] = [
     DensityCase {
         label: "1pct",
         density: 0.01,
@@ -63,8 +81,24 @@ const DENSITY_CASES: [DensityCase; 6] = [
         density: 0.25,
     },
     DensityCase {
+        label: "30pct",
+        density: 0.30,
+    },
+    DensityCase {
         label: "50pct",
         density: 0.50,
+    },
+    DensityCase {
+        label: "85pct",
+        density: 0.85,
+    },
+    DensityCase {
+        label: "95pct",
+        density: 0.95,
+    },
+    DensityCase {
+        label: "98pct",
+        density: 0.98,
     },
     DensityCase {
         label: "100pct",
@@ -164,7 +198,7 @@ fn bench_feature_memory_cached_sparse_update<B, MakeDevice>(
     group.finish();
 }
 
-fn bench_feature_memory_plan_build_update<B, MakeDevice>(
+fn bench_feature_memory_dense_ordered_update<B, MakeDevice>(
     c: &mut Criterion,
     backend_name: &str,
     make_device: MakeDevice,
@@ -172,29 +206,26 @@ fn bench_feature_memory_plan_build_update<B, MakeDevice>(
     B: Backend,
     MakeDevice: Fn() -> B::Device + Copy,
 {
-    let mut group = c.benchmark_group(format!("feature_memory_plan_build_update_{backend_name}"));
-    let case = FEATURE_MEMORY_CASES
-        .iter()
-        .copied()
-        .find(|case| case.label == "vjepa224_b1")
-        .expect("vjepa224 case");
-    let dense_tokens = case.grid.len();
-    for density in DENSITY_CASES {
-        let keep = keep_count(dense_tokens, density.density);
-        group.throughput(Throughput::Elements(keep as u64));
+    let mut group = c.benchmark_group(format!(
+        "feature_memory_dense_ordered_update_{backend_name}"
+    ));
+    for case in FEATURE_MEMORY_CASES {
+        let dense_tokens = case.grid.len();
+        group.throughput(Throughput::Elements((case.batch * dense_tokens) as u64));
         group.bench_function(
             format!(
-                "{}_density_{}_tokens{}_of{}",
-                case.label, density.label, keep, dense_tokens
+                "{}_density_100pct_b{}_tokens{}",
+                case.label, case.batch, dense_tokens
             ),
             |bench| {
                 bench.iter_batched(
                     || {
                         let device = make_device();
-                        let indices = token_indices::<B>(case.batch, dense_tokens, keep, &device);
-                        let tokens =
-                            Tensor::<B, 3>::ones([case.batch, keep, case.embed_dim], &device);
-                        let memory = InterframeJepaFeatureMemory::<B>::new(
+                        let tokens = Tensor::<B, 3>::ones(
+                            [case.batch, dense_tokens, case.embed_dim],
+                            &device,
+                        );
+                        let mut memory = InterframeJepaFeatureMemory::<B>::new(
                             InterframeJepaFeatureMemoryConfig::default(),
                             case.batch,
                             case.grid,
@@ -202,14 +233,19 @@ fn bench_feature_memory_plan_build_update<B, MakeDevice>(
                             &device,
                         )
                         .expect("feature memory");
-                        (device, memory, tokens, indices)
+                        memory
+                            .update_dense_ordered_tokens(tokens.clone(), case.grid)
+                            .expect("prime dense ordered update");
+                        (device, memory, tokens)
                     },
-                    |(device, mut memory, tokens, indices)| {
+                    |(device, mut memory, tokens)| {
                         let output = memory
-                            .update_tokens(black_box(tokens), black_box(indices), case.grid)
-                            .expect("sparse update");
+                            .update_dense_ordered_tokens(black_box(tokens), case.grid)
+                            .expect("dense ordered update");
                         B::sync(&device).expect("sync feature memory backend");
                         black_box(output.features);
+                        black_box(output.observed);
+                        black_box(output.age_frames);
                     },
                     BatchSize::SmallInput,
                 );
@@ -219,6 +255,213 @@ fn bench_feature_memory_plan_build_update<B, MakeDevice>(
     group.finish();
 }
 
+#[cfg(feature = "sparse-feature-memory-wgpu")]
+fn feature_memory_tiled_sparse_assign_wgpu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("feature_memory_tiled_sparse_assign_wgpu");
+    for case in FEATURE_MEMORY_CASES {
+        let dense_tokens = case.grid.len();
+        for density in DENSITY_CASES {
+            let keep = keep_count(dense_tokens, density.density);
+            group.throughput(Throughput::Elements((case.batch * keep) as u64));
+            group.bench_function(
+                format!(
+                    "{}_density_{}_b{}_tokens{}_of{}",
+                    case.label, density.label, case.batch, keep, dense_tokens
+                ),
+                |bench| {
+                    bench.iter_batched(
+                        || {
+                            let device = Default::default();
+                            let indices = token_indices::<burn::backend::Wgpu<f32, i32>>(
+                                case.batch,
+                                dense_tokens,
+                                keep,
+                                &device,
+                            );
+                            let tokens = Tensor::<burn::backend::Wgpu<f32, i32>, 3>::ones(
+                                [case.batch, keep, case.embed_dim],
+                                &device,
+                            );
+                            let mut memory =
+                                InterframeJepaFeatureMemory::<burn::backend::Wgpu<f32, i32>>::new(
+                                    InterframeJepaFeatureMemoryConfig::default(),
+                                    case.batch,
+                                    case.grid,
+                                    case.embed_dim,
+                                    &device,
+                                )
+                                .expect("feature memory");
+                            memory
+                                .update_tokens_tiled_assign_wgpu(
+                                    tokens.clone(),
+                                    indices.clone(),
+                                    case.grid,
+                                )
+                                .expect("prime tiled assign plan");
+                            (device, memory, tokens, indices)
+                        },
+                        |(device, mut memory, tokens, indices)| {
+                            let output = memory
+                                .update_tokens_tiled_assign_wgpu(
+                                    black_box(tokens),
+                                    black_box(indices),
+                                    case.grid,
+                                )
+                                .expect("tiled sparse assign");
+                            burn::backend::Wgpu::<f32, i32>::sync(&device)
+                                .expect("sync feature memory backend");
+                            black_box(output.features);
+                            black_box(output.observed);
+                            black_box(output.age_frames);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "sparse-feature-memory-wgpu"))]
+fn feature_memory_tiled_sparse_assign_wgpu(_c: &mut Criterion) {}
+
+#[cfg(feature = "sparse-feature-memory-cuda")]
+fn feature_memory_tiled_sparse_assign_cuda(c: &mut Criterion) {
+    if let Err(reason) =
+        burn_jepa::runtime::cuda_runtime_preflight(burn_jepa::runtime::CUDA_TRAIN_FORCE_ENV)
+    {
+        eprintln!("skipping feature_memory_tiled_sparse_assign_cuda: {reason}");
+        return;
+    }
+    let mut group = c.benchmark_group("feature_memory_tiled_sparse_assign_cuda");
+    for case in FEATURE_MEMORY_CASES {
+        let dense_tokens = case.grid.len();
+        for density in DENSITY_CASES {
+            let keep = keep_count(dense_tokens, density.density);
+            group.throughput(Throughput::Elements((case.batch * keep) as u64));
+            group.bench_function(
+                format!(
+                    "{}_density_{}_b{}_tokens{}_of{}",
+                    case.label, density.label, case.batch, keep, dense_tokens
+                ),
+                |bench| {
+                    bench.iter_batched(
+                        || {
+                            let device = Default::default();
+                            let indices = token_indices::<burn::backend::Cuda<f32, i32>>(
+                                case.batch,
+                                dense_tokens,
+                                keep,
+                                &device,
+                            );
+                            let tokens = Tensor::<burn::backend::Cuda<f32, i32>, 3>::ones(
+                                [case.batch, keep, case.embed_dim],
+                                &device,
+                            );
+                            let mut memory =
+                                InterframeJepaFeatureMemory::<burn::backend::Cuda<f32, i32>>::new(
+                                    InterframeJepaFeatureMemoryConfig::default(),
+                                    case.batch,
+                                    case.grid,
+                                    case.embed_dim,
+                                    &device,
+                                )
+                                .expect("feature memory");
+                            memory
+                                .update_tokens_tiled_assign_cuda(
+                                    tokens.clone(),
+                                    indices.clone(),
+                                    case.grid,
+                                )
+                                .expect("prime tiled assign plan");
+                            (device, memory, tokens, indices)
+                        },
+                        |(device, mut memory, tokens, indices)| {
+                            let output = memory
+                                .update_tokens_tiled_assign_cuda(
+                                    black_box(tokens),
+                                    black_box(indices),
+                                    case.grid,
+                                )
+                                .expect("tiled sparse assign");
+                            burn::backend::Cuda::<f32, i32>::sync(&device)
+                                .expect("sync feature memory backend");
+                            black_box(output.features);
+                            black_box(output.observed);
+                            black_box(output.age_frames);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "sparse-feature-memory-cuda"))]
+fn feature_memory_tiled_sparse_assign_cuda(_c: &mut Criterion) {}
+
+fn bench_feature_memory_plan_build_update<B, MakeDevice>(
+    c: &mut Criterion,
+    backend_name: &str,
+    make_device: MakeDevice,
+) where
+    B: Backend,
+    MakeDevice: Fn() -> B::Device + Copy,
+{
+    let mut group = c.benchmark_group(format!("feature_memory_plan_build_update_{backend_name}"));
+    for case_label in ["bevy256_b1", "bevy512_b1", "vjepa224_b1"] {
+        let case = FEATURE_MEMORY_CASES
+            .iter()
+            .copied()
+            .find(|case| case.label == case_label)
+            .expect("feature memory case");
+        let dense_tokens = case.grid.len();
+        for density in DENSITY_CASES {
+            let keep = keep_count(dense_tokens, density.density);
+            group.throughput(Throughput::Elements(keep as u64));
+            group.bench_function(
+                format!(
+                    "{}_density_{}_tokens{}_of{}",
+                    case.label, density.label, keep, dense_tokens
+                ),
+                |bench| {
+                    bench.iter_batched(
+                        || {
+                            let device = make_device();
+                            let indices =
+                                token_indices::<B>(case.batch, dense_tokens, keep, &device);
+                            let tokens =
+                                Tensor::<B, 3>::ones([case.batch, keep, case.embed_dim], &device);
+                            let memory = InterframeJepaFeatureMemory::<B>::new(
+                                InterframeJepaFeatureMemoryConfig::default(),
+                                case.batch,
+                                case.grid,
+                                case.embed_dim,
+                                &device,
+                            )
+                            .expect("feature memory");
+                            (device, memory, tokens, indices)
+                        },
+                        |(device, mut memory, tokens, indices)| {
+                            let output = memory
+                                .update_tokens(black_box(tokens), black_box(indices), case.grid)
+                                .expect("sparse update");
+                            B::sync(&device).expect("sync feature memory backend");
+                            black_box(output.features);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+#[allow(dead_code)]
 fn bench_feature_memory_row_reset<B, MakeDevice>(
     c: &mut Criterion,
     backend_name: &str,
@@ -272,6 +515,7 @@ fn bench_feature_memory_row_reset<B, MakeDevice>(
     group.finish();
 }
 
+#[allow(dead_code)]
 fn bench_feature_memory_backend<B, MakeDevice>(
     c: &mut Criterion,
     backend_name: &str,
@@ -281,8 +525,22 @@ fn bench_feature_memory_backend<B, MakeDevice>(
     MakeDevice: Fn() -> B::Device + Copy,
 {
     bench_feature_memory_cached_sparse_update::<B, _>(c, backend_name, make_device);
+    bench_feature_memory_dense_ordered_update::<B, _>(c, backend_name, make_device);
     bench_feature_memory_plan_build_update::<B, _>(c, backend_name, make_device);
     bench_feature_memory_row_reset::<B, _>(c, backend_name, make_device);
+}
+
+fn bench_feature_memory_backend_without_row_reset<B, MakeDevice>(
+    c: &mut Criterion,
+    backend_name: &str,
+    make_device: MakeDevice,
+) where
+    B: Backend,
+    MakeDevice: Fn() -> B::Device + Copy,
+{
+    bench_feature_memory_cached_sparse_update::<B, _>(c, backend_name, make_device);
+    bench_feature_memory_dense_ordered_update::<B, _>(c, backend_name, make_device);
+    bench_feature_memory_plan_build_update::<B, _>(c, backend_name, make_device);
 }
 
 #[cfg(feature = "ndarray")]
@@ -333,9 +591,11 @@ fn feature_memory_cuda(c: &mut Criterion) {
         eprintln!("skipping feature_memory_cuda: {reason}");
         return;
     }
-    bench_feature_memory_backend::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || {
-        Default::default()
-    });
+    bench_feature_memory_backend_without_row_reset::<burn::backend::Cuda<f32, i32>, _>(
+        c,
+        "cuda",
+        || Default::default(),
+    );
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -349,7 +609,7 @@ fn feature_memory_dispatch_cuda(c: &mut Criterion) {
         eprintln!("skipping feature_memory_dispatch_cuda: {reason}");
         return;
     }
-    bench_feature_memory_backend::<burn::Dispatch, _>(c, "dispatch_cuda", || {
+    bench_feature_memory_backend_without_row_reset::<burn::Dispatch, _>(c, "dispatch_cuda", || {
         burn::DispatchDevice::Cuda(Default::default())
     });
 }
@@ -397,7 +657,9 @@ criterion_group!(
     feature_memory_dispatch_cuda,
     feature_memory_wgpu,
     feature_memory_webgpu,
-    feature_memory_dispatch_wgpu
+    feature_memory_dispatch_wgpu,
+    feature_memory_tiled_sparse_assign_wgpu,
+    feature_memory_tiled_sparse_assign_cuda
 );
 
 criterion_main!(benches);

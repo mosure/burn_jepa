@@ -44,7 +44,7 @@ wasm = [
 ]
 bevy-web-demo = ["wasm"]
 sparse-patchify-wgpu = [
-  "wgpu",
+  "sparse-feature-memory-wgpu",
   "dep:burn-backend",
   "dep:burn-fusion",
   "dep:burn-ir",
@@ -52,18 +52,36 @@ sparse-patchify-wgpu = [
   "burn_flex_gmm/wgpu-kernel",
 ]
 sparse-patchify-cuda = [
-  "cuda",
+  "sparse-feature-memory-cuda",
   "dep:burn-backend",
   "dep:burn-fusion",
   "dep:burn-ir",
   "dep:burn_flex_gmm",
   "burn_flex_gmm/cuda-kernel",
 ]
+sparse-feature-memory-wgpu = [
+  "wgpu",
+  "dep:burn-backend",
+  "dep:burn-cubecl",
+  "dep:burn-fusion",
+  "dep:burn-ir",
+  "dep:burn-wgpu",
+]
+sparse-feature-memory-cuda = [
+  "cuda",
+  "dep:burn-backend",
+  "dep:burn-cubecl",
+  "dep:burn-cuda",
+  "dep:burn-fusion",
+  "dep:burn-ir",
+]
 
 [dependencies]
 anyhow = "1"
 burn = { version = "0.21.0", default-features = false, features = ["autodiff", "fusion", "std"] }
 burn-backend = { version = "0.21.0", default-features = false, optional = true }
+burn-cubecl = { version = "0.21.0", default-features = false, features = ["fusion", "std"], optional = true }
+burn-cuda = { version = "0.21.0", default-features = false, features = ["fusion", "std"], optional = true }
 burn-fusion = { version = "0.21.0", default-features = false, optional = true }
 burn-ir = { version = "0.21.0", default-features = false, optional = true }
 burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
@@ -87,6 +105,24 @@ console_error_panic_hook = { version = "0.1", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
+version = "0.21.0"
+optional = true
+default-features = false
+features = ["fusion", "std", "vulkan"]
+
+[target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
+version = "0.21.0"
+optional = true
+default-features = false
+features = ["fusion", "std", "metal"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
+version = "0.21.0"
+optional = true
+default-features = false
+features = ["fusion", "std", "webgpu"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"

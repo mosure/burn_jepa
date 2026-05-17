@@ -177,6 +177,89 @@ fn ema_updates_assign_first_observation_then_blend_repeated_tokens() {
 }
 
 #[test]
+fn dense_ordered_update_matches_full_sparse_update_without_scatter() {
+    let device = Default::default();
+    let grid = TokenGridShape::new(1, 2, 2);
+    let config = InterframeJepaFeatureMemoryConfig {
+        update_mode: InterframeJepaFeatureUpdateMode::Ema { alpha: 0.25 },
+        ..InterframeJepaFeatureMemoryConfig::default()
+    };
+    let mut dense_memory =
+        InterframeJepaFeatureMemory::<B>::new(config, 1, grid, 1, &device).expect("dense memory");
+    let mut sparse_memory =
+        InterframeJepaFeatureMemory::<B>::new(config, 1, grid, 1, &device).expect("sparse memory");
+    let all_indices = indices(&[0, 1, 2, 3], [1, 4], &device);
+
+    for values in [&[1.0, 2.0, 3.0, 4.0][..], &[5.0, 6.0, 7.0, 8.0][..]] {
+        let tokens = tensor3(values, [1, 4, 1], &device);
+        let dense = dense_memory
+            .update_dense_ordered_tokens(tokens.clone(), grid)
+            .expect("dense ordered update");
+        let sparse = sparse_memory
+            .update_tokens(tokens, all_indices.clone(), grid)
+            .expect("full sparse update");
+
+        assert_eq!(dense.updated_tokens, sparse.updated_tokens);
+        assert_close(&values3(dense.features), &values3(sparse.features));
+        assert_close(&values2(dense.observed), &values2(sparse.observed));
+        assert_close(&values2(dense.age_frames), &values2(sparse.age_frames));
+    }
+}
+
+#[test]
+fn high_density_sparse_update_preserves_unwritten_512_grid_tokens() {
+    let device = Default::default();
+    let grid = TokenGridShape::new(1, 32, 32);
+    let embed_dim = 4;
+    let dense_tokens = grid.len();
+    let keep = (dense_tokens * 98).div_ceil(100);
+    let mut memory = InterframeJepaFeatureMemory::<B>::new(
+        InterframeJepaFeatureMemoryConfig::default(),
+        1,
+        grid,
+        embed_dim,
+        &device,
+    )
+    .expect("feature memory");
+
+    let initial_values = token_values(dense_tokens, embed_dim, 1000.0);
+    memory
+        .update_dense_ordered_tokens(
+            tensor3(&initial_values, [1, dense_tokens, embed_dim], &device),
+            grid,
+        )
+        .expect("dense prime");
+
+    let sparse_indices = (0..keep).map(|index| index as i64).collect::<Vec<_>>();
+    let updated_values = token_values(keep, embed_dim, 2000.0);
+    let output = memory
+        .update_tokens(
+            tensor3(&updated_values, [1, keep, embed_dim], &device),
+            indices(&sparse_indices, [1, keep], &device),
+            grid,
+        )
+        .expect("high-density sparse update");
+
+    let features = values3(output.features);
+    let observed = values2(output.observed);
+    let age = values2(output.age_frames);
+    assert_eq!(output.updated_tokens, keep);
+    assert_close(&features[0..embed_dim], &updated_values[0..embed_dim]);
+    assert_close(
+        &features[(keep - 1) * embed_dim..keep * embed_dim],
+        &updated_values[(keep - 1) * embed_dim..keep * embed_dim],
+    );
+    assert_close(
+        &features[keep * embed_dim..(keep + 1) * embed_dim],
+        &initial_values[keep * embed_dim..(keep + 1) * embed_dim],
+    );
+    assert!(observed.iter().all(|value| (*value - 1.0).abs() < 1.0e-5));
+    assert_eq!(age[0], 0.0);
+    assert_eq!(age[keep - 1], 0.0);
+    assert_eq!(age[keep], 1.0);
+}
+
+#[test]
 fn masked_and_encoder_output_conveniences_update_the_same_canvas() {
     let device = Default::default();
     let grid = TokenGridShape::new(1, 2, 2);
@@ -312,8 +395,55 @@ fn sparse_update_hot_path_has_no_host_readbacks_or_tensordata_construction() {
     assert!(!hot_path.contains(".scatter_nd("));
     assert!(hot_path.contains(".scatter("));
     assert!(hot_path.contains("feature_indices"));
-    assert!(hot_path.contains("observed_delta"));
-    assert!(hot_path.contains("age_delta"));
+    assert!(hot_path.contains("observed_values"));
+    assert!(hot_path.contains("age_values"));
+    assert!(hot_path.contains("IndexingUpdateOp::Add"));
+}
+
+#[test]
+fn dense_ordered_update_hot_path_avoids_sparse_gather_and_scatter() {
+    let source = include_str!("../src/feature_memory.rs");
+    let start = source
+        .find("pub fn update_dense_ordered_tokens")
+        .expect("update_dense_ordered_tokens");
+    let end = source[start..]
+        .find("pub fn reset")
+        .map(|offset| start + offset)
+        .expect("reset");
+    let hot_path = &source[start..end];
+
+    for marker in [
+        ".to_data(",
+        ".into_data(",
+        "TensorData::new",
+        ".gather(",
+        ".scatter(",
+        ".scatter_nd(",
+        "Tensor::<B, 2>::ones",
+        "Tensor::<B, 2>::zeros",
+    ] {
+        assert!(
+            !hot_path.contains(marker),
+            "dense ordered update hot path should not contain {marker}"
+        );
+    }
+    assert!(hot_path.contains("dense_metadata_values"));
+}
+
+#[test]
+fn tiled_sparse_assign_kernel_is_backend_gated_and_device_resident() {
+    let source = include_str!("../src/sparse_feature_memory.rs");
+    assert!(source.contains("copy_feature_memory_kernel"));
+    assert!(source.contains("sparse_assign_feature_memory_kernel"));
+    assert!(source.contains("sparse-feature-memory-wgpu"));
+    assert!(source.contains("sparse-feature-memory-cuda"));
+    assert!(source.contains("launch_unchecked::<R>"));
+    for marker in [".to_data(", ".into_data(", "TensorData::new", ".scatter("] {
+        assert!(
+            !source.contains(marker),
+            "backend sparse assign kernel should not use portable/host hot-path marker {marker}"
+        );
+    }
 }
 
 fn tensor3(
@@ -330,6 +460,14 @@ fn indices(
     device: &<B as burn::tensor::backend::BackendTypes>::Device,
 ) -> Tensor<B, 2, Int> {
     Tensor::<B, 2, Int>::from_data(TensorData::new(values.to_vec(), shape), device)
+}
+
+fn token_values(token_count: usize, embed_dim: usize, offset: f32) -> Vec<f32> {
+    (0..token_count)
+        .flat_map(|token| {
+            (0..embed_dim).map(move |channel| offset + token as f32 * 10.0 + channel as f32)
+        })
+        .collect()
 }
 
 fn values3(tensor: Tensor<B, 3>) -> Vec<f32> {
