@@ -119,14 +119,18 @@ turns frame ids into per-batch `FeatureFrameRequest`s, so a stream can emit
 low-res PCA every frame while only emitting full AnyUp/PCA every N frames. A
 payload can therefore contain neither optional display artifact, only low-res
 PCA, only high-res AnyUp/PCA, or both. The full legacy `process_next_ready`
-method still returns high-res AnyUp/PCA every processed batch.
+method still returns high-res AnyUp/PCA every processed batch. The default node
+schedule is low-res-only; set `high_res_pca_every` explicitly when a stream
+should spend stage-worker time on AnyUp.
 
 The Bevy viewer uses the same node separation but keeps the live input preview
 outside the stage worker. Source frames update the input panel immediately; the
-JEPA/AnyUp/PCA stage owns one active async task plus one latest pending frame.
-New camera frames overwrite that pending stage frame when the worker is busy, so
-slow high-res PCA cannot build an unbounded queue or drag the input panel down
-to stage FPS. Bevy metrics report input/low-res/high-res FPS and
+JEPA/cache/PCA low-res stage owns one active async task plus one latest pending
+frame. New camera frames overwrite that pending stage frame when the worker is
+busy, so low-res work cannot build an unbounded queue. High-res AnyUp is not
+run inline with this stage: scheduled high-res frames are copied from completed
+low-res cache snapshots into a separate AnyUp task, also with a latest-frame
+overwrite slot. Bevy metrics report input/low-res/high-res FPS and
 drop/overwrite counts alongside the raw `FeatureFrameMetrics`.
 For camera sources, pending frames stay as resized RGBA until the worker admits
 them. The worker then converts the admitted frame to a Burn tensor, computes
@@ -135,6 +139,70 @@ mask panel from the admitted sparse mask. The pipeline tests assert that this
 mask matches `encoded.token_indices` and the cache scatter positions. This makes
 the displayed mask a cache write map for the completed stage frame, not a
 speculative mask for a newer preview frame.
+High-motion patch-diff frames that select much of the token grid are promoted to
+a dense ordered mask. The feature memory then uses dense assignment rather than
+high-density sparse gather/scatter, and the encoder avoids exploring many
+near-dense sparse widths. The viewer default cutoff is `0.60`, based on the
+latest 256/512px WGPU viewer stability sweep: exact sparse widths are steady
+once shapes are warm, but live high-density jitter can still trigger first-use
+shape/autotune stalls, and dense full-grid inference is already competitive in
+that regime. The Bevy RGBA patch-diff node also uses this cutoff for a sampled
+high-motion precheck, so dense frames can bypass full per-patch scoring before
+they enter JEPA. By default the Bevy viewer uses bucketed sparse encode with
+exact cache writes: the displayed mask remains the cache-write mask, while the
+encoder context is widened to stable token buckets. This preserves every
+threshold-selected patch but adds real extra context tokens, so it is an
+approximate performance mode, not dummy padding. `--sparse-encode-mode exact`
+restores one-to-one encode/write masks for experiments. `--prewarm-shape-buckets`
+is enabled by default and runs those bucket widths during pipeline
+initialization, then resets encoder/cache/PCA state before admitting live
+frames.
+
+The current WGPU sparse-vs-dense crossover should be read at the full
+JEPA+cache level, not from cache writes alone. A focused tiny JEPA+cache sweep
+measured these mean latencies:
+
+| Input density | 256px JEPA+cache | 512px JEPA+cache |
+| ---: | ---: | ---: |
+| 50% | 1.986 ms | 3.260 ms |
+| 75% | 1.887 ms | 3.156 ms |
+| 85% | 2.061 ms | 3.218 ms |
+| 90% | 2.057 ms | 4.113 ms |
+| 95% | 1.969 ms | 3.289 ms |
+| 98% | 2.049 ms | 3.970 ms |
+| 100% dense ordered | 1.864 ms | 4.292 ms |
+
+The feature-cache-only sweep still favors dense ordered assignment for
+near-full writes, especially at 512px, while the full Bevy viewer path adds
+patch-diff, rolling PCA, display upload, and WGPU shape-specialization effects.
+That is why the raw bench still includes near-dense rows, but the production
+Bevy fallback is lower (`0.60`) for smoother live camera behavior.
+
+The headless Bevy FPS-stability sweep exercises camera-like RGBA frames through
+the real patch-diff path and writes CSV/Markdown artifacts:
+
+```sh
+BURN_JEPA_FPS_STABILITY_FRAMES=16 BURN_JEPA_FPS_STABILITY_WARMUP=4 \
+cargo run -p bevy_jepa --features sparse-patchify-wgpu --example fps_stability
+```
+
+Latest WGPU sparse-patchify run:
+
+| Mode | Resolution | Threshold | Dynamics | Write density | Encode density | Unique encode widths | p95 outer ms | Max outer ms |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| bucketed256 | 512 | 0.03 | static | 0.1% | 25.0% | 1 | 24.14 | 24.21 |
+| bucketed256 | 512 | 0.03 | stable_10 | 10.0% | 25.0% | 1 | 24.59 | 25.26 |
+| bucketed256 | 512 | 0.03 | stable_30 | 30.0% | 50.0% | 1 | 24.49 | 26.30 |
+| bucketed256 | 512 | 0.03 | stable_60 | 100.0% | 100.0% | 1 | 20.89 | 22.01 |
+| bucketed256 | 512 | 0.03 | jitter_60 | 100.0% | 100.0% | 1 | 22.80 | 25.21 |
+| bucketed256 | 512 | 0.03 | low_contrast_60 | 33.5% | 50.0% | 1 | 24.96 | 26.42 |
+| bucketed256 | 256 | 0.03 | low_contrast_60 | 34.5% | 50.0% | 1 | 9.34 | 9.46 |
+
+The diagnostic exact mode remains available, but it is no longer the Bevy
+default. In the same run, exact low-contrast variable-width masks at 256px had
+10 unique encode widths and one 1.665 s max frame from first-use WGPU shape
+specialization. Bucketed encode preserved the exact write mask, used one encode
+width, and kept the row below 9.5 ms.
 
 ## PCA
 
@@ -158,12 +226,12 @@ PCA basis. This update node is independent from `FeatureFrameSchedule`: a frame
 can update the rolling PCA basis without emitting either low-res or high-res
 display artifacts, and a display artifact can use the last stable basis without
 forcing an update. Updates consume a rolling device-resident window of
-low-resolution token-cache snapshots. `rolling_low_res_every(N)` uses
-`max(N, 2)` sampled frames by default and waits until that many frames are
-buffered before the first update, so live PCA is fit from more than one frame
-instead of a single cache snapshot. Each scheduled update runs several
-orthogonalized Oja/power-iteration steps, maintains a moving mean, nudges
-components toward the observed covariance directions, then normalizes the basis.
+low-resolution token-cache snapshots. The Bevy viewer default updates every
+processed low-res frame after a two-frame warmup while sampling from a 16-frame
+window, so live PCA is fit from temporal context instead of a single cache
+snapshot. Each scheduled update runs configurable orthogonalized Oja/power
+iterations, maintains a moving mean, nudges components toward the observed
+covariance directions, then normalizes the basis.
 Because the basis is rolled forward instead of recomputed from scratch, signs and
 axes remain stable across frames, which reduces PCA color flicker. This is meant
 for live visualization and domain adaptation of the display basis, not as a
@@ -171,8 +239,8 @@ replacement for an offline PCA fit on a large feature corpus.
 
 The legacy `update_pca_online` config flag maps to
 `FeaturePcaUpdateConfig::rolling_low_res_every(1)` for compatibility. New code
-should prefer the explicit `pca_update` config; even the compatibility mapping
-uses a two-frame sample window. The pipeline update path uses
+should prefer the explicit `pca_update` config when it needs independent cadence,
+window, warmup, and iteration control. The pipeline update path uses
 `InterframeJepaFeatureMemoryOutput::observed` as tensor-side weights, so
 never-observed cache slots do not bias the rolling PCA basis toward zero.
 
@@ -205,8 +273,8 @@ BURN_JEPA_HIGHRES_BENCH_LARGE=1 cargo bench --bench highres_anyup_pca_pipeline -
 
 The raw E2E matrix includes `viewer256_sparse100` and `viewer512_sparse100`
 rows for the V-JEPA 2.1 trained-resolution viewer paths. The Bevy app defaults
-to the 256x256 sparse-encoding path with a 16x16 token grid; 512x512 remains
-available as the larger 32x32-grid path. Compare these rows with the headless
+to the 512x512 sparse-encoding path with a 32x32 token grid; 256x256 remains
+available as the smaller 16x16-grid path. Compare these rows with the headless
 Bevy wrapper bench to separate shared pipeline cost from display tensor
 preparation:
 

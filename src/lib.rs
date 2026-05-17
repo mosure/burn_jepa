@@ -10,6 +10,7 @@ pub mod experiment;
 mod feature_memory;
 mod highres_pipeline;
 mod model;
+mod model_package;
 mod nodes;
 mod pca;
 mod pipeline;
@@ -27,6 +28,7 @@ mod temporal;
 mod tokens;
 pub mod training;
 mod ttt;
+pub mod viewer;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasm;
 
@@ -44,6 +46,7 @@ pub use burn_anyup::{
     AnyUp, AnyUpAttentionMode, AnyUpConfig, AnyUpImageContext, AnyUpImageGrid, AnyUpLoadOptions,
     AnyUpLoadReport,
 };
+pub use burn_store::ApplyResult as BurnStoreApplyResult;
 pub use config::{
     VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig, VJepaPreprocessConfig,
 };
@@ -85,6 +88,26 @@ pub use model::{
     SparsePredictorPlan, SparseVJepaForwardOutput, TokenSequencePosition, TransformerBlock,
     VJepa2_1Model, VJepaEncoder, VJepaEncoderOutput, VJepaMlp, VJepaPredictor,
     VJepaPredictorOutput, VJepaSelfAttention,
+};
+pub use model_package::{
+    BurnJepaModelBootstrapConfig, BurnJepaModelDeployBundleReport, BurnJepaModelPackageFiles,
+    BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, BurnpackPartEntry,
+    BurnpackPartsManifest, BurnpackPartsReport, DEFAULT_BURN_JEPA_MODEL_BASE_URL,
+    DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR, DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR,
+    DEFAULT_BURNPACK_SHARD_MAX_BYTES, apply_burnpack_parts, burnpack_dtype_counts,
+    burnpack_parts_dtype_counts, burnpack_parts_manifest_path, load_ttt_burnpack,
+    load_ttt_burnpack_parts, load_vjepa_burnpack, load_vjepa_burnpack_parts,
+    manifest_has_all_parts, module_dtype_counts, read_parts_manifest,
+    resolve_package_manifest_entry_path, resolve_part_entry_path, save_module_burnpack,
+    save_ttt_burnpack, save_vjepa_burnpack, write_burn_jepa_model_deploy_bundle,
+    write_burnpack_parts_for_browser, write_pipeline_package_manifest,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use model_package::{
+    burn_jepa_model_package_cache_complete, default_burn_jepa_model_cache_root,
+    default_burn_jepa_model_cache_root_with_config, resolve_or_bootstrap_burn_jepa_model_package,
+    resolve_or_bootstrap_burn_jepa_model_package_with_config,
+    resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress,
 };
 pub use nodes::{
     FnOutputNode, RgbaVideoInput, SparseJepaAutogazeSparsityConfig, SparseJepaInputNode,
@@ -132,20 +155,34 @@ pub use training::{
     BurnJepaTrainConfig, DenseJepaTrainingReport, DensePredictiveLoss, JepaDispatchBackend,
     JepaTrainBackend, LearningRateScheduleConfig, LearningRateScheduleStats, TrainModelConfig,
     TrainingAutogazeTokenSource, TrainingBatchingMode, TrainingImageTokenGrid, TrainingLoopConfig,
-    TrainingMaskConfig, TttBackpropMetrics, TttDistillationConfig, TttDistillationLoss,
-    TttDomainEvalMetric, TttEvalReport, TttLayerUtilizationMetric, TttRolloutMetrics,
-    TttRolloutReportMode, TttSequenceCurriculumConfig, TttSparsePatchifyTrainingBackend,
-    TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttStreamStepKind,
-    TttStreamTrainingConfig, TttStreamTrainingMetrics, TttTargetSupervisionMetrics,
-    TttTemporalDiagnosticMetrics, TttTemporalSegmentMetric, TttTemporalSegmentMetrics,
-    TttTrainingReport, TttUtilizationMetrics, VJepaTrainingBatch, center_prior_frame_tokens,
-    dense_predictive_loss, evaluate_ttt_distillation, evaluate_ttt_model_file, train_dense_jepa,
-    train_ttt_distillation,
+    TrainingMaskConfig, TttBackpropMetrics, TttDenseSampleMetrics, TttDenseSampleTrainingConfig,
+    TttDistillationConfig, TttDistillationLoss, TttDomainEvalMetric, TttEvalReport,
+    TttLayerUtilizationMetric, TttRolloutMetrics, TttRolloutReportMode,
+    TttSequenceCurriculumConfig, TttSparsePatchifyTrainingBackend, TttSparsePatchifyTrainingMode,
+    TttSparseRolloutMode, TttStreamStepKind, TttStreamTrainingConfig, TttStreamTrainingMetrics,
+    TttTargetSupervisionMetrics, TttTemporalDiagnosticMetrics, TttTemporalSegmentMetric,
+    TttTemporalSegmentMetrics, TttTrainingReport, TttUtilizationMetrics, VJepaTrainingBatch,
+    center_prior_frame_tokens, dense_predictive_loss, evaluate_ttt_distillation,
+    evaluate_ttt_model_file, train_dense_jepa, train_ttt_distillation,
 };
 pub use ttt::{
     TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttMemoryUpdateSource,
     TttState, TttStateResetMode, TttSupervisionMode, TttTargetMode, VJepaTttEncoder, VJepaTttLayer,
     VJepaTttLayerProbe, VJepaTttLayerProbeRecord, VJepaTttModel,
+};
+pub use viewer::{
+    DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CONTEXT_DENSITY,
+    DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE, DEFAULT_MIN_CONTEXT_DENSITY,
+    DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY, DEFAULT_PATCH_DIFF_QUALITY,
+    DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES,
+    DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
+    DEFAULT_SPARSE_MASK_BUCKET_TOKENS, FeatureFrameEncodeRoute, FeatureFrameSparseEncodeMode,
+    FeatureFrameSparseMasks, FeatureFrameViewerConfig, MIN_PIPELINE_IMAGE_SIZE,
+    PIPELINE_IMAGE_SIZE_MULTIPLE, RgbaPatchDiffFrameStats, bucket_sparse_mask, center_prior_mask,
+    finalize_patch_diff_mask, finalize_patch_diff_masks, patch_diff_can_use_dense_fast_path,
+    patch_diff_dense_fallback, patch_diff_sampled_dense_fast_path_from_rgba,
+    patch_diff_scores_from_rgba, patch_diff_sparsity_config, patch_diff_threshold_from_quality,
+    rgba_patch_diff_frame_stats, shape_prewarm_masks,
 };
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;

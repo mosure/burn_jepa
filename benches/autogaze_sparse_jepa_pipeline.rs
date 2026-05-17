@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda")),
+    allow(dead_code, unused)
+)]
+
 use std::{
     env, fs,
     hint::black_box,
@@ -29,11 +34,6 @@ use burn_jepa::{
     TemporalSparseJepaStream, TemporalSparseJepaStreamOutput, VJepa2_1Model, VJepaConfig,
     VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig, autogaze_image_token_grid,
 };
-
-#[cfg(not(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda")))]
-compile_error!(
-    "autogaze_sparse_jepa_pipeline requires sparse-patchify-wgpu or sparse-patchify-cuda"
-);
 
 trait SparsePatchifyBenchBackend: Backend {
     const JEPA_BACKEND_LABEL: &'static str;
@@ -394,6 +394,7 @@ fn append_backend_rows(rows: &mut Vec<BenchRow>, backend_rows: Option<Vec<BenchR
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_autogaze_backend_rows<B>(
     rows: &mut Vec<BenchRow>,
     autogaze_backend: &'static str,
@@ -408,6 +409,23 @@ fn append_autogaze_backend_rows<B>(
     B: Backend,
     B::Device: Clone,
 {
+    #[cfg(not(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda")))]
+    {
+        eprintln!(
+            "skipping {autogaze_backend}: enable sparse-patchify-wgpu or sparse-patchify-cuda to run autogaze_sparse_jepa_pipeline"
+        );
+        let _ = (
+            rows,
+            autogaze_device,
+            jepa_backend_filter,
+            resolutions,
+            densities,
+            bench_config,
+            warmups,
+            reps,
+        );
+    }
+
     #[cfg(feature = "sparse-patchify-wgpu")]
     if backend_enabled(
         jepa_backend_filter,

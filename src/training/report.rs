@@ -77,6 +77,7 @@ pub struct TttStreamTrainingMetrics {
     pub state_decay: f64,
     pub state_l2_weight: f64,
     pub update_l2_weight: f64,
+    pub state_regularization_width: usize,
     pub active_streams: usize,
     pub max_active_streams: usize,
     pub packed_batches: usize,
@@ -93,13 +94,21 @@ pub struct TttStreamTrainingMetrics {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TttStageMetrics {
+    pub data_ms: u128,
+    pub prefetch_wait_ms: u128,
+    pub host_to_device_ms: u128,
     pub mask_ms: u128,
+    pub stream_state_ms: u128,
     pub teacher_forward_ms: u128,
+    pub teacher_cache_key_ms: u128,
+    pub teacher_cache_evictions: usize,
     pub student_forward_ms: u128,
     pub loss_ms: u128,
+    pub loss_read_ms: u128,
     pub backward_ms: u128,
     pub optimizer_ms: u128,
     pub backward_optim_ms: u128,
+    pub report_ms: u128,
     pub teacher_cache_hits: usize,
     pub teacher_cache_misses: usize,
 }
@@ -207,6 +216,15 @@ pub struct TttRolloutMetrics {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct TttDenseSampleMetrics {
+    pub enabled: bool,
+    pub warmup_steps: usize,
+    pub interval_steps: usize,
+    pub dense_steps: usize,
+    pub sparse_steps: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct TttTrainingReport {
     pub steps: usize,
     pub samples: usize,
@@ -217,6 +235,7 @@ pub struct TttTrainingReport {
     pub memory: TttMemoryMetrics,
     pub mask: Option<TttMaskMetrics>,
     pub rollout: TttRolloutMetrics,
+    pub dense_samples: TttDenseSampleMetrics,
     pub backprop: TttBackpropMetrics,
     pub stream: TttStreamTrainingMetrics,
     pub lr_schedule: LearningRateScheduleConfig,

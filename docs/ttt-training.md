@@ -137,6 +137,7 @@ reset_interval_steps = 4
 state_decay = 0.97
 state_l2_weight = 0.000001
 update_l2_weight = 0.00001
+state_regularization_width = 64
 
 [training.stream.curriculum]
 enabled = true
@@ -170,7 +171,10 @@ unrelated windows cannot silently share state.
 carried fast weights remain device tensors, but the previous window graph is not
 retained. `state_decay` applies a scheduled stability decay after each step,
 while `state_l2_weight` and `update_l2_weight` add device-side regularization
-terms to the training loss.
+terms to the training loss. `state_regularization_width = 0` regularizes the
+full fast-weight matrix; production CUDA configs use a sampled width of `64` so
+long-horizon stabilization does not add a full extra backward path through every
+`768 x 768` fast-weight matrix on each step.
 
 Every stream window still receives a normal optimizer step. The curriculum does
 not run hidden no-grad warmup rollouts: steps with a fresh/reset state train the
@@ -305,6 +309,23 @@ controls whether the student rollout itself is dense or sparse:
 - `target_mask`: force target-mask sparse rollout; this requires
   `training.mask` and is incompatible with predictor auxiliary loss.
 
+Use `training.dense_samples` when a sparse stream run should also receive
+all-token TTT distillation against the 3D/tubelet teacher:
+
+```toml
+[training.dense_samples]
+enabled = true
+warmup_steps = 2
+interval_steps = 4
+```
+
+Dense-sample steps ignore `training.mask`, run the dense single-frame rollout,
+and compute feature distillation over every token. Other steps keep the normal
+configured sparse rollout, including frozen sparse patchify when available.
+This is intentionally separate from `training.mask.kind = "full_frame"`:
+`full_frame` still creates a JEPA holdout target mask, while dense-sample steps
+train true full-token TTT behavior.
+
 Set
 `loss.predictor_loss_weight > 0` to add the normal sparse predictor auxiliary
 loss. `training.sparse_patchify_training` controls the patch-embed boundary used
@@ -326,9 +347,10 @@ the frozen patch embedding does not receive gradients. Training reports include
 actually used.
 
 Training reports include `rollout.mode`, `rollout.student_tokens`,
-`rollout.student_token_density`, and `rollout.autodiff_sparse_patchify` so
-experiment artifacts show whether a run actually trained dense rollout,
-target-mask sparse rollout, or frozen sparse patchify rollout. Set
+`rollout.student_token_density`, `rollout.autodiff_sparse_patchify`, and
+`dense_samples.{dense_steps,sparse_steps}` so experiment artifacts show whether
+a run actually trained dense rollout, target-mask sparse rollout, mixed dense
+samples, or frozen sparse patchify rollout. Set
 `training.loss_trace_interval = 0` for throughput-oriented GPU runs to avoid the
 per-step scalar loss readback; the final loss is still reported, but `loss_trace`
 is left empty.
@@ -407,9 +429,14 @@ full final-feature passthrough for the last `ttt.hybrid_final_steps`. Eval and
 model-file evaluation force full-encoder free-run rollout so layer-local
 training speedups do not hide deploy-time quality regressions.
 
-Set `training.cache_teacher_tokens = true` to cache detached final and
-layer-local teacher features inside a run. Reports include `teacher_cache_hits` and
-`teacher_cache_misses` in train/eval stage metrics.
+Set `training.prefetch_batches = true` for manifest runs to decode the next CPU
+batch while the current GPU step is executing. The training report separates
+`data_ms`, `prefetch_wait_ms`, and `host_to_device_ms` so genuine runtime gaps do
+not get misattributed to JEPA compute. `training.cache_teacher_tokens = true`
+caches detached final and layer-local teacher features inside a run, bounded by
+`training.teacher_cache_max_entries`; leave it disabled for one-pass production
+training unless repeated windows actually produce cache hits. Reports include
+cache hit/miss/eviction counts in train/eval stage metrics.
 
 ## TTT Layer Placement
 

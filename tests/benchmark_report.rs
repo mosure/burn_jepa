@@ -107,12 +107,19 @@ fn cuda_benchmark_path_documents_runtime_and_rejects_header_only_csv() {
     assert!(runbook.contains("probe\nfailure details"));
     assert!(runbook.contains("CUDA runtime cannot open a device without NVIDIA character devices"));
     assert!(runbook.contains("The CSV has data rows, not just the header."));
+    assert!(
+        runbook.contains("cargo check --no-default-features --features cuda,sparse-patchify-cuda")
+    );
     assert!(runbook.contains("BURN_JEPA_PIPELINE_BENCH_DENSE_PATCHIFY=0"));
     assert!(runbook.contains("autogaze_trace_ms` is `0.000`"));
 
     let workflow_template = include_str!("../docs/workflows/cuda-benchmark.yml");
     assert!(workflow_template.contains("BURN_JEPA_PIPELINE_AUTOGAZE_BACKENDS: cuda"));
     assert!(workflow_template.contains("BURN_JEPA_PIPELINE_JEPA_BACKENDS: sparse-patchify-cuda"));
+    assert!(
+        workflow_template
+            .contains("cargo check --no-default-features --features cuda,sparse-patchify-cuda")
+    );
     assert!(workflow_template.contains("BURN_JEPA_PIPELINE_BENCH_TRACE"));
     assert!(workflow_template.contains("CUDA benchmark produced no data rows"));
     assert!(workflow_template.contains("if [ \"$rows\" -le 1 ]; then"));
@@ -291,6 +298,7 @@ fn feature_memory_benchmark_covers_sparse_update_density_matrix() {
     assert!(bench.contains("vjepa384_b1"));
     assert!(bench.contains("label: \"1pct\""));
     assert!(bench.contains("label: \"50pct\""));
+    assert!(bench.contains("label: \"30pct\""));
     assert!(bench.contains("label: \"100pct\""));
     assert!(
         bench.contains("feature_memory_cached_update_"),
@@ -301,12 +309,25 @@ fn feature_memory_benchmark_covers_sparse_update_density_matrix() {
         "feature memory benches should expose first-update plan build overhead"
     );
     assert!(
+        bench.contains("feature_memory_dense_ordered_update_"),
+        "feature memory benches should compare high-density sparse updates to the dense ordered path"
+    );
+    assert!(
         bench.contains("feature_memory_row_reset_"),
         "feature memory benches should measure packed-stream row resets"
     );
     assert!(
+        bench.contains("feature_memory_tiled_sparse_assign_wgpu")
+            && bench.contains("feature_memory_tiled_sparse_assign_cuda"),
+        "feature memory benches should include backend-specific tiled sparse assignment lanes"
+    );
+    assert!(
         compact.contains(".update_tokens(black_box(tokens),black_box(indices),"),
         "bench should exercise sparse feature update with caller-owned sparse tokens and indices"
+    );
+    assert!(
+        compact.contains(".update_dense_ordered_tokens(black_box(tokens),case.grid)"),
+        "bench should exercise the full-token dense ordered cache update path"
     );
     assert!(
         compact.contains("Throughput::Elements((case.batch*keep)asu64)"),
@@ -324,10 +345,13 @@ fn feature_memory_benchmark_covers_sparse_update_density_matrix() {
     assert!(docs.contains("InterframeJepaFeatureMemory"));
     assert!(docs.contains("features`, `observed`, and"));
     assert!(docs.contains("scatter(..., Add)"));
+    assert!(docs.contains("tiled sparse assignment"));
     assert!(docs.contains("cargo bench --bench feature_memory"));
 
     let manifest = include_str!("../Cargo.toml");
     assert!(manifest.contains("name = \"feature_memory\""));
+    assert!(manifest.contains("sparse-feature-memory-wgpu"));
+    assert!(manifest.contains("sparse-feature-memory-cuda"));
 }
 
 #[test]
@@ -350,6 +374,10 @@ fn highres_anyup_pca_pipeline_has_modular_bench_and_docs() {
     assert!(
         bench.contains("highres_sparse_jepa_anyup_pca_e2e_"),
         "high-res bench should include an end-to-end sparse JEPA path"
+    );
+    assert!(
+        bench.contains("highres_jepa_cache_density_sweep_") && bench.contains("0.98"),
+        "high-res bench should measure the near-dense JEPA cache crossover"
     );
     assert!(
         bench.contains("highres_sparse_patchify_jepa_anyup_pca_e2e_wgpu"),
@@ -415,15 +443,23 @@ fn highres_anyup_pca_pipeline_has_modular_bench_and_docs() {
 #[test]
 fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     let viewer_bench = include_str!("../crates/bevy_jepa/benches/viewer_pipeline.rs");
+    let fps_stability = include_str!("../crates/bevy_jepa/examples/fps_stability.rs");
     let viewer_config = include_str!("../crates/bevy_jepa/src/config.rs");
     let viewer_lib = include_str!("../crates/bevy_jepa/src/lib.rs");
+    let viewer_mask = include_str!("../crates/bevy_jepa/src/mask.rs");
+    let viewer_metrics = include_str!("../crates/bevy_jepa/src/metrics.rs");
     let viewer_platform = include_str!("../crates/bevy_jepa/src/platform.rs");
     let viewer_docs = include_str!("../crates/bevy_jepa/README.md");
+    let viewer_policy = include_str!("../src/viewer.rs");
     let raw_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
     let highres_docs = include_str!("../docs/highres-anyup-pca-pipeline.md");
+    let preprint = include_str!("../docs/papers/vjepa21_ttt_sparse_temporal_preprint.tex");
     let manifest = include_str!("../crates/bevy_jepa/Cargo.toml");
     let pca = include_str!("../src/pca.rs");
     let pca_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
+    let workflow = include_str!("../.github/workflows/test.yml");
+    let safetensors = include_str!("../src/safetensors_io.rs");
+    let experiment = include_str!("../src/experiment.rs");
 
     assert!(viewer_bench.contains("bevy_jepa_viewer_pipeline_wgpu"));
     assert!(viewer_bench.contains("low_res_cache_update"));
@@ -431,6 +467,11 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(viewer_bench.contains("full_anyup_decode"));
     assert!(viewer_bench.contains("display_upload_gpu"));
     assert!(viewer_bench.contains("display_upload_cpu"));
+    assert!(viewer_bench.contains("patch_diff_t003"));
+    assert!(viewer_bench.contains("patch_diff_t000"));
+    assert!(viewer_bench.contains("patch_diff_threshold: 0.03"));
+    assert!(viewer_bench.contains("patch_diff_threshold: 0.0"));
+    assert!(viewer_bench.contains("sync_measurements: true"));
     assert!(viewer_bench.contains("step_with_display_request"));
     assert!(viewer_bench.contains("step_with_stage_request"));
     assert!(viewer_bench.contains("aligns_with_stage_metrics"));
@@ -439,10 +480,25 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
         !viewer_bench.contains("BevyJepaMaskSource::Autogaze"),
         "viewer bench must not time the reserved AutoGaze mode unless it is backed by a real model node"
     );
-    assert!(viewer_bench.contains("{mask_source}_{image_size}_{name}"));
-    assert!(viewer_lib.contains("pub stage_metrics: FeatureFrameMetrics"));
-    assert!(viewer_lib.contains("pub encode_path: FeatureFrameEncodePath"));
-    assert!(viewer_lib.contains("pub fn aligns_with_stage_metrics(&self) -> bool"));
+    assert!(viewer_bench.contains("mask_case.label"));
+    assert!(viewer_policy.contains("DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY"));
+    assert!(viewer_policy.contains("pub struct FeatureFrameViewerConfig"));
+    assert!(viewer_policy.contains("pub fn patch_diff_dense_fallback"));
+    assert!(viewer_policy.contains("pub fn bucket_sparse_mask"));
+    assert!(viewer_policy.contains("pub fn finalize_patch_diff_masks"));
+    assert!(viewer_policy.contains("pub fn patch_diff_sampled_dense_fast_path_from_rgba"));
+    assert!(viewer_policy.contains("pub fn patch_diff_scores_from_rgba"));
+    assert!(viewer_policy.contains("pub fn patch_diff_can_use_dense_fast_path"));
+    assert!(viewer_mask.contains("patch_diff_sampled_dense_fast_path_from_rgba"));
+    assert!(viewer_mask.contains("patch_diff_scores_from_rgba"));
+    assert!(viewer_mask.contains("patch_diff_can_use_dense_fast_path"));
+    assert!(viewer_mask.contains("patch_diff_dense_fallback_density"));
+    assert!(!viewer_mask.contains("fn patch_diff_dense_fallback"));
+    assert!(!viewer_mask.contains("fn bucket_sparse_mask"));
+    assert!(viewer_lib.contains("DEFAULT_SPARSE_MASK_BUCKET_TOKENS"));
+    assert!(viewer_metrics.contains("pub stage_metrics: FeatureFrameMetrics"));
+    assert!(viewer_metrics.contains("pub encode_path: FeatureFrameEncodePath"));
+    assert!(viewer_metrics.contains("pub fn aligns_with_stage_metrics(&self) -> bool"));
     assert!(viewer_lib.contains("pub struct BevyJepaHeadlessPipeline"));
     assert!(viewer_lib.contains("pub fn step_stage_only(&mut self)"));
     assert!(viewer_lib.contains("pub fn step_with_display_panels(&mut self)"));
@@ -464,27 +520,56 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(viewer_platform.contains("frame_input"));
     assert!(viewer_platform.contains("native_camera_thread_with_request"));
     assert!(viewer_config.contains("pub enum BevyJepaFrameSource"));
-    assert!(viewer_config.contains("pub enum BevyJepaEncodePath"));
-    assert!(viewer_config.contains("MIN_PIPELINE_IMAGE_SIZE: usize = 256"));
-    assert!(viewer_config.contains("DEFAULT_IMAGE_SIZE: usize = 256"));
-    assert!(viewer_config.contains("DEFAULT_HIGH_RES_PCA_EVERY: u64 = 8"));
-    assert!(viewer_config.contains("DEFAULT_PATCH_DIFF_QUALITY: f32 = 0.85"));
-    assert!(viewer_config.contains("DEFAULT_MIN_CONTEXT_DENSITY: f32 = 0.0"));
-    assert!(viewer_config.contains("pub fn pipeline_image_size(&self) -> usize"));
-    assert!(viewer_config.contains("pub fn patch_diff_quality(&self) -> f32"));
+    assert!(viewer_config.contains("pub type BevyJepaEncodePath = FeatureFrameEncodeRoute"));
     assert!(
-        viewer_config
+        viewer_config.contains("pub type BevyJepaSparseEncodeMode = FeatureFrameSparseEncodeMode")
+    );
+    assert!(viewer_config.contains("pub pipeline: FeatureFrameViewerConfig"));
+    assert!(viewer_config.contains("impl Deref for BevyJepaConfig"));
+    assert!(viewer_policy.contains("MIN_PIPELINE_IMAGE_SIZE: usize = 256"));
+    assert!(viewer_policy.contains("DEFAULT_IMAGE_SIZE: usize = 512"));
+    assert!(viewer_config.contains("burn-jepa-production-final-256"));
+    assert!(viewer_config.contains("~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"));
+    assert!(viewer_policy.contains("DEFAULT_HIGH_RES_PCA_EVERY: u64 = 0"));
+    assert!(viewer_policy.contains("DEFAULT_PCA_UPDATE_EVERY: u64 = 1"));
+    assert!(viewer_policy.contains("DEFAULT_PCA_SAMPLE_WINDOW_FRAMES: usize = 16"));
+    assert!(viewer_policy.contains("DEFAULT_PCA_MIN_SAMPLE_FRAMES: usize = 2"));
+    assert!(viewer_policy.contains("DEFAULT_PATCH_DIFF_QUALITY: f32 = 0.97"));
+    assert!(viewer_policy.contains("DEFAULT_SPARSE_MASK_BUCKET_TOKENS: usize = 256"));
+    assert!(viewer_policy.contains("DEFAULT_MIN_CONTEXT_DENSITY: f32 = 0.0"));
+    assert!(viewer_policy.contains("pub enum FeatureFrameSparseEncodeMode"));
+    assert!(viewer_policy.contains("Exact"));
+    assert!(viewer_policy.contains("pub fn pipeline_image_size(&self) -> usize"));
+    assert!(viewer_policy.contains("pub fn patch_diff_quality(&self) -> f32"));
+    assert!(
+        viewer_policy
             .contains("DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 1.0 - DEFAULT_PATCH_DIFF_QUALITY")
     );
     assert!(viewer_lib.contains("DEFAULT_PATCH_DIFF_QUALITY"));
+    assert!(viewer_policy.contains("DEFAULT_PREWARM_SHAPE_BUCKETS: bool = true"));
+    assert!(viewer_lib.contains("prewarm_feature_frame_shapes"));
+    assert!(fps_stability.contains("fps-stability-summary.csv"));
+    assert!(fps_stability.contains("unique_encode_widths"));
+    assert!(fps_stability.contains("p95_outer_ms"));
+    assert!(manifest.contains("default = []"));
     assert!(manifest.contains("sparse-patchify-wgpu = [\"burn_jepa/sparse-patchify-wgpu\"]"));
     assert!(
-        viewer_bench.contains("const VIEWER_IMAGE_SIZES: [usize; 2] = [DEFAULT_IMAGE_SIZE, 512]")
+        viewer_bench.contains("const VIEWER_IMAGE_SIZES: [usize; 2] = [256, DEFAULT_IMAGE_SIZE]")
     );
     assert!(viewer_docs.contains("--source camera"));
-    assert!(viewer_docs.contains("quality `0.85`, threshold `0.15`"));
+    assert!(viewer_docs.contains("default `--high-res-pca-every 0`"));
+    assert!(viewer_docs.contains("separate AnyUp worker"));
+    assert!(viewer_docs.contains("latest-frame overwrite slot"));
+    assert!(viewer_docs.contains("--pca-update-every 1"));
+    assert!(viewer_docs.contains("16-frame sample window"));
+    assert!(viewer_docs.contains("quality `0.97`, threshold `0.03`"));
     assert!(viewer_docs.contains("quality value only changes the threshold"));
-    assert!(viewer_docs.contains("fixed 85%"));
+    assert!(viewer_docs.contains("patch-diff-dense-fallback-density 0.60"));
+    assert!(viewer_docs.contains("shape-stable bucketed sparse encode"));
+    assert!(viewer_docs.contains("bucketed-context"));
+    assert!(viewer_docs.contains("FeatureFrameViewerConfig"));
+    assert!(viewer_docs.contains("fixed 97%"));
+    assert!(viewer_docs.contains("uniform global RGB/luma shifts"));
     assert!(
         raw_bench.contains("viewer256_sparse100") && raw_bench.contains("viewer512_sparse100"),
         "raw high-res E2E bench should include both supported V-JEPA 2.1 viewer resolutions"
@@ -510,6 +595,21 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
             && highres_docs.contains("viewer512_sparse100"),
         "docs should tell users how to compare Bevy wrapper and raw pipeline rows"
     );
+    assert!(preprint.contains("\\usepackage{pgfplots}"));
+    assert!(preprint.contains("\\label{fig:sparsity-latency}"));
+    assert!(preprint.contains("(85,3.218)"));
+    assert!(preprint.contains("100\\% point is the dense ordered baseline"));
+    assert!(workflow.contains("cargo fmt --all -- --check"));
+    assert!(workflow.contains("cargo test --workspace --locked"));
+    assert!(workflow.contains("cargo test --locked --test benchmark_report"));
+    assert!(workflow.contains("cargo package -p burn_anyup --locked"));
+    assert!(workflow.contains("cargo check -p bevy_jepa --locked --features sparse-patchify-wgpu"));
+    for source in [viewer_config, safetensors, experiment] {
+        assert!(
+            !source.contains("/home/mosure"),
+            "source defaults must not bake in machine-specific absolute cache paths"
+        );
+    }
     assert!(manifest.contains("name = \"viewer_pipeline\""));
 }
 
@@ -549,6 +649,10 @@ fn e2e_benchmark_reuses_library_projection_and_patchify_core() {
     assert!(
         bench.contains("BURN_JEPA_PIPELINE_JEPA_BACKENDS"),
         "E2E bench should allow selecting the sparse JEPA backend independently"
+    );
+    assert!(
+        !bench.contains("compile_error!"),
+        "E2E bench should skip cleanly when all-targets checks compile it without sparse-patchify features"
     );
     assert!(
         autogaze.contains("autogaze_sparse_top_k_for_context"),

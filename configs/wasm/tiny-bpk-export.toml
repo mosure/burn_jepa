@@ -1,0 +1,8 @@
+[model]
+output_dir = "target/burn-jepa-wasm-model"
+save_model = true
+
+[training]
+backend = "nd_array"
+max_steps = 1
+batch_size = 1

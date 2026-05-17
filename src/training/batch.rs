@@ -1,11 +1,13 @@
 use super::config::TrainingBatchingMode;
 use crate::{
     JepaDataset, JepaDatasetConfig, JepaSampleMetadata, JepaTensorBatch, VJepaConfig,
-    load_jepa_tensor_batch,
+    dataset::{JepaCpuTensorBatch, jepa_tensor_batch_from_cpu, load_jepa_cpu_tensor_batch},
+    dataset_from_config,
 };
-use anyhow::Result;
-use burn::tensor::Tensor;
+use anyhow::{Context, Result, ensure};
 use burn::tensor::backend::Backend;
+use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
+use std::thread::{self, JoinHandle};
 
 pub(super) fn load_training_batch<B: Backend>(
     dataset: &dyn JepaDataset,
@@ -96,21 +98,155 @@ fn load_training_batch_from_indices<B: Backend>(
     device: &B::Device,
     indices: &[usize],
 ) -> Result<JepaTensorBatch<B>> {
-    let mut students = Vec::with_capacity(indices.len());
-    let mut teachers = Vec::with_capacity(indices.len());
+    let batch =
+        load_training_cpu_batch_from_indices(dataset, dataset_config, model_config, indices)?;
+    Ok(jepa_tensor_batch_from_cpu(batch, device))
+}
+
+pub(super) fn materialize_training_batch<B: Backend>(
+    batch: JepaCpuTensorBatch,
+    device: &B::Device,
+) -> JepaTensorBatch<B> {
+    jepa_tensor_batch_from_cpu(batch, device)
+}
+
+pub(super) fn load_training_cpu_batch_from_indices(
+    dataset: &dyn JepaDataset,
+    dataset_config: &JepaDatasetConfig,
+    model_config: &VJepaConfig,
+    indices: &[usize],
+) -> Result<JepaCpuTensorBatch> {
+    ensure!(
+        !indices.is_empty(),
+        "training batch indices must be non-empty"
+    );
+    let mut student_values = Vec::new();
+    let mut teacher_values = None::<Vec<f32>>;
     let mut metadata = Vec::with_capacity(indices.len());
+    let mut shape = None::<[usize; 5]>;
     for &index in indices {
         let sample = dataset.sample(index)?;
-        let batch = load_jepa_tensor_batch::<B>(&sample, dataset_config, model_config, device)?;
-        students.push(batch.student);
-        teachers.push(batch.teacher);
+        let batch = load_jepa_cpu_tensor_batch(&sample, dataset_config, model_config)?;
+        let sample_shape = batch.shape;
+        ensure!(
+            sample_shape[0] == 1,
+            "dataset sample loader must produce single-sample CPU batches"
+        );
+        if let Some(shape) = &shape {
+            ensure!(
+                shape[1..] == sample_shape[1..],
+                "all training batch samples must have matching C/T/H/W shapes"
+            );
+        } else {
+            shape = Some(sample_shape);
+        }
+        if let Some(sample_teacher) = batch.teacher_values {
+            if teacher_values.is_none() {
+                teacher_values = Some(student_values.clone());
+            }
+            teacher_values
+                .as_mut()
+                .expect("teacher values initialized")
+                .extend(sample_teacher);
+        } else if let Some(teacher_values) = teacher_values.as_mut() {
+            teacher_values.extend_from_slice(&batch.student_values);
+        }
+        student_values.extend(batch.student_values);
         metadata.extend(batch.metadata);
     }
-    Ok(JepaTensorBatch {
-        student: Tensor::cat(students, 0),
-        teacher: Tensor::cat(teachers, 0),
+    let mut shape = shape.context("training batch must contain at least one sample")?;
+    shape[0] = indices.len();
+    Ok(JepaCpuTensorBatch {
+        student_values,
+        teacher_values,
+        shape,
         metadata,
     })
+}
+
+pub(super) fn cpu_batch_from_planner(
+    planner: &TrainingBatchPlanner,
+    dataset: &dyn JepaDataset,
+    dataset_config: &JepaDatasetConfig,
+    model_config: &VJepaConfig,
+    start_index: usize,
+    batch_size: usize,
+) -> Result<JepaCpuTensorBatch> {
+    let indices = planner.indices(dataset, start_index, batch_size)?;
+    load_training_cpu_batch_from_indices(dataset, dataset_config, model_config, &indices)
+}
+
+pub(super) struct TrainingBatchPrefetcher {
+    request_tx: SyncSender<Option<usize>>,
+    response_rx: Receiver<Result<JepaCpuTensorBatch>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TrainingBatchPrefetcher {
+    pub(super) fn new(
+        dataset_config: JepaDatasetConfig,
+        model_config: VJepaConfig,
+        batching: TrainingBatchingMode,
+        batch_size: usize,
+    ) -> Result<Self> {
+        let (request_tx, request_rx) = sync_channel::<Option<usize>>(1);
+        let (response_tx, response_rx) = channel::<Result<JepaCpuTensorBatch>>();
+        let handle = thread::Builder::new()
+            .name("burn-jepa-batch-prefetch".to_string())
+            .spawn(move || {
+                let init = dataset_from_config(&dataset_config, true).and_then(|dataset| {
+                    let planner = TrainingBatchPlanner::new(dataset.as_ref(), batching)?;
+                    Ok((dataset, planner))
+                });
+                let (dataset, planner) = match init {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = response_tx.send(Err(error));
+                        return;
+                    }
+                };
+                while let Ok(Some(start_index)) = request_rx.recv() {
+                    let batch = cpu_batch_from_planner(
+                        &planner,
+                        dataset.as_ref(),
+                        &dataset_config,
+                        &model_config,
+                        start_index,
+                        batch_size,
+                    );
+                    if response_tx.send(batch).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawn JEPA training batch prefetch thread")?;
+        Ok(Self {
+            request_tx,
+            response_rx,
+            handle: Some(handle),
+        })
+    }
+
+    pub(super) fn request(&self, start_index: usize) -> Result<()> {
+        self.request_tx
+            .send(Some(start_index))
+            .context("request prefetched JEPA training batch")
+    }
+
+    pub(super) fn recv(&self) -> Result<JepaCpuTensorBatch> {
+        self.response_rx
+            .recv()
+            .context("receive prefetched JEPA training batch")?
+    }
+}
+
+impl Drop for TrainingBatchPrefetcher {
+    fn drop(&mut self) {
+        let _ = self.request_tx.send(None);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn sample_indices(

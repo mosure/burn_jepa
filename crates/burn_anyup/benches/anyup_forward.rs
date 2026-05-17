@@ -848,22 +848,18 @@ impl AnyUpBenchConfig {
 
 #[cfg(feature = "ndarray")]
 fn anyup_forward_ndarray(c: &mut Criterion) {
-    bench_anyup_forward::<burn::backend::NdArray<f32>, _>(c, "ndarray", || Default::default());
-    bench_anyup_attention::<burn::backend::NdArray<f32>, _>(c, "ndarray", || Default::default());
-    bench_anyup_stages::<burn::backend::NdArray<f32>, _>(c, "ndarray", || Default::default());
-    bench_anyup_upsample_parts::<burn::backend::NdArray<f32>, _>(c, "ndarray", || {
-        Default::default()
-    });
-    bench_anyup_context::<burn::backend::NdArray<f32>, _>(c, "ndarray", || Default::default());
-    bench_anyup_sparse_context::<burn::backend::NdArray<f32>, _>(c, "ndarray", || {
-        Default::default()
-    });
-    bench_anyup_sparse_low_feature_context::<burn::backend::NdArray<f32>, _>(c, "ndarray", || {
-        Default::default()
-    });
-    bench_anyup_highres_update::<burn::backend::NdArray<f32>, _>(c, "ndarray", || {
-        Default::default()
-    });
+    bench_anyup_forward::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
+    bench_anyup_attention::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
+    bench_anyup_stages::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
+    bench_anyup_upsample_parts::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
+    bench_anyup_context::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
+    bench_anyup_sparse_context::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
+    bench_anyup_sparse_low_feature_context::<burn::backend::NdArray<f32>, _>(
+        c,
+        "ndarray",
+        Default::default,
+    );
+    bench_anyup_highres_update::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
 }
 
 #[cfg(not(feature = "ndarray"))]
@@ -871,22 +867,18 @@ fn anyup_forward_ndarray(_c: &mut Criterion) {}
 
 #[cfg(feature = "flex")]
 fn anyup_forward_flex(c: &mut Criterion) {
-    bench_anyup_forward::<burn::backend::Flex<f32, i32>, _>(c, "flex", || Default::default());
-    bench_anyup_attention::<burn::backend::Flex<f32, i32>, _>(c, "flex", || Default::default());
-    bench_anyup_stages::<burn::backend::Flex<f32, i32>, _>(c, "flex", || Default::default());
-    bench_anyup_upsample_parts::<burn::backend::Flex<f32, i32>, _>(c, "flex", || {
-        Default::default()
-    });
-    bench_anyup_context::<burn::backend::Flex<f32, i32>, _>(c, "flex", || Default::default());
-    bench_anyup_sparse_context::<burn::backend::Flex<f32, i32>, _>(c, "flex", || {
-        Default::default()
-    });
-    bench_anyup_sparse_low_feature_context::<burn::backend::Flex<f32, i32>, _>(c, "flex", || {
-        Default::default()
-    });
-    bench_anyup_highres_update::<burn::backend::Flex<f32, i32>, _>(c, "flex", || {
-        Default::default()
-    });
+    bench_anyup_forward::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
+    bench_anyup_attention::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
+    bench_anyup_stages::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
+    bench_anyup_upsample_parts::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
+    bench_anyup_context::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
+    bench_anyup_sparse_context::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
+    bench_anyup_sparse_low_feature_context::<burn::backend::Flex<f32, i32>, _>(
+        c,
+        "flex",
+        Default::default,
+    );
+    bench_anyup_highres_update::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
 }
 
 #[cfg(not(feature = "flex"))]
@@ -925,24 +917,18 @@ fn anyup_forward_dispatch_flex(_c: &mut Criterion) {}
 
 #[cfg(feature = "webgpu")]
 fn anyup_forward_webgpu(c: &mut Criterion) {
-    bench_anyup_forward::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", || Default::default());
-    bench_anyup_attention::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", || Default::default());
-    bench_anyup_stages::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", || Default::default());
-    bench_anyup_upsample_parts::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", || {
-        Default::default()
-    });
-    bench_anyup_context::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", || Default::default());
-    bench_anyup_sparse_context::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", || {
-        Default::default()
-    });
+    bench_anyup_forward::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", Default::default);
+    bench_anyup_attention::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", Default::default);
+    bench_anyup_stages::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", Default::default);
+    bench_anyup_upsample_parts::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", Default::default);
+    bench_anyup_context::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", Default::default);
+    bench_anyup_sparse_context::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", Default::default);
     bench_anyup_sparse_low_feature_context::<burn::backend::WebGpu<f32, i32>, _>(
         c,
         "webgpu",
-        || Default::default(),
+        Default::default,
     );
-    bench_anyup_highres_update::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", || {
-        Default::default()
-    });
+    bench_anyup_highres_update::<burn::backend::WebGpu<f32, i32>, _>(c, "webgpu", Default::default);
 }
 
 #[cfg(not(feature = "webgpu"))]
@@ -954,7 +940,7 @@ fn anyup_forward_webgpu_f16(c: &mut Criterion) {
         c,
         "webgpu_f16",
         DType::F16,
-        || Default::default(),
+        Default::default,
     );
 }
 
@@ -967,7 +953,7 @@ fn anyup_forward_webgpu_bf16(c: &mut Criterion) {
         c,
         "webgpu_bf16",
         DType::BF16,
-        || Default::default(),
+        Default::default,
     );
 }
 
@@ -976,22 +962,18 @@ fn anyup_forward_webgpu_bf16(_c: &mut Criterion) {}
 
 #[cfg(feature = "wgpu")]
 fn anyup_forward_wgpu(c: &mut Criterion) {
-    bench_anyup_forward::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || Default::default());
-    bench_anyup_attention::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || Default::default());
-    bench_anyup_stages::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || Default::default());
-    bench_anyup_upsample_parts::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || {
-        Default::default()
-    });
-    bench_anyup_context::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || Default::default());
-    bench_anyup_sparse_context::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || {
-        Default::default()
-    });
-    bench_anyup_sparse_low_feature_context::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || {
-        Default::default()
-    });
-    bench_anyup_highres_update::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || {
-        Default::default()
-    });
+    bench_anyup_forward::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
+    bench_anyup_attention::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
+    bench_anyup_stages::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
+    bench_anyup_upsample_parts::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
+    bench_anyup_context::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
+    bench_anyup_sparse_context::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
+    bench_anyup_sparse_low_feature_context::<burn::backend::Wgpu<f32, i32>, _>(
+        c,
+        "wgpu",
+        Default::default,
+    );
+    bench_anyup_highres_update::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
 }
 
 #[cfg(not(feature = "wgpu"))]
@@ -999,22 +981,18 @@ fn anyup_forward_wgpu(_c: &mut Criterion) {}
 
 #[cfg(feature = "cuda")]
 fn anyup_forward_cuda(c: &mut Criterion) {
-    bench_anyup_forward::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || Default::default());
-    bench_anyup_attention::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || Default::default());
-    bench_anyup_stages::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || Default::default());
-    bench_anyup_upsample_parts::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || {
-        Default::default()
-    });
-    bench_anyup_context::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || Default::default());
-    bench_anyup_sparse_context::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || {
-        Default::default()
-    });
-    bench_anyup_sparse_low_feature_context::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || {
-        Default::default()
-    });
-    bench_anyup_highres_update::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || {
-        Default::default()
-    });
+    bench_anyup_forward::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
+    bench_anyup_attention::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
+    bench_anyup_stages::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
+    bench_anyup_upsample_parts::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
+    bench_anyup_context::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
+    bench_anyup_sparse_context::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
+    bench_anyup_sparse_low_feature_context::<burn::backend::Cuda<f32, i32>, _>(
+        c,
+        "cuda",
+        Default::default,
+    );
+    bench_anyup_highres_update::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1026,7 +1004,7 @@ fn anyup_forward_cuda_f16(c: &mut Criterion) {
         c,
         "cuda_f16",
         DType::F16,
-        || Default::default(),
+        Default::default,
     );
 }
 
@@ -1039,7 +1017,7 @@ fn anyup_forward_cuda_bf16(c: &mut Criterion) {
         c,
         "cuda_bf16",
         DType::BF16,
-        || Default::default(),
+        Default::default,
     );
 }
 

@@ -4,6 +4,7 @@
 __pycache__/
 *.py[cod]
 node_modules/
+test-results/
 dist/
 pkg/
 crates/bevy_jepa/www/out/
@@ -23,3 +24,6 @@ crates/bevy_jepa/www/out/
 *.pt
 *.pth
 *.safetensors
+*.bpk
+*.bpk.parts.json
+*.bpk.part-*

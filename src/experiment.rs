@@ -220,9 +220,7 @@ pub struct ExperimentAutogazeMaskConfig {
 impl Default for ExperimentAutogazeMaskConfig {
     fn default() -> Self {
         Self {
-            checkpoint_dir: PathBuf::from(
-                "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a",
-            ),
+            checkpoint_dir: default_autogaze_checkpoint_dir(),
             backend: None,
             streaming: false,
             context_density: None,
@@ -233,6 +231,16 @@ impl Default for ExperimentAutogazeMaskConfig {
             dilation: 0,
         }
     }
+}
+
+fn default_autogaze_checkpoint_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("BURN_JEPA_AUTOGAZE_CHECKPOINT_DIR") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

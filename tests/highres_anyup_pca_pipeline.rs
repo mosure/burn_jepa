@@ -431,6 +431,48 @@ fn pipeline_sparse_mask_indices_drive_cache_spatial_updates() {
 }
 
 #[test]
+fn encode_bucket_mask_can_be_restricted_to_semantic_cache_writes() {
+    let device = Default::default();
+    let model_config = VJepaConfig::tiny_for_tests();
+    let mut pipeline = tiny_pipeline(
+        1,
+        SparseJepaAnyUpPcaPipelineConfig {
+            anyup_q_chunk_size: Some(1),
+            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
+            ..SparseJepaAnyUpPcaPipelineConfig::default()
+        },
+        &device,
+        &model_config,
+    );
+    let image = Tensor::<B, 4>::ones(
+        [1, 3, model_config.image_size, model_config.image_size],
+        &device,
+    );
+    let encode_mask = SparseTokenMask::all(pipeline.grid().len());
+    let write_mask = SparseTokenMask::new(vec![3], pipeline.grid().len()).expect("mask");
+
+    let output = pipeline
+        .step_image_with_encode_write_masks_nodes_measured(
+            image,
+            &encode_mask,
+            &write_mask,
+            FeatureFrameRequest::low_res(),
+        )
+        .expect("restricted write step")
+        .output;
+
+    assert_eq!(values_i64(output.encoded.token_indices), vec![3]);
+    assert_eq!(output.encoded.tokens.shape().dims::<3>(), [1, 1, 32]);
+    assert_eq!(output.token_cache.updated_tokens, 1);
+    assert_eq!(output.mask.first_mask().expect("output mask"), write_mask);
+    assert_close(
+        &values2(output.token_cache.observed),
+        &[0.0, 0.0, 0.0, 1.0],
+        1.0e-5,
+    );
+}
+
+#[test]
 fn sparse_feature_cache_pca_display_preserves_spatial_variation() {
     let device = Default::default();
     let grid = TokenGridShape::new(1, 2, 2);
@@ -1031,6 +1073,19 @@ fn inflight_stream_can_overwrite_the_latest_queued_frame() {
         .expect("ready");
     assert_eq!(output.frame_ids[0].sequence, 1);
     assert_eq!(output.dropped_frames_total, 1);
+}
+
+#[test]
+fn default_frame_stream_schedule_keeps_anyup_off_hot_path() {
+    let schedule = FeatureFrameSchedule::default();
+    let ids = [burn_jepa::SparseJepaAnyUpPcaFrameId {
+        stream_id: 0,
+        sequence: 0,
+        capture_time_nanos: 0,
+    }];
+    assert_eq!(schedule.low_res_pca_every, Some(1));
+    assert_eq!(schedule.high_res_pca_every, None);
+    assert_eq!(schedule.request_for(&ids), FeatureFrameRequest::low_res());
 }
 
 #[test]

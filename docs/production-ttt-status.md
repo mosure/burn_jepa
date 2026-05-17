@@ -10,11 +10,11 @@ external parity/data requirements.
 - Base V-JEPA fixture:
   `/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/model.pt`
 - TTT adapter:
-  `target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk`
+  `target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk`
 - Sparse policy: AutoGaze-style sparse context masks, 314 / 1568 context
   tokens, 79 / 1568 target tokens.
 - Eval split: 164 held-out open-set windows from
-  `target/burn-jepa-production-final/data/eval-real-autogaze.jsonl`.
+  `target/burn-jepa-production-final-256/data/eval-real-autogaze.jsonl`.
 
 ## Loader Gate
 
@@ -53,7 +53,7 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-final-eval-cuda.toml \
-  --model target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk \
+  --model target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk \
   --steps 11 --batch-size 1 --no-full-grid
 ```
 
@@ -76,7 +76,7 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-stream-eval-fast-cuda.toml \
-  --model target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk \
+  --model target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk \
   --steps 16 --batch-size 2 --no-full-grid
 ```
 

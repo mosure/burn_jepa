@@ -150,8 +150,13 @@ flex-gmm image patchify entry points that skip masked-out image patches before
 the encoder. `FeatureFrameRequest` and `FeatureFrameSchedule` let callers emit
 low-res PCA and high-res AnyUp/PCA at separate rates from the same sparse token
 cache update. The Bevy viewer follows the production-friendly default of
-updating low-res token-cache PCA every processed stage frame while decimating
-the expensive high-res AnyUp/PCA stage.
+updating low-res token-cache PCA every processed stage frame while keeping the
+expensive high-res AnyUp/PCA stage opt-in and off the low-res worker.
+`FeatureFrameViewerConfig` is the shared public policy surface for live viewers,
+benches, and downstream apps: it owns patch-diff quality/threshold conversion,
+dense fallback, bucketed sparse encode context, shape prewarm masks, PCA update
+cadence, and stage measurement flags. The `bevy_jepa` crate embeds and re-exports
+that config instead of carrying a separate copy of the pipeline rules.
 For camera-style loops, `FeatureFrameStream` adds bounded in-flight
 queueing, fixed-width sparse-mask batching, per-stage metrics, queue-wait
 timing, monotonic frame sequencing, and reject/drop/overwrite backpressure
@@ -273,6 +278,13 @@ host-scored heuristic. Manifest-precomputed masks are per window; set
 For long-form TBPTT over multiple videos, set
 `training.batching = "packed_streams"` so each batch row owns an independent
 carried TTT state keyed by manifest `clip_id`/`source`.
+For sparse TTT runs that also need full-token distillation, enable
+`training.dense_samples`. Dense-sample steps temporarily bypass
+`training.mask`, run the dense single-frame rollout, and match every student
+token against the 3D/tubelet V-JEPA teacher; non-dense steps keep the configured
+sparse rollout. This is different from `training.mask.kind = "full_frame"`,
+which is still a JEPA context/target holdout mask rather than all-token TTT
+supervision.
 Variable-width ragged masks are accepted in TTT training/eval. The rollout
 groups samples by per-tubelet token-count shape, runs exact-token
 encoder/sparse-patchify calls per bucket, and pads only the returned tensors so
@@ -280,8 +292,11 @@ loss/reporting can ignore invalid positions with a valid-token mask.
 Use `ttt.supervision = "hybrid"` to train TTT across early encoder layers
 without paying full frozen-tail backward cost on every step. The training loop
 uses a layer-local early-exit phase for those steps and restores full-encoder
-free-run eval afterward. `training.cache_teacher_tokens = true` caches detached
-final and layer-local teacher features for repeat windows.
+free-run eval afterward. `training.prefetch_batches = true` overlaps manifest
+frame decode with the current GPU step and materializes each batch with one
+host-to-device tensor upload. `training.cache_teacher_tokens = true` is useful
+only for repeat windows; production one-pass runs keep it disabled to avoid
+retaining large dense teacher tensors.
 
 Datasets can be synthetic smoke data or JSONL manifests. Video rows accept
 either explicit frame paths or a frame directory:
@@ -516,7 +531,7 @@ patchify parity smoke against dense masked V-JEPA output.
 ```sh
 cargo run -p bevy_jepa
 cargo run -p bevy_jepa -- --source static --image-path /path/to/frame.png
-cargo run -p bevy_jepa -- --mask-source patch-diff --image-size 512
+cargo run -p bevy_jepa -- --mask-source patch-diff
 cargo run -p bevy_jepa -- --mask-source patch-diff --image-size 256
 cargo run -p bevy_jepa -- --source camera --anyup-weights /path/to/anyup_multi_backbone.pth --anyup-attention-mode upstream-masked
 cargo run -p bevy_jepa -- --encoder-source tiny-test --source synthetic-local-motion
@@ -528,16 +543,28 @@ npm run serve
 The Bevy viewer uses the shared `bevy_burn` WebGPU device path to render input
 frames, sparse masks, low-resolution JEPA token-cache PCA, and high-resolution
 AnyUp PCA as GPU texture uploads. The viewer pipeline runs at a minimum
-256x256 JEPA input resolution, defaults to 256x256 sparse encoding, and rounds
+256x256 JEPA input resolution, defaults to 512x512 sparse encoding, and rounds
 larger requests to a multiple of the 16px V-JEPA patch size. Native camera input
 uses a latest-frame overwrite queue, center-crops the camera frame to preserve
 aspect ratio, and resizes the crop to the configured JEPA input size. The wasm
 page uses `getUserMedia` plus the exported
 `frame_input(...)` bridge. Native runs default to the trained encoder-only TTT
-V-JEPA 2.1 checkpoint at
-`target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk`; pass
-`--ttt-model`, set `BURN_JEPA_TTT_MODEL`, or use `--encoder-source
-base-checkpoint`/`tiny-test` for explicit alternatives.
+V-JEPA 2.1 encoder, loaded from a sharded `.bpk` package when
+`--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`, or
+`target/burn-jepa-web/model/manifest.json` is available. A legacy local `.mpk`
+is only used when explicitly passed with `--ttt-model` or
+`BURN_JEPA_TTT_MODEL`; use `--encoder-source base-checkpoint`/`tiny-test` for
+explicit alternatives.
+Base-checkpoint mode defaults to
+`~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384`; pass
+`--jepa-checkpoint-dir` and `--jepa-config` when the official V-JEPA 2.1
+checkpoint lives elsewhere.
+Low-res token PCA is adaptive by default: the viewer updates the rolling Oja
+basis every processed low-res frame after a two-frame warmup and keeps a
+16-frame device-resident sample window. Tune `--pca-update-every`,
+`--pca-sample-window-frames`, `--pca-min-sample-frames`, and
+`--pca-update-iterations` when a deployment needs slower color drift or lower
+PCA update cost.
 
 Input preview and stage processing are decoupled. The camera/input panel is
 updated immediately from the latest source frame, while the sparse JEPA ->
@@ -545,7 +572,10 @@ feature-cache -> AnyUp/PCA stage runs on a single async worker with a one-frame
 overwrite queue. When AnyUp or high-res PCA is slower than the camera, the
 latest pending stage frame replaces the previous pending one; the overlay
 reports input FPS, low-res FPS, high-res FPS, in-flight frames, drops, and
-overwrites so backpressure is visible instead of silently stalling the app.
+overwrites so backpressure is visible instead of silently stalling the app. The
+default `--high-res-pca-every 0` keeps AnyUp off the live camera hot path; a
+positive value sends completed low-res cache snapshots to a separate AnyUp
+worker with its own latest-frame overwrite slot.
 Camera preview frames remain center-cropped RGBA until they are admitted into
 the stage worker, so pending preview updates do not build Burn tensors or run
 patch-diff scoring. The sparse-mask panel is the completed stage write map:
@@ -558,7 +588,33 @@ threshold-driven adaptive density by default: every patch above the threshold is
 updated, `--min-context-density` is only a near-static fallback floor, and
 `--bootstrap-context-density` controls the first frame token-cache fill.
 `--patch-diff-quality Q` mirrors the AutoGaze viewer mapping by setting the
-patch-diff threshold to `1 - Q`; it does not impose a fixed 85% token density.
+patch-diff threshold to `1 - Q`; it does not impose a fixed quality-percent
+token density. The Bevy camera path compensates uniform global RGB/luma shifts
+and includes relative-luma/chroma scoring so the mask is less sensitive to
+average scene brightness.
+If thresholding selects much of the token grid, the viewer promotes the mask to
+dense ordered mode. The default `--patch-diff-dense-fallback-density 0.60`
+keeps low- and medium-density adaptive motion sparse, then routes high-motion
+frames through dense ordered inference. The latest 512px WGPU stability sweep
+showed that exact sparse widths are steady once warm, but live high-density
+jitter can still trigger first-use shape/autotune stalls. Dense fallback avoids
+those spikes in the regime where dense full-grid inference is already
+competitive. Set it closer to `1.0` to force exact sparse masks at high density,
+or lower it for a backend where sparse shape churn is worse than dense
+inference. The camera RGBA path uses a sampled high-motion precheck with this
+cutoff to skip full per-patch scoring when a frame is already clearly dense.
+The native Bevy default uses shape-stable bucketed sparse encode with exact
+cache writes: the sparse-mask panel still shows the patches that overwrite the
+low-res token cache, while the encoder context is widened to stable token
+buckets controlled by `--sparse-mask-bucket-tokens 256`. This avoids live WGPU
+shape churn from arbitrary patch-diff widths. It never drops
+threshold-selected patches, but it does add real extra context tokens, so use
+`--sparse-encode-mode exact` when an experiment needs encode tokens to match the
+displayed write mask exactly. `--prewarm-shape-buckets` is enabled by default so
+bucket specializations move to startup instead of the live camera loop; pass
+`--no-prewarm-shape-buckets` to disable it.
+Build with `--features sparse-patchify-wgpu` to opt into flex-gmm sparse
+patchify; auto still routes dense ordered masks through the dense path.
 `--mask-source autogaze` requires a real
 model-backed AutoGaze node and fails clearly instead of generating a synthetic
 moving center prior. The GitHub Pages workflow builds the wasm target and
@@ -568,3 +624,95 @@ uses the tiny untrained AnyUp test module; use
 upstream Python AnyUp parity. PCA display follows the V-JEPA 2.1 dense-feature
 visualization protocol by mapping the first three rolling PCA components of
 observed patch features to RGB with device-resident normalization.
+
+### Bevy/Wasm Model Packages
+
+The Bevy viewer prefers Burn's native `.bpk` package format. Exported packages
+store floating-point records as f16 for deployment size, while native and wasm
+loaders upcast those records back into the active backend dtype at load time.
+Native runs check
+`--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`,
+`target/burn-jepa-web/model/manifest.json`, then an auto-downloaded cache under
+`~/.burn_jepa/models/burn_jepa`. The cache fetches the same deployment URL that
+wasm uses by default: `https://aberration.technology/model/burn_jepa/manifest.json`.
+Override it with `--model-base-url`, `BURN_JEPA_MODEL_BASE_URL`, or
+`BURN_JEPA_MODEL_MANIFEST_URL`; use `--model-cache-dir` or
+`BURN_JEPA_MODEL_CACHE_DIR` for an exact cache directory. A legacy `.mpk`
+checkpoint is still accepted only when `--ttt-model` or `BURN_JEPA_TTT_MODEL`
+is explicitly set. The wasm viewer does not read local `.mpk`, `.pt`, or
+`.safetensors` files. Export a `.bpk` package and split it into cacheable
+burnpack parts:
+
+```sh
+cargo run --bin burn-jepa -- export-bpk \
+  --config configs/deploy/vjepa21-base-bpk-export.toml \
+  --output target/burn-jepa-web/model/vjepa2_1_vit_base_384.bpk \
+  --shard-mib 20 \
+  --model-base-url https://aberration.technology/model/burn_jepa \
+  --deploy-dir target/burn-jepa-cdn-upload \
+  --overwrite-deploy
+```
+
+This writes `jepa_ttt.bpk`, `jepa_ttt.bpk.parts.json`, one or more
+`jepa_ttt.bpk.part-*.bpk` files, and `manifest.json`. With `--deploy-dir`, it
+also writes a clean CDN/upload directory containing only `manifest.json`, the
+parts manifest, and shard files. The export fails if f32 tensors remain in the
+burnpack. Each part is a valid partial burnpack, so wasm loads shards
+incrementally instead of concatenating a large model blob. GitHub Pages deploys
+only the app files under `crates/bevy_jepa/www`; model packages are expected
+under `https://aberration.technology/model/burn_jepa/*`.
+
+Native cache smoke:
+
+```sh
+cargo run --bin burn-jepa -- cache-model
+cargo run --no-default-features --features ndarray --bin burn-jepa -- verify-bpk
+```
+
+`verify-bpk` uses Burn 0.21's `burn-store` path: it clean-initializes the
+module, applies the sharded `BurnpackStore` records through
+`ModuleSnapshot::load_from`, verifies f16 records upcast to runtime f32 tensors,
+and runs a small forward pass. Add `--checkpoint-dir ... --weights-name model.pt`
+to compare the f16 `.bpk` output against the original V-JEPA 2.1 checkpoint.
+
+Native package smoke:
+
+```sh
+cargo run -p bevy_jepa -- \
+  --source static
+```
+
+For local package testing:
+
+```sh
+# Tiny package smoke, small enough for local browser tests.
+cargo run --no-default-features --features ndarray --bin burn-jepa -- export-bpk \
+  --config configs/wasm/tiny-bpk-export.toml \
+  --output target/burn-jepa-wasm-model/jepa.bpk \
+  --shard-mib 1 \
+  --overwrite-shards \
+  --deploy-dir target/burn-jepa-wasm-model-upload \
+  --overwrite-deploy \
+  --allow-tiny-model
+
+python3 -m http.server 8091 -d target/burn-jepa-wasm-model
+cd crates/bevy_jepa
+npm run build:wasm
+npm run serve
+# open http://127.0.0.1:8080/?model-base=http://127.0.0.1:8091&source=static
+```
+
+Use `?load-model=false` for tiny smoke tests that exercise the wasm app without
+fetching model shards. `?preload-only=true` validates browser shard fetching
+without starting Bevy. For direct package-load plus inference validation, build
+the root wasm API and run:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm
+mkdir -p target/burn-jepa-wasm-api/out
+wasm-bindgen --target web --out-dir target/burn-jepa-wasm-api/out \
+  --out-name burn_jepa target/wasm32-unknown-unknown/release/burn_jepa.wasm
+cd crates/bevy_jepa
+npm run test:wasm-api
+BURN_JEPA_WASM_MODEL_MANIFEST_URL=https://aberration.technology/model/burn_jepa/manifest.json npm run test:wasm-api
+```

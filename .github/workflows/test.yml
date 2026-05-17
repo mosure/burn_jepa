@@ -31,29 +31,47 @@ jobs:
       - name: cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: format
+        run: cargo fmt --all -- --check
+
       - name: test root crate
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: test ndarray-only feature set
-        run: cargo test --workspace --no-default-features --features ndarray
+        run: cargo test --workspace --locked --no-default-features --features ndarray
+
+      - name: test benchmark and docs guardrails
+        run: cargo test --locked --test benchmark_report
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: clippy ndarray-only feature set
-        run: cargo clippy --workspace --all-targets --no-default-features --features ndarray -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --no-default-features --features ndarray -- -D warnings
 
       - name: package
-        run: cargo package -p burn_jepa
+        run: cargo package -p burn_jepa --locked
+
+      - name: package burn_anyup
+        run: cargo package -p burn_anyup --locked
 
       - name: benchmark smoke
-        run: cargo bench --bench sparse_pipeline --no-default-features --features ndarray -- --test
+        run: cargo bench --bench sparse_pipeline --locked --no-default-features --features ndarray -- --test
+
+      - name: high-res pipeline benchmark smoke
+        run: cargo bench --bench highres_anyup_pca_pipeline --locked --no-default-features --features ndarray -- --test
 
       - name: check wasm api
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features wasm
 
       - name: check bevy
-        run: cargo check -p bevy_jepa
+        run: cargo check -p bevy_jepa --locked
+
+      - name: check bevy wasm
+        run: cargo check -p bevy_jepa --locked --target wasm32-unknown-unknown
+
+      - name: check bevy sparse patchify path
+        run: cargo check -p bevy_jepa --locked --features sparse-patchify-wgpu
 
       - name: check bevy static page
         run: cd crates/bevy_jepa && node tests/static-source.spec.mjs

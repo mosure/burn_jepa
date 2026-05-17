@@ -281,10 +281,18 @@ pub mod camera {
     use std::cell::RefCell;
 
     use image::RgbaImage;
+    use js_sys::{Array, Reflect, Uint8Array};
     use wasm_bindgen::prelude::*;
 
     thread_local! {
         pub static SAMPLE_RECEIVER: RefCell<Option<RgbaImage>> = const { RefCell::new(None) };
+        static MODEL_PACKAGE: RefCell<Option<WasmModelPackage>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct WasmModelPackage {
+        pub manifest_json: String,
+        pub parts: Vec<Vec<u8>>,
     }
 
     #[wasm_bindgen]
@@ -298,7 +306,55 @@ pub mod camera {
         });
     }
 
+    #[wasm_bindgen]
+    pub fn jepa_model_package_input(manifest_json: &str, parts: Array) {
+        let package = WasmModelPackage {
+            manifest_json: manifest_json.to_string(),
+            parts: parts
+                .iter()
+                .map(|part| Uint8Array::new(&part).to_vec())
+                .collect(),
+        };
+        MODEL_PACKAGE.with(|cell| {
+            *cell.borrow_mut() = Some(package);
+        });
+    }
+
     pub fn receive_image() -> Option<RgbaImage> {
         SAMPLE_RECEIVER.with(|receiver| receiver.borrow_mut().take())
+    }
+
+    pub fn model_package() -> Option<WasmModelPackage> {
+        if let Some(package) = MODEL_PACKAGE.with(|cell| cell.borrow().clone()) {
+            return Some(package);
+        }
+        let package = read_window_model_package()?;
+        MODEL_PACKAGE.with(|cell| {
+            *cell.borrow_mut() = Some(package.clone());
+        });
+        Some(package)
+    }
+
+    fn read_window_model_package() -> Option<WasmModelPackage> {
+        let window = web_sys::window()?;
+        let window_value = JsValue::from(window);
+        let package =
+            Reflect::get(&window_value, &JsValue::from_str("__burnJepaModelPackage")).ok()?;
+        if package.is_null() || package.is_undefined() {
+            return None;
+        }
+        let manifest_json = Reflect::get(&package, &JsValue::from_str("manifestJson"))
+            .ok()?
+            .as_string()?;
+        let parts = Reflect::get(&package, &JsValue::from_str("parts")).ok()?;
+        let array = Array::from(&parts);
+        let parts = array
+            .iter()
+            .map(|part| Uint8Array::new(&part).to_vec())
+            .collect::<Vec<_>>();
+        Some(WasmModelPackage {
+            manifest_json,
+            parts,
+        })
     }
 }

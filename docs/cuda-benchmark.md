@@ -16,7 +16,7 @@ self-hosted CUDA runner. The default runner labels are:
 The workflow runs:
 
 ```sh
-cargo check --no-default-features --features cuda
+cargo check --no-default-features --features cuda,sparse-patchify-cuda
 
 BURN_JEPA_PIPELINE_AUTOGAZE_BACKENDS=cuda \
 BURN_JEPA_PIPELINE_JEPA_BACKENDS=sparse-patchify-cuda \

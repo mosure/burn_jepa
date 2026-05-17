@@ -9,6 +9,7 @@
     )),
     allow(dead_code, unused_imports, unused_variables)
 )]
+#![allow(clippy::too_many_arguments)]
 
 use anyhow::Result;
 use burn::tensor::Tensor;
@@ -56,7 +57,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "ndarray")]
     run_dense_backend::<burn::backend::NdArray<f32>, _>(
         "ndarray",
-        || Default::default(),
+        Default::default,
         iters,
         warmup,
         stream_frames,
@@ -67,7 +68,7 @@ fn main() -> Result<()> {
     #[cfg(all(any(feature = "wgpu", feature = "webgpu"), not(feature = "cuda")))]
     run_dense_backend::<burn::backend::Wgpu<f32, i32>, _>(
         "wgpu_dense_patch_embed",
-        || Default::default(),
+        Default::default,
         iters,
         warmup,
         stream_frames,

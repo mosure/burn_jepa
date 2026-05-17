@@ -257,7 +257,7 @@ fn bench_ttt_sparsity_training_step_matrix<B>(
         c,
         backend_name,
         batch_sizes,
-        || Default::default(),
+        Default::default,
     );
 }
 

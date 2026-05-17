@@ -4,8 +4,10 @@
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{array}
+\usepackage{pgfplots}
 \usepackage{hyperref}
 \usepackage{url}
+\pgfplotsset{compat=1.18}
 
 \title{Sparse Temporal Test-Time Training for V-JEPA 2.1}
 \author{Burn JEPA Contributors}
@@ -342,6 +344,81 @@ than sparse JEPA itself: the AutoGaze path performs many short launches and
 synchronization points.  That is why CPU ndarray can exceed WebGPU-family E2E
 FPS in low-density rows; it is not evidence that dense CPU JEPA is faster than
 device-resident sparse GPU JEPA.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.78\linewidth,
+    height=0.42\linewidth,
+    xlabel={Input token density (\%)},
+    ylabel={Latency (ms)},
+    xmin=48, xmax=101,
+    ymin=1.5, ymax=4.6,
+    xtick={50,75,85,90,95,98,100},
+    grid=both,
+    legend style={at={(0.02,0.98)},anchor=north west,font=\small},
+]
+\addplot+[mark=o,thick] coordinates {
+    (50,1.986) (75,1.887) (85,2.061) (90,2.057)
+    (95,1.969) (98,2.049) (100,1.864)
+};
+\addlegendentry{256px JEPA+cache}
+\addplot+[mark=square*,thick] coordinates {
+    (50,3.260) (75,3.156) (85,3.218) (90,4.113)
+    (95,3.289) (98,3.970) (100,4.292)
+};
+\addlegendentry{512px JEPA+cache}
+\end{axis}
+\end{tikzpicture}
+\caption{WGPU sparsity-latency sweep for the Bevy-style tiny JEPA+feature-cache
+path.  The 100\% point is the dense ordered baseline.  Cache-update-only sweeps
+show dense assignment is faster for full-grid writes, but total JEPA+cache
+latency stays competitive at 512px until the sparse mask is almost dense.}
+\label{fig:sparsity-latency}
+\end{figure}
+
+Figure~\ref{fig:sparsity-latency} isolates the raw JEPA+cache path, but the
+interactive viewer also pays patch-diff, rolling PCA, display upload, and WGPU
+shape-specialization costs.  Table~\ref{tab:viewer-stability} reports the
+current optimized Bevy default: exact cache writes, bucketed encoder context
+with 256-token buckets, and dense fallback for masks above 60\% density.  The
+displayed sparse mask remains the cache-write mask; bucketed context only adds
+extra encoder tokens to keep GPU shapes stable.  This setting removed the
+observed live-camera stall mode where exact arbitrary widths triggered
+first-use WGPU autotuning.  In the same run, the diagnostic exact mode reached a
+1.665 s max frame on the 256px low-contrast variable-width case, while the
+bucketed default kept that row below 9.5 ms.
+
+\begin{table}[t]
+\centering
+\caption{WGPU Bevy viewer stability sweep at threshold 0.03, 16 measured
+frames after four warmup frames.  Latency is outer headless viewer time for
+camera-like RGBA input, patch-diff mask, JEPA/cache, rolling low-res PCA, and
+GPU display tensor preparation.}
+\label{tab:viewer-stability}
+\begin{tabular}{lrrrrr}
+\toprule
+Scenario & Write dens. & Encode dens. & Unique enc. & p95 ms & Max ms \\
+\midrule
+Static, 512px & 0.1\% & 25.0\% & 1 & 24.14 & 24.21 \\
+Stable 10\%, 512px & 10.0\% & 25.0\% & 1 & 24.59 & 25.26 \\
+Stable 30\%, 512px & 30.0\% & 50.0\% & 1 & 24.49 & 26.30 \\
+Stable 60\%, 512px & 100.0\% & 100.0\% & 1 & 20.89 & 22.01 \\
+Jitter 60\%, 512px & 100.0\% & 100.0\% & 1 & 22.80 & 25.21 \\
+Low-contrast 60\%, 512px & 33.5\% & 50.0\% & 1 & 24.96 & 26.42 \\
+Low-contrast 60\%, 256px & 34.5\% & 50.0\% & 1 & 9.34 & 9.46 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The routing rule is therefore intentionally different from the raw
+JEPA+cache-only crossover.  Low and medium motion stay sparse, high-motion
+frames go dense, and variable-width low-contrast masks use bucketed encoder
+context to avoid WGPU shape churn.  A backend-specific sparse tiled assignment
+kernel would still be useful; the portable Burn path currently uses gather plus
+scatter-add because direct scatter assignment is not implemented on every
+backend.
 
 \begin{table}[t]
 \centering

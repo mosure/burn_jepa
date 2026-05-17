@@ -111,6 +111,11 @@ impl BurnJepaTrainConfig {
         self.training.validate_mask_config()?;
         self.training.validate_stream_config()?;
         ensure!(
+            !self.training.prefetch_batches
+                || self.dataset.kind == crate::JepaDatasetKind::Manifest,
+            "training.prefetch_batches currently requires a manifest dataset"
+        );
+        ensure!(
             self.loss.feature_loss_weight > 0.0 || self.loss.predictor_loss_weight > 0.0,
             "at least one loss weight must be positive"
         );
@@ -124,6 +129,10 @@ impl BurnJepaTrainConfig {
             self.loss.predictor_loss_weight,
             self.ttt.freeze_pretrained,
         )?;
+        ensure!(
+            !self.training.dense_samples.enabled || self.loss.predictor_loss_weight <= 0.0,
+            "training.dense_samples currently requires loss.predictor_loss_weight=0"
+        );
         self.ttt.validate(&model_config)?;
         Ok(())
     }
@@ -189,6 +198,9 @@ pub struct TrainingLoopConfig {
     pub eval_utilization_diagnostics: bool,
     pub eval_temporal_diagnostics: bool,
     pub cache_teacher_tokens: bool,
+    pub teacher_cache_max_entries: usize,
+    pub prefetch_batches: bool,
+    pub dense_samples: TttDenseSampleTrainingConfig,
     pub stream: TttStreamTrainingConfig,
     pub save_steps: usize,
 }
@@ -215,6 +227,9 @@ impl Default for TrainingLoopConfig {
             eval_utilization_diagnostics: false,
             eval_temporal_diagnostics: false,
             cache_teacher_tokens: false,
+            teacher_cache_max_entries: 32,
+            prefetch_batches: false,
+            dense_samples: TttDenseSampleTrainingConfig::default(),
             stream: TttStreamTrainingConfig::default(),
             save_steps: 0,
         }
@@ -237,6 +252,7 @@ impl TrainingLoopConfig {
     }
 
     pub fn validate_stream_config(&self) -> Result<()> {
+        self.dense_samples.validate()?;
         self.stream.validate(
             self.batch_size,
             self.effective_eval_batch_size(),
@@ -321,6 +337,32 @@ impl TrainingLoopConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TttDenseSampleTrainingConfig {
+    pub enabled: bool,
+    pub warmup_steps: usize,
+    pub interval_steps: usize,
+}
+
+impl TttDenseSampleTrainingConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.enabled || self.warmup_steps > 0 || self.interval_steps > 0,
+            "training.dense_samples requires warmup_steps or interval_steps when enabled"
+        );
+        Ok(())
+    }
+
+    pub fn uses_dense_step(&self, step_index: usize) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        step_index < self.warmup_steps
+            || (self.interval_steps > 0 && step_index.is_multiple_of(self.interval_steps))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TttStreamTrainingConfig {
@@ -332,6 +374,7 @@ pub struct TttStreamTrainingConfig {
     pub state_decay: f64,
     pub state_l2_weight: f64,
     pub update_l2_weight: f64,
+    pub state_regularization_width: usize,
     pub curriculum: TttSequenceCurriculumConfig,
 }
 
@@ -346,6 +389,7 @@ impl Default for TttStreamTrainingConfig {
             state_decay: 1.0,
             state_l2_weight: 0.0,
             update_l2_weight: 0.0,
+            state_regularization_width: 0,
             curriculum: TttSequenceCurriculumConfig::default(),
         }
     }

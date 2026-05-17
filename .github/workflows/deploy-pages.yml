@@ -52,6 +52,10 @@ jobs:
           test -f crates/bevy_jepa/www/index.html
           test -f crates/bevy_jepa/www/out/bevy_jepa.js
           test -f crates/bevy_jepa/www/out/bevy_jepa_bg.wasm
+          if find crates/bevy_jepa/www \( -name '*.bpk' -o -name '*.bpk.parts.json' -o -name '*.bpk.part-*' \) | grep -q .; then
+            echo "model shards must be hosted under https://aberration.technology/model/burn_jepa/, not GitHub Pages"
+            exit 1
+          fi
 
       - name: configure github pages
         uses: actions/configure-pages@v6

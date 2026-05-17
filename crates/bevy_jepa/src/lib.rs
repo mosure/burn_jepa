@@ -1,6 +1,6 @@
 #![recursion_limit = "512"]
 
-use std::{env, path::PathBuf, time::Instant};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use bevy::{
@@ -21,19 +21,11 @@ use burn::tensor::{
     module::interpolate,
     ops::{InterpolateMode, InterpolateOptions},
 };
-use burn::{
-    module::Module,
-    record::{FullPrecisionSettings, NamedMpkFileRecorder},
-};
 use burn_jepa::{
-    AnyUp, AnyUpConfig, AnyUpLoadOptions, FeatureFrameBatch, FeatureFrameEncodePath,
-    FeatureFrameJepaEncoder, FeatureFrameMetrics, FeatureFramePipeline, FeatureFramePipelineConfig,
-    FeatureFrameRequest, FeaturePcaUpdateConfig, FrameId, HighResFrameArtifacts,
-    LowResFrameArtifacts, SparseJepaPatchDiffSparsityConfig, SparseTokenMask, TokenGridShape,
-    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttMemoryUpdateSource,
-    TttSupervisionMode, VJepa2_1Model, VJepaConfig, VJepaLoadOptions, VJepaTttModel,
-    coords_to_token_index, load_config_from_hf_dir, patch_diff_context_mask_from_scores,
-    patch_diff_context_mask_from_video,
+    AnyUp, AnyUpImageGrid, FeatureFrameBatch, FeatureFrameMetrics, FeatureFramePipeline,
+    FeatureFramePipelineConfig, FeatureFrameRequest, FeaturePcaProjector, FrameId,
+    HighResFrameArtifacts, LowResFrameArtifacts, SparseTokenMask, TokenGridShape, VJEPA_IMAGE_MEAN,
+    VJEPA_IMAGE_STD, VJepaConfig, shape_prewarm_masks,
 };
 #[cfg(feature = "sparse-patchify-wgpu")]
 use burn_jepa::{SparseMaskBatch, SparsePatchifyBatchPlan};
@@ -41,21 +33,43 @@ use image::{ImageReader, RgbaImage, imageops::FilterType};
 
 mod config;
 mod display;
+mod mask;
+mod metrics;
+mod model_loading;
 pub mod platform;
 
+#[cfg(test)]
+use burn_jepa::{
+    FeaturePcaUpdateConfig, bucket_sparse_mask, center_prior_mask, finalize_patch_diff_mask,
+    finalize_patch_diff_masks,
+};
 pub use config::{
     BevyJepaConfig, BevyJepaDisplayTransfer, BevyJepaEncodePath, BevyJepaEncoderSource,
-    BevyJepaFrameSource, BevyJepaMaskSource, DEFAULT_ANYUP_CHUNK_SIZE,
-    DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CAMERA_FPS, DEFAULT_CAMERA_HEIGHT,
-    DEFAULT_CAMERA_WIDTH, DEFAULT_CONTEXT_DENSITY, DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE,
-    DEFAULT_MIN_CONTEXT_DENSITY, DEFAULT_PATCH_DIFF_QUALITY, DEFAULT_PATCH_DIFF_THRESHOLD,
-    DEFAULT_PCA_UPDATE_EVERY, DEFAULT_TTT_MODEL_PATH, DEFAULT_VJEPA21_CHECKPOINT_DIR,
-    DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME, MIN_PIPELINE_IMAGE_SIZE,
-    PIPELINE_IMAGE_SIZE_MULTIPLE,
+    BevyJepaFrameSource, BevyJepaMaskSource, BevyJepaSparseEncodeMode,
+    DEFAULT_ANYUP_CHECKPOINT_PATH, DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY,
+    DEFAULT_CAMERA_FPS, DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, DEFAULT_CONTEXT_DENSITY,
+    DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE, DEFAULT_MIN_CONTEXT_DENSITY,
+    DEFAULT_MODEL_MANIFEST_PATH, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
+    DEFAULT_PATCH_DIFF_QUALITY, DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES,
+    DEFAULT_PCA_SAMPLE_WINDOW_FRAMES, DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS,
+    DEFAULT_PREWARM_SHAPE_BUCKETS, DEFAULT_SPARSE_MASK_BUCKET_TOKENS, DEFAULT_TTT_MODEL_PATH,
+    DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME,
+    FeatureFrameViewerConfig, MIN_PIPELINE_IMAGE_SIZE, PIPELINE_IMAGE_SIZE_MULTIPLE,
 };
 use display::{
-    InputPanelData, JepaPanelTextures, StagePanelData, apply_input_panel_to_world,
-    apply_stage_panels_to_world, clear_completed_gpu_uploads,
+    HighResPanelData, InputPanelData, JepaPanelTextures, StagePanelData,
+    apply_high_res_panel_to_world, apply_input_panel_to_world, apply_stage_panels_to_world,
+    clear_completed_gpu_uploads,
+};
+use mask::run_sparse_mask_node;
+pub use metrics::{BevyJepaMetrics, BevyJepaStepOutput};
+use metrics::{
+    MetricFrameContext, bevy_metrics_from_stage, format_metrics_line, format_metrics_waiting_line,
+};
+use model_loading::{effective_anyup_weights, load_viewer_anyup, load_viewer_encoder};
+#[cfg(test)]
+use model_loading::{
+    effective_ttt_model_path, resolve_repo_relative_path, tiny_viewer_model_config,
 };
 
 pub type JepaBevyBackend = burn::backend::WebGpu<f32, i32>;
@@ -63,6 +77,49 @@ pub type JepaBevyDevice = burn::backend::wgpu::WgpuDevice;
 
 const UI_MARGIN_PX: f32 = 12.0;
 const METRIC_ROW_HEIGHT: f32 = 24.0;
+
+#[cfg(not(target_arch = "wasm32"))]
+type ViewerInstant = std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+type ViewerInstant = f64;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn viewer_now() -> ViewerInstant {
+    std::time::Instant::now()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn viewer_now() -> ViewerInstant {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map(|performance| performance.now())
+        .unwrap_or_else(js_sys::Date::now)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn viewer_seconds_since(now: ViewerInstant, previous: ViewerInstant) -> f64 {
+    now.duration_since(previous).as_secs_f64()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn viewer_seconds_since(now: ViewerInstant, previous: ViewerInstant) -> f64 {
+    (now - previous) / 1000.0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn viewer_elapsed_us(start: ViewerInstant) -> u64 {
+    micros_u64(start.elapsed().as_micros())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn viewer_elapsed_us(start: ViewerInstant) -> u64 {
+    let elapsed_ms = viewer_now() - start;
+    if elapsed_ms.is_finite() && elapsed_ms > 0.0 {
+        micros_u64((elapsed_ms * 1000.0) as u128)
+    } else {
+        0
+    }
+}
 const PANEL_LABEL_ROW_HEIGHT: f32 = 34.0;
 
 pub fn log(message: &str) {
@@ -71,6 +128,22 @@ pub fn log(message: &str) {
 
     #[cfg(not(target_arch = "wasm32"))]
     eprintln!("{message}");
+}
+
+pub fn warn(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::warn_1(&message.into());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("warning: {message}");
+}
+
+pub fn error(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::error_1(&message.into());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("error: {message}");
 }
 
 #[derive(Resource, Default)]
@@ -82,6 +155,10 @@ struct JepaRuntime {
     pipeline_patch_size: Option<usize>,
     active_task: Option<Task<JepaAsyncTaskOutput>>,
     pending_stage: Option<PendingStageFrame>,
+    high_res_runtime: Option<AnyUpHighResRuntime>,
+    high_res_signature: Option<RuntimePipelineSignature>,
+    high_res_task: Option<Task<HighResAsyncTaskOutput>>,
+    pending_high_res: Option<HighResFrameInput>,
     prev_image: Option<Tensor<JepaBevyBackend, 4>>,
     prev_rgba: Option<RgbaImage>,
     prev_stage_image: Option<Tensor<JepaBevyBackend, 4>>,
@@ -95,12 +172,18 @@ struct JepaRuntime {
     dropped_frames: usize,
     overwritten_frames: usize,
     stale_completions: usize,
-    last_input_at: Option<Instant>,
-    last_completion_at: Option<Instant>,
+    last_input_at: Option<ViewerInstant>,
+    last_completion_at: Option<ViewerInstant>,
+    last_high_res_completion_at: Option<ViewerInstant>,
     input_fps: f64,
     low_res_fps: f64,
     high_res_fps: f64,
+    last_high_res_anyup_context_us: u64,
+    last_high_res_anyup_decode_us: u64,
+    last_high_res_pca_us: u64,
+    last_high_res_display_tensor_us: u64,
     last_error: Option<String>,
+    last_logged_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +199,13 @@ struct RuntimePipelineSignature {
     anyup_attention_mode: burn_jepa::AnyUpAttentionMode,
     anyup_q_chunk_size: usize,
     pca_update_every: u64,
+    pca_sample_window_frames: usize,
+    pca_min_sample_frames: usize,
+    pca_update_iterations: usize,
+    sparse_encode_mode: BevyJepaSparseEncodeMode,
+    patch_diff_dense_fallback_bits: u32,
+    sparse_mask_bucket_tokens: usize,
+    prewarm_shape_buckets: bool,
 }
 
 impl RuntimePipelineSignature {
@@ -128,10 +218,17 @@ impl RuntimePipelineSignature {
             jepa_config_path: config.jepa_config_path.clone(),
             jepa_weights_name: config.jepa_weights_name.clone(),
             image_size,
-            anyup_weights: config.anyup_weights.clone(),
+            anyup_weights: effective_anyup_weights(config),
             anyup_attention_mode: config.anyup_attention_mode,
             anyup_q_chunk_size: config.anyup_q_chunk_size,
             pca_update_every: config.pca_update_every,
+            pca_sample_window_frames: config.pca_sample_window_frames,
+            pca_min_sample_frames: config.pca_min_sample_frames,
+            pca_update_iterations: config.pca_update_iterations,
+            sparse_encode_mode: config.sparse_encode_mode,
+            patch_diff_dense_fallback_bits: config.patch_diff_dense_fallback_density.to_bits(),
+            sparse_mask_bucket_tokens: config.sparse_mask_bucket_tokens,
+            prewarm_shape_buckets: config.prewarm_shape_buckets,
         }
     }
 }
@@ -143,101 +240,38 @@ struct CachedStaticFrame {
     image: Tensor<JepaBevyBackend, 4>,
 }
 
-#[derive(Resource, Clone, Debug, Default)]
-pub struct BevyJepaMetrics {
-    pub frame_index: u64,
-    pub frame_ready: bool,
-    pub encoder_source: BevyJepaEncoderSource,
-    pub encode_path: FeatureFrameEncodePath,
-    pub frame_source: BevyJepaFrameSource,
-    pub camera_frame_received: bool,
-    pub mask_source: BevyJepaMaskSource,
-    pub display_transfer: BevyJepaDisplayTransfer,
-    pub context_tokens: usize,
-    pub dense_tokens: usize,
-    pub grid_height: usize,
-    pub grid_width: usize,
-    pub patch_size: usize,
-    pub stage_metrics: FeatureFrameMetrics,
-    pub encode_us: u64,
-    pub cache_update_us: u64,
-    pub token_view_us: u64,
-    pub anyup_context_us: u64,
-    pub anyup_decode_us: u64,
-    pub low_res_pca_us: u64,
-    pub pca_update_us: u64,
-    pub pca_sample_window_frames: usize,
-    pub pca_sample_frames: usize,
-    pub high_res_pca_us: u64,
-    pub display_tensor_us: u64,
-    pub total_us: u64,
-    pub viewer_total_us: u64,
-    pub pca_update_applied: bool,
-    pub input_frame_index: u64,
-    pub input_frames_seen: u64,
-    pub completed_frames: u64,
-    pub high_res_frames: u64,
-    pub input_fps: f64,
-    pub low_res_fps: f64,
-    pub high_res_fps: f64,
-    pub in_flight_frames: usize,
-    pub queue_dropped_frames: usize,
-    pub queue_overwritten_frames: usize,
-    pub stale_completions: usize,
-    pub last_error: Option<String>,
+struct AnyUpHighResRuntime {
+    anyup: AnyUp<JepaBevyBackend>,
+    anyup_image_grid: AnyUpImageGrid<JepaBevyBackend>,
+    image_size: [usize; 2],
+    grid: TokenGridShape,
+    q_chunk_size: usize,
 }
 
-impl BevyJepaMetrics {
-    pub fn density(&self) -> f64 {
-        if self.dense_tokens == 0 {
-            0.0
-        } else {
-            self.context_tokens as f64 / self.dense_tokens as f64
-        }
-    }
-
-    pub fn fps(&self) -> f64 {
-        self.viewer_fps()
-    }
-
-    pub fn core_fps(&self) -> f64 {
-        if self.total_us == 0 {
-            0.0
-        } else {
-            1_000_000.0 / self.total_us as f64
-        }
-    }
-
-    pub fn viewer_fps(&self) -> f64 {
-        if self.viewer_total_us == 0 {
-            self.core_fps()
-        } else {
-            1_000_000.0 / self.viewer_total_us as f64
-        }
-    }
-
-    pub fn aligns_with_stage_metrics(&self) -> bool {
-        self.encode_us == self.stage_metrics.encode_us
-            && self.cache_update_us == self.stage_metrics.cache_update_us
-            && self.token_view_us == self.stage_metrics.token_view_us
-            && self.anyup_context_us == self.stage_metrics.anyup_context_us
-            && self.anyup_decode_us == self.stage_metrics.anyup_decode_us
-            && self.low_res_pca_us == self.stage_metrics.low_res_pca_project_us
-            && self.pca_update_us == self.stage_metrics.pca_update_us
-            && self.pca_sample_window_frames == self.stage_metrics.pca_sample_window_frames
-            && self.pca_sample_frames == self.stage_metrics.pca_sample_frames
-            && self.high_res_pca_us == self.stage_metrics.pca_project_us
-            && self.total_us == self.stage_metrics.total_us
-            && self.encode_path == self.stage_metrics.encode_path
-            && self.context_tokens == self.stage_metrics.sparse_width
-            && self.dense_tokens == self.stage_metrics.dense_tokens_per_frame
-            && self.pca_update_applied == self.stage_metrics.pca_update_applied
-    }
+struct HighResFrameInput {
+    signature: RuntimePipelineSignature,
+    id: FrameId,
+    image: Tensor<JepaBevyBackend, 4>,
+    low_res_features: Tensor<JepaBevyBackend, 4>,
+    pca: FeaturePcaProjector<JepaBevyBackend>,
+    display_transfer: BevyJepaDisplayTransfer,
+    sync_measurements: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct BevyJepaStepOutput {
-    pub metrics: BevyJepaMetrics,
+struct HighResAsyncTaskOutput {
+    signature: RuntimePipelineSignature,
+    runtime: AnyUpHighResRuntime,
+    result: Result<HighResProcessedFrame, String>,
+}
+
+struct HighResProcessedFrame {
+    id: FrameId,
+    panels: HighResPanelData,
+    anyup_context_us: u64,
+    anyup_decode_us: u64,
+    high_res_pca_us: u64,
+    display_tensor_us: u64,
+    total_us: u64,
 }
 
 pub struct BevyJepaHeadlessPipeline {
@@ -372,157 +406,6 @@ pub fn run_once() -> Result<BevyJepaMetrics> {
     .metrics)
 }
 
-fn load_viewer_encoder(
-    config: &BevyJepaConfig,
-    image_size: usize,
-    device: &JepaBevyDevice,
-) -> Result<(FeatureFrameJepaEncoder<JepaBevyBackend>, VJepaConfig)> {
-    match config.encoder_source {
-        BevyJepaEncoderSource::TinyTest => {
-            let model_config = tiny_viewer_model_config(image_size);
-            let jepa = VJepa2_1Model::<JepaBevyBackend>::new(&model_config, device);
-            Ok((FeatureFrameJepaEncoder::base(jepa), model_config))
-        }
-        BevyJepaEncoderSource::BaseCheckpoint => {
-            let (jepa, mut model_config) = load_base_checkpoint_model(config, image_size, device)?;
-            model_config.image_size = image_size;
-            Ok((FeatureFrameJepaEncoder::base(jepa), model_config))
-        }
-        BevyJepaEncoderSource::TrainedTtt => {
-            let ttt_model_path = effective_ttt_model_path(config)?;
-            if !ttt_model_path.exists() {
-                bail!(
-                    "trained TTT JEPA encoder checkpoint `{}` does not exist; pass --ttt-model or set BURN_JEPA_TTT_MODEL",
-                    ttt_model_path.display()
-                );
-            }
-            let model_config = viewer_model_config(config, image_size)?;
-            let base = VJepa2_1Model::<JepaBevyBackend>::new(&model_config, device);
-            let ttt_config = production_ttt_config();
-            let ttt = VJepaTttModel::from_model(base, ttt_config, device)?
-                .load_file(
-                    ttt_model_path.clone(),
-                    &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
-                    device,
-                )
-                .with_context(|| {
-                    format!(
-                        "load trained TTT JEPA encoder `{}`",
-                        ttt_model_path.display()
-                    )
-                })?;
-            Ok((FeatureFrameJepaEncoder::ttt(ttt), model_config))
-        }
-    }
-}
-
-fn load_base_checkpoint_model(
-    config: &BevyJepaConfig,
-    image_size: usize,
-    device: &JepaBevyDevice,
-) -> Result<(VJepa2_1Model<JepaBevyBackend>, VJepaConfig)> {
-    if let Some(checkpoint_dir) = &config.jepa_checkpoint_dir {
-        let checkpoint_dir = resolve_repo_relative_path(checkpoint_dir);
-        let mut options = VJepaLoadOptions::default();
-        options.weights_name = config.jepa_weights_name.clone();
-        let (model, model_config, _report) = options
-            .load_model(&checkpoint_dir, device)
-            .with_context(|| {
-                format!("load V-JEPA 2.1 checkpoint `{}`", checkpoint_dir.display())
-            })?;
-        return Ok((model, model_config));
-    }
-
-    let model_config = viewer_model_config(config, image_size)?;
-    Ok((
-        VJepa2_1Model::<JepaBevyBackend>::new(&model_config, device),
-        model_config,
-    ))
-}
-
-fn viewer_model_config(config: &BevyJepaConfig, image_size: usize) -> Result<VJepaConfig> {
-    let mut model_config = if let Some(config_path) = &config.jepa_config_path {
-        let config_path = resolve_repo_relative_path(config_path);
-        if config_path.exists() {
-            VJepaConfig::from_json_file(&config_path)
-                .with_context(|| format!("load V-JEPA 2.1 config `{}`", config_path.display()))?
-        } else if config.encoder_source == BevyJepaEncoderSource::TrainedTtt {
-            bail!(
-                "V-JEPA 2.1 config `{}` does not exist; pass --jepa-config or --encoder-source tiny-test",
-                config_path.display()
-            );
-        } else {
-            VJepaConfig::default()
-        }
-    } else if let Some(checkpoint_dir) = &config.jepa_checkpoint_dir {
-        let checkpoint_dir = resolve_repo_relative_path(checkpoint_dir);
-        load_config_from_hf_dir(&checkpoint_dir, &VJepaLoadOptions::default().config_name)
-            .with_context(|| {
-                format!("load V-JEPA 2.1 config from `{}`", checkpoint_dir.display())
-            })?
-    } else {
-        VJepaConfig::default()
-    };
-    model_config.image_size = image_size;
-    model_config.num_frames = 2;
-    model_config.tubelet_size = 2;
-    Ok(model_config)
-}
-
-fn tiny_viewer_model_config(image_size: usize) -> VJepaConfig {
-    let mut model_config = VJepaConfig::tiny_for_tests();
-    model_config.image_size = image_size;
-    model_config.num_frames = 2;
-    model_config.tubelet_size = 2;
-    model_config
-}
-
-fn effective_ttt_model_path(config: &BevyJepaConfig) -> Result<PathBuf> {
-    if let Some(path) = env::var_os("BURN_JEPA_TTT_MODEL") {
-        return Ok(resolve_repo_relative_path(PathBuf::from(path)));
-    }
-    config
-        .ttt_model_path
-        .as_ref()
-        .map(resolve_repo_relative_path)
-        .ok_or_else(|| {
-            anyhow::anyhow!("trained TTT JEPA encoder requires --ttt-model or BURN_JEPA_TTT_MODEL")
-        })
-}
-
-fn resolve_repo_relative_path(path: impl Into<PathBuf>) -> PathBuf {
-    let path = path.into();
-    if path.is_absolute() || path.exists() {
-        return path;
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let Some(workspace_root) = manifest_dir.parent().and_then(|parent| parent.parent()) else {
-        return path;
-    };
-    let candidate = workspace_root.join(&path);
-    if candidate.exists() { candidate } else { path }
-}
-
-fn production_ttt_config() -> TttEncoderConfig {
-    TttEncoderConfig {
-        layer_placement: TttLayerPlacement::Explicit,
-        layers: vec![3, 7, 11],
-        predictor_layers: Vec::new(),
-        chunk_tokens: 196,
-        ttt_lr: 0.003,
-        use_projection: true,
-        conv_kernel: 3,
-        memory_update: TttMemoryUpdateSource::SelfHidden,
-        supervision: TttSupervisionMode::FinalTeacher,
-        hybrid_final_steps: 1,
-        rollout_blocks: 2,
-        backprop_mode: TttBackpropMode::FinalFeature,
-        backprop_truncate_blocks: 1,
-        freeze_pretrained: true,
-        ..TttEncoderConfig::default()
-    }
-}
-
 impl JepaRuntime {
     fn ensure_pipeline(
         &mut self,
@@ -537,34 +420,12 @@ impl JepaRuntime {
             .is_none_or(|current| current != &signature);
         if needs_init {
             let (encoder, model_config) = load_viewer_encoder(config, image_size, device)?;
-            let mut anyup_config = if config.anyup_weights.is_some() {
-                AnyUpConfig::default()
-            } else {
-                AnyUpConfig::tiny_for_tests()
-            }
-            .with_attention_mode(config.anyup_attention_mode);
-            anyup_config.input_dim = 3;
-            let mut anyup = AnyUp::<JepaBevyBackend>::new(anyup_config, device)
-                .context("initialize AnyUp viewer model")?;
-            if let Some(path) = &config.anyup_weights {
-                AnyUpLoadOptions::default()
-                    .load_into(&mut anyup, path, device)
-                    .with_context(|| format!("load AnyUp viewer weights `{}`", path.display()))?;
-            }
+            let anyup = load_viewer_anyup(config, device)?;
             let pipeline_config = FeatureFramePipelineConfig {
                 anyup_q_chunk_size: Some(config.anyup_q_chunk_size.max(1)),
                 update_pca_online: false,
-                pca_update: FeaturePcaUpdateConfig::rolling_low_res_every(
-                    config.pca_update_every.max(1),
-                ),
-                measurement: if config.measure_stages {
-                    burn_jepa::FeatureFrameMeasureConfig {
-                        enabled: true,
-                        sync_backend: config.sync_measurements,
-                    }
-                } else {
-                    burn_jepa::FeatureFrameMeasureConfig::disabled()
-                },
+                pca_update: config.pca_update_config(),
+                measurement: config.measurement_config(),
                 ..FeatureFramePipelineConfig::default()
             };
             self.pipeline = Some(FeatureFramePipeline::<JepaBevyBackend>::new_with_encoder(
@@ -576,17 +437,43 @@ impl JepaRuntime {
                 [image_size, image_size],
                 device,
             )?);
+            if config.prewarm_shape_buckets {
+                let pipeline = self.pipeline.as_mut().expect("pipeline initialized");
+                match prewarm_feature_frame_shapes(config, pipeline, image_size, device) {
+                    Ok(Some(report)) => log(&format!(
+                        "bevy_jepa: prewarmed sparse token widths {:?} in {:.1} ms",
+                        report.token_widths,
+                        micros_to_ms(report.total_us)
+                    )),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = pipeline.reset_visualization_state();
+                        log(&format!(
+                            "bevy_jepa: sparse shape prewarm skipped after error: {error:#}"
+                        ));
+                    }
+                }
+            }
             let pipeline = self.pipeline.as_ref().expect("pipeline initialized");
             self.pipeline_grid = Some(pipeline.grid());
             self.pipeline_patch_size = Some(model_config.patch_size);
             self.model_config = Some(model_config);
             self.pipeline_signature = Some(signature);
             self.pending_stage = None;
+            self.high_res_runtime = None;
+            self.high_res_signature = None;
+            self.high_res_task = None;
+            self.pending_high_res = None;
             self.prev_image = None;
             self.prev_rgba = None;
             self.prev_stage_image = None;
             self.prev_stage_rgba = None;
             self.frame_index = 0;
+            self.last_high_res_completion_at = None;
+            self.last_high_res_anyup_context_us = 0;
+            self.last_high_res_anyup_decode_us = 0;
+            self.last_high_res_pca_us = 0;
+            self.last_high_res_display_tensor_us = 0;
         }
         let model_config = self
             .model_config
@@ -616,10 +503,67 @@ impl JepaRuntime {
         Ok((pipeline, model_config, signature))
     }
 
+    fn ensure_high_res_runtime(
+        &mut self,
+        config: &BevyJepaConfig,
+        device: &JepaBevyDevice,
+    ) -> Result<()> {
+        let image_size = config.pipeline_image_size();
+        let signature = RuntimePipelineSignature::new(config, image_size);
+        let needs_init = self
+            .high_res_signature
+            .as_ref()
+            .is_none_or(|current| current != &signature);
+        if !needs_init {
+            return Ok(());
+        }
+        let Some(model_config) = self.model_config.as_ref() else {
+            bail!("cannot initialize AnyUp worker before JEPA pipeline model config");
+        };
+        let anyup = load_viewer_anyup(config, device)?;
+        let image_size = [image_size, image_size];
+        let grid = TokenGridShape::new(
+            1,
+            image_size[0] / model_config.patch_size.max(1),
+            image_size[1] / model_config.patch_size.max(1),
+        );
+        self.high_res_runtime = Some(AnyUpHighResRuntime {
+            anyup_image_grid: anyup.prepare_image_grid(image_size, device),
+            anyup,
+            image_size,
+            grid,
+            q_chunk_size: config.anyup_q_chunk_size.max(1),
+        });
+        self.high_res_signature = Some(signature);
+        self.high_res_task = None;
+        self.pending_high_res = None;
+        Ok(())
+    }
+
+    fn enqueue_high_res_frame(
+        &mut self,
+        config: &BevyJepaConfig,
+        input: HighResFrameInput,
+        device: &JepaBevyDevice,
+    ) -> Result<()> {
+        self.ensure_high_res_runtime(config, device)?;
+        if self.high_res_task.is_none() {
+            let runtime = self
+                .high_res_runtime
+                .take()
+                .expect("high-res AnyUp runtime initialized");
+            self.high_res_task = Some(spawn_high_res_task(runtime, input));
+        } else if self.pending_high_res.replace(input).is_some() {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+            self.overwritten_frames = self.overwritten_frames.saturating_add(1);
+        }
+        Ok(())
+    }
+
     fn record_input_frame(&mut self, sequence: u64) {
-        let now = Instant::now();
+        let now = viewer_now();
         if let Some(previous) = self.last_input_at {
-            let seconds = now.duration_since(previous).as_secs_f64();
+            let seconds = viewer_seconds_since(now, previous);
             if seconds.is_finite() && seconds > 0.0 {
                 self.input_fps = 1.0 / seconds;
             }
@@ -630,21 +574,37 @@ impl JepaRuntime {
     }
 
     fn record_completion(&mut self, high_res_updated: bool) {
-        let now = Instant::now();
+        let now = viewer_now();
         if let Some(previous) = self.last_completion_at {
-            let seconds = now.duration_since(previous).as_secs_f64();
+            let seconds = viewer_seconds_since(now, previous);
             if seconds.is_finite() && seconds > 0.0 {
                 self.low_res_fps = 1.0 / seconds;
-                if high_res_updated {
-                    self.high_res_fps = 1.0 / seconds;
-                }
             }
         }
         self.last_completion_at = Some(now);
         self.completed_frames = self.completed_frames.saturating_add(1);
         if high_res_updated {
-            self.high_res_frames = self.high_res_frames.saturating_add(1);
+            self.record_high_res_completion();
         }
+    }
+
+    fn record_high_res_completion(&mut self) {
+        let now = viewer_now();
+        if let Some(previous) = self.last_high_res_completion_at {
+            let seconds = viewer_seconds_since(now, previous);
+            if seconds.is_finite() && seconds > 0.0 {
+                self.high_res_fps = 1.0 / seconds;
+            }
+        }
+        self.last_high_res_completion_at = Some(now);
+        self.high_res_frames = self.high_res_frames.saturating_add(1);
+    }
+
+    fn apply_high_res_timings(&mut self, processed: &HighResProcessedFrame) {
+        self.last_high_res_anyup_context_us = processed.anyup_context_us;
+        self.last_high_res_anyup_decode_us = processed.anyup_decode_us;
+        self.last_high_res_pca_us = processed.high_res_pca_us;
+        self.last_high_res_display_tensor_us = processed.display_tensor_us;
     }
 
     fn apply_runtime_counts(&self, metrics: &mut BevyJepaMetrics) {
@@ -655,11 +615,34 @@ impl JepaRuntime {
         metrics.input_fps = self.input_fps;
         metrics.low_res_fps = self.low_res_fps;
         metrics.high_res_fps = self.high_res_fps;
-        metrics.in_flight_frames =
-            usize::from(self.active_task.is_some()) + usize::from(self.pending_stage.is_some());
+        metrics.in_flight_frames = usize::from(self.active_task.is_some())
+            + usize::from(self.pending_stage.is_some())
+            + usize::from(self.high_res_task.is_some())
+            + usize::from(self.pending_high_res.is_some());
         metrics.queue_dropped_frames = self.dropped_frames;
         metrics.queue_overwritten_frames = self.overwritten_frames;
         metrics.stale_completions = self.stale_completions;
+        if self.last_high_res_anyup_decode_us > 0 || self.last_high_res_pca_us > 0 {
+            metrics.anyup_context_us = self.last_high_res_anyup_context_us;
+            metrics.anyup_decode_us = self.last_high_res_anyup_decode_us;
+            metrics.high_res_pca_us = self.last_high_res_pca_us;
+            metrics.display_tensor_us = metrics
+                .display_tensor_us
+                .max(self.last_high_res_display_tensor_us);
+        }
+    }
+
+    fn set_error(&mut self, context: &str, error: String) {
+        let log_key = format!("{context}: {error}");
+        if self.last_logged_error.as_deref() != Some(log_key.as_str()) {
+            crate::error(&format!("bevy_jepa {log_key}"));
+            self.last_logged_error = Some(log_key);
+        }
+        self.last_error = Some(error);
+    }
+
+    fn clear_error(&mut self) {
+        self.last_error = None;
     }
 }
 
@@ -779,6 +762,38 @@ fn process_jepa_frame(world: &mut World) {
     };
 
     let transfer = config.display_transfer;
+    let high_res_completed = {
+        let mut runtime = world.resource_mut::<JepaRuntime>();
+        poll_high_res_task(&config, &mut runtime)
+    };
+    if let Some(completed) = high_res_completed {
+        match completed {
+            Ok(processed) => {
+                let mut metrics = world.resource::<BevyJepaMetrics>().clone();
+                {
+                    let mut runtime = world.resource_mut::<JepaRuntime>();
+                    runtime.record_high_res_completion();
+                    runtime.apply_high_res_timings(&processed);
+                    runtime.clear_error();
+                    runtime.apply_runtime_counts(&mut metrics);
+                }
+                metrics.frame_index = processed.id.sequence;
+                metrics.frame_ready = true;
+                metrics.last_error = None;
+                metrics.viewer_total_us = processed.total_us;
+                apply_high_res_panel_to_world(world, processed.panels, transfer);
+                *world.resource_mut::<BevyJepaMetrics>() = metrics;
+            }
+            Err(err) => {
+                {
+                    let mut runtime = world.resource_mut::<JepaRuntime>();
+                    runtime.set_error("AnyUp worker", err.clone());
+                }
+                world.resource_mut::<BevyJepaMetrics>().last_error = Some(err);
+            }
+        }
+    }
+
     let completed = {
         let mut runtime = world.resource_mut::<JepaRuntime>();
         poll_jepa_task(&config, &mut runtime, &device)
@@ -790,14 +805,28 @@ fn process_jepa_frame(world: &mut World) {
                 {
                     let mut runtime = world.resource_mut::<JepaRuntime>();
                     runtime.record_completion(processed.high_res_updated);
-                    runtime.last_error = None;
+                    let mut enqueue_error = None;
+                    if let Some(input) = processed.high_res_input
+                        && let Err(err) = runtime.enqueue_high_res_frame(&config, input, &device)
+                    {
+                        enqueue_error = Some(err.to_string());
+                    }
+                    if let Some(err) = enqueue_error.as_ref() {
+                        runtime.set_error("AnyUp enqueue", err.clone());
+                    } else {
+                        runtime.clear_error();
+                    }
+                    metrics.last_error = enqueue_error;
                     runtime.apply_runtime_counts(&mut metrics);
                 }
                 apply_stage_panels_to_world(world, processed.panels, transfer);
                 *world.resource_mut::<BevyJepaMetrics>() = metrics;
             }
             Err(err) => {
-                world.resource_mut::<JepaRuntime>().last_error = Some(err.clone());
+                {
+                    let mut runtime = world.resource_mut::<JepaRuntime>();
+                    runtime.set_error("JEPA worker", err.clone());
+                }
                 world.resource_mut::<BevyJepaMetrics>().last_error = Some(err);
             }
         }
@@ -822,11 +851,11 @@ fn process_jepa_frame(world: &mut World) {
             metrics.camera_frame_received = input.camera_frame_received;
             metrics.mask_source = config.mask_source;
             metrics.display_transfer = config.display_transfer;
-            world.resource_mut::<JepaRuntime>().last_error = None;
+            world.resource_mut::<JepaRuntime>().clear_error();
             *world.resource_mut::<BevyJepaMetrics>() = metrics;
         }
         Ok(None) => {
-            world.resource_mut::<JepaRuntime>().last_error = None;
+            world.resource_mut::<JepaRuntime>().clear_error();
             let mut metrics = world.resource::<BevyJepaMetrics>().clone();
             if !metrics.frame_ready {
                 metrics.encoder_source = config.encoder_source;
@@ -843,8 +872,12 @@ fn process_jepa_frame(world: &mut World) {
             *world.resource_mut::<BevyJepaMetrics>() = metrics;
         }
         Err(err) => {
-            world.resource_mut::<JepaRuntime>().last_error = Some(err.to_string());
-            world.resource_mut::<BevyJepaMetrics>().last_error = Some(err.to_string());
+            let err = err.to_string();
+            {
+                let mut runtime = world.resource_mut::<JepaRuntime>();
+                runtime.set_error("source frame", err.clone());
+            }
+            world.resource_mut::<BevyJepaMetrics>().last_error = Some(err);
         }
     }
 }
@@ -911,6 +944,37 @@ fn poll_jepa_task(
         runtime.pending_stage = None;
         Some(Err(
             "discarded stale JEPA completion after pipeline config changed".to_string(),
+        ))
+    }
+}
+
+fn poll_high_res_task(
+    config: &BevyJepaConfig,
+    runtime: &mut JepaRuntime,
+) -> Option<Result<HighResProcessedFrame, String>> {
+    let task = runtime.high_res_task.as_mut()?;
+    let output = block_on(future::poll_once(task))?;
+    runtime.high_res_task = None;
+    let current_signature = RuntimePipelineSignature::new(config, config.pipeline_image_size());
+    if output.signature == current_signature {
+        runtime.high_res_runtime = Some(output.runtime);
+        if let Some(pending) = runtime.pending_high_res.take() {
+            if pending.signature == current_signature {
+                let high_res_runtime = runtime
+                    .high_res_runtime
+                    .take()
+                    .expect("high-res AnyUp runtime initialized");
+                runtime.high_res_task = Some(spawn_high_res_task(high_res_runtime, pending));
+            } else {
+                runtime.stale_completions = runtime.stale_completions.saturating_add(1);
+            }
+        }
+        Some(output.result)
+    } else {
+        runtime.stale_completions = runtime.stale_completions.saturating_add(1);
+        runtime.pending_high_res = None;
+        Some(Err(
+            "discarded stale AnyUp completion after pipeline config changed".to_string(),
         ))
     }
 }
@@ -1014,12 +1078,14 @@ fn process_runtime_source_frame(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_jepa_task(
     config: BevyJepaConfig,
     signature: RuntimePipelineSignature,
     mut pipeline: FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: SparseTokenMask,
+    write_mask: SparseTokenMask,
+    encode_mask: SparseTokenMask,
     id: FrameId,
     grid: TokenGridShape,
     patch_size: usize,
@@ -1032,7 +1098,8 @@ fn spawn_jepa_task(
             &config,
             &mut pipeline,
             image,
-            &mask,
+            &write_mask,
+            &encode_mask,
             id,
             grid,
             patch_size,
@@ -1049,6 +1116,22 @@ fn spawn_jepa_task(
     })
 }
 
+fn spawn_high_res_task(
+    mut runtime: AnyUpHighResRuntime,
+    input: HighResFrameInput,
+) -> Task<HighResAsyncTaskOutput> {
+    AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::new).spawn(async move {
+        let signature = input.signature.clone();
+        let result = run_high_res_anyup_step(&mut runtime, input).map_err(|err| err.to_string());
+        HighResAsyncTaskOutput {
+            signature,
+            runtime,
+            result,
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_admitted_jepa_task(
     config: BevyJepaConfig,
     signature: RuntimePipelineSignature,
@@ -1065,7 +1148,7 @@ fn spawn_admitted_jepa_task(
     camera_frame_received: bool,
     request: FeatureFrameRequest,
 ) -> Result<Task<JepaAsyncTaskOutput>> {
-    let mask = run_sparse_mask_node(
+    let masks = run_sparse_mask_node(
         &config,
         prev_stage_image,
         prev_stage_rgba,
@@ -1073,14 +1156,14 @@ fn spawn_admitted_jepa_task(
         &image,
         model_config,
         grid,
-    )?
-    .mask;
+    )?;
     Ok(spawn_jepa_task(
         config,
         signature,
         pipeline,
         image,
-        mask,
+        masks.write_mask,
+        masks.encode_mask,
         id,
         grid,
         patch_size,
@@ -1107,7 +1190,7 @@ fn process_runtime_frame(
     let prev_rgba = runtime.prev_rgba.clone();
     let (pipeline, model_config) = runtime.ensure_pipeline(config, device)?;
     let grid = pipeline.grid();
-    let mask = run_sparse_mask_node(
+    let masks = run_sparse_mask_node(
         config,
         prev_image.as_ref(),
         prev_rgba.as_ref(),
@@ -1115,8 +1198,7 @@ fn process_runtime_frame(
         &image,
         &model_config,
         grid,
-    )?
-    .mask;
+    )?;
     let id = FrameId {
         stream_id: 0,
         sequence: frame_index,
@@ -1127,7 +1209,8 @@ fn process_runtime_frame(
             config,
             pipeline,
             image.clone(),
-            &mask,
+            &masks.write_mask,
+            &masks.encode_mask,
             id,
             grid,
             model_config.patch_size,
@@ -1138,7 +1221,8 @@ fn process_runtime_frame(
             config,
             pipeline,
             image.clone(),
-            &mask,
+            &masks.write_mask,
+            &masks.encode_mask,
             id,
             grid,
             model_config.patch_size,
@@ -1150,7 +1234,8 @@ fn process_runtime_frame(
             config,
             pipeline,
             image.clone(),
-            &mask,
+            &masks.write_mask,
+            &masks.encode_mask,
             id,
             grid,
             model_config.patch_size,
@@ -1190,10 +1275,6 @@ struct SourcePreviewFrame {
     camera_frame_received: bool,
 }
 
-struct SparseMaskNodeOutput {
-    mask: SparseTokenMask,
-}
-
 struct StageFrame {
     output: FeatureFrameBatch<JepaBevyBackend>,
     metrics: FeatureFrameMetrics,
@@ -1204,14 +1285,16 @@ struct StageProcessedFrame {
     metrics: BevyJepaMetrics,
     panels: StagePanelData,
     high_res_updated: bool,
+    high_res_input: Option<HighResFrameInput>,
 }
 
 fn stage_request_for_frame(config: &BevyJepaConfig, frame_index: u64) -> FeatureFrameRequest {
-    if config.high_res_pca_every > 0 && frame_index % config.high_res_pca_every == 0 {
-        FeatureFrameRequest::full_pca()
-    } else {
-        FeatureFrameRequest::low_res()
-    }
+    let _ = (config, frame_index);
+    FeatureFrameRequest::low_res()
+}
+
+fn high_res_scheduled_for_frame(config: &BevyJepaConfig, frame_index: u64) -> bool {
+    config.high_res_pca_every > 0 && frame_index.is_multiple_of(config.high_res_pca_every)
 }
 
 struct PendingStageFrame {
@@ -1233,83 +1316,21 @@ struct JepaAsyncTaskOutput {
     result: Result<StageProcessedFrame, String>,
 }
 
-#[derive(Clone, Copy)]
-struct MetricFrameContext {
-    frame_index: u64,
-    encoder_source: BevyJepaEncoderSource,
-    frame_source: BevyJepaFrameSource,
-    camera_frame_received: bool,
-    mask_source: BevyJepaMaskSource,
-    display_transfer: BevyJepaDisplayTransfer,
-    context_tokens: usize,
-    dense_tokens: usize,
-    grid: TokenGridShape,
-    patch_size: usize,
-}
-
-fn bevy_metrics_from_stage(
-    frame: MetricFrameContext,
-    stage_metrics: FeatureFrameMetrics,
-    display_tensor_us: u64,
-    viewer_total_us: u64,
-) -> BevyJepaMetrics {
-    BevyJepaMetrics {
-        frame_index: frame.frame_index,
-        frame_ready: true,
-        encoder_source: frame.encoder_source,
-        encode_path: stage_metrics.encode_path,
-        frame_source: frame.frame_source,
-        camera_frame_received: frame.camera_frame_received,
-        mask_source: frame.mask_source,
-        display_transfer: frame.display_transfer,
-        context_tokens: frame.context_tokens,
-        dense_tokens: frame.dense_tokens,
-        grid_height: frame.grid.height,
-        grid_width: frame.grid.width,
-        patch_size: frame.patch_size,
-        encode_us: stage_metrics.encode_us,
-        cache_update_us: stage_metrics.cache_update_us,
-        token_view_us: stage_metrics.token_view_us,
-        anyup_context_us: stage_metrics.anyup_context_us,
-        anyup_decode_us: stage_metrics.anyup_decode_us,
-        low_res_pca_us: stage_metrics.low_res_pca_project_us,
-        pca_update_us: stage_metrics.pca_update_us,
-        pca_sample_window_frames: stage_metrics.pca_sample_window_frames,
-        pca_sample_frames: stage_metrics.pca_sample_frames,
-        high_res_pca_us: stage_metrics.pca_project_us,
-        display_tensor_us,
-        total_us: stage_metrics.total_us,
-        viewer_total_us,
-        pca_update_applied: stage_metrics.pca_update_applied,
-        input_frame_index: frame.frame_index,
-        input_frames_seen: 0,
-        completed_frames: 0,
-        high_res_frames: u64::from(stage_metrics.anyup_decode_us > 0),
-        input_fps: 0.0,
-        low_res_fps: 0.0,
-        high_res_fps: 0.0,
-        in_flight_frames: 0,
-        queue_dropped_frames: 0,
-        queue_overwritten_frames: 0,
-        stale_completions: 0,
-        last_error: None,
-        stage_metrics,
-    }
-}
-
 fn run_stage_step_with_config_and_request(
     config: &BevyJepaConfig,
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     request: FeatureFrameRequest,
 ) -> Result<StageFrame> {
-    let wall_start = Instant::now();
-    let measured = run_feature_frame_pipeline(config, pipeline, image, mask, request)?;
+    let wall_start = viewer_now();
+    let measured =
+        run_feature_frame_pipeline(config, pipeline, image, write_mask, encode_mask, request)?;
     Ok(StageFrame {
         output: measured.output,
         metrics: measured.metrics,
-        wall_us: micros_u64(wall_start.elapsed().as_micros()),
+        wall_us: viewer_elapsed_us(wall_start),
     })
 }
 
@@ -1317,70 +1338,169 @@ fn run_feature_frame_pipeline(
     config: &BevyJepaConfig,
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     request: FeatureFrameRequest,
 ) -> Result<burn_jepa::MeasuredFeatureFrameBatch<JepaBevyBackend>> {
     match config.encode_path {
-        BevyJepaEncodePath::DensePatchEmbed => {
-            pipeline.step_image_with_mask_nodes_measured(image, mask, request)
+        BevyJepaEncodePath::DensePatchEmbed => pipeline
+            .step_image_with_encode_write_masks_nodes_measured(
+                image,
+                encode_mask,
+                write_mask,
+                request,
+            ),
+        BevyJepaEncodePath::Auto => {
+            run_feature_frame_pipeline_auto(pipeline, image, write_mask, encode_mask, request)
         }
-        BevyJepaEncodePath::Auto => run_feature_frame_pipeline_auto(pipeline, image, mask, request),
-        BevyJepaEncodePath::SparsePatchify => {
-            run_feature_frame_pipeline_sparse_patchify(pipeline, image, mask, request)
-        }
+        BevyJepaEncodePath::SparsePatchify => run_feature_frame_pipeline_sparse_patchify(
+            pipeline,
+            image,
+            write_mask,
+            encode_mask,
+            request,
+        ),
     }
 }
 
 fn run_feature_frame_pipeline_auto(
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     request: FeatureFrameRequest,
 ) -> Result<burn_jepa::MeasuredFeatureFrameBatch<JepaBevyBackend>> {
     #[cfg(feature = "sparse-patchify-wgpu")]
     {
-        run_feature_frame_pipeline_sparse_patchify(pipeline, image, mask, request)
+        if encode_mask.is_dense_ordered() {
+            pipeline.step_image_with_encode_write_masks_nodes_measured(
+                image,
+                encode_mask,
+                write_mask,
+                request,
+            )
+        } else {
+            run_feature_frame_pipeline_sparse_patchify(
+                pipeline,
+                image,
+                write_mask,
+                encode_mask,
+                request,
+            )
+        }
     }
 
     #[cfg(not(feature = "sparse-patchify-wgpu"))]
     {
-        pipeline.step_image_with_mask_nodes_measured(image, mask, request)
+        pipeline.step_image_with_encode_write_masks_nodes_measured(
+            image,
+            encode_mask,
+            write_mask,
+            request,
+        )
     }
+}
+
+#[derive(Clone, Debug)]
+struct ShapePrewarmReport {
+    token_widths: Vec<usize>,
+    total_us: u64,
+}
+
+fn prewarm_feature_frame_shapes(
+    config: &BevyJepaConfig,
+    pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
+    image_size: usize,
+    device: &JepaBevyDevice,
+) -> Result<Option<ShapePrewarmReport>> {
+    if !config.uses_bucketed_sparse_encode() || !config.prewarm_shape_buckets {
+        return Ok(None);
+    }
+    if config.encoder_source == BevyJepaEncoderSource::TinyTest {
+        return Ok(None);
+    }
+    let grid = pipeline.grid();
+    if grid.len() < 256 {
+        return Ok(None);
+    }
+    let masks = shape_prewarm_masks(grid, config);
+    if masks.is_empty() {
+        return Ok(None);
+    }
+
+    let image = synthetic_image_tensor(0, image_size, device);
+    let started = viewer_now();
+    let mut token_widths = Vec::with_capacity(masks.len());
+    for mask in masks {
+        let measured = run_feature_frame_pipeline(
+            config,
+            pipeline,
+            image.clone(),
+            &mask,
+            &mask,
+            FeatureFrameRequest::low_res(),
+        )?;
+        token_widths.push(measured.metrics.sparse_width);
+    }
+    JepaBevyBackend::sync(device)?;
+    let total_us = viewer_elapsed_us(started);
+    pipeline.reset_visualization_state()?;
+    Ok(Some(ShapePrewarmReport {
+        token_widths,
+        total_us,
+    }))
 }
 
 #[cfg(feature = "sparse-patchify-wgpu")]
 fn run_feature_frame_pipeline_sparse_patchify(
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     request: FeatureFrameRequest,
 ) -> Result<burn_jepa::MeasuredFeatureFrameBatch<JepaBevyBackend>> {
-    let batch_mask = SparseMaskBatch::uniform(mask.clone(), pipeline.batch(), pipeline.device())?;
+    let batch_mask =
+        SparseMaskBatch::uniform(encode_mask.clone(), pipeline.batch(), pipeline.device())?;
     let patchify_plan =
         SparsePatchifyBatchPlan::new(batch_mask, pipeline.grid(), pipeline.device())?;
-    pipeline.step_image_with_sparse_patchify_plan_wgpu_nodes_measured(
-        image,
-        &patchify_plan,
-        request,
-        pipeline.config().measurement,
-    )
+    if write_mask == encode_mask {
+        pipeline.step_image_with_sparse_patchify_plan_wgpu_nodes_measured(
+            image,
+            &patchify_plan,
+            request,
+            pipeline.config().measurement,
+        )
+    } else {
+        let write_batch_mask =
+            SparseMaskBatch::uniform(write_mask.clone(), pipeline.batch(), pipeline.device())?;
+        pipeline.step_image_with_sparse_patchify_plan_wgpu_nodes_measured_with_write_mask(
+            image,
+            &patchify_plan,
+            write_batch_mask,
+            request,
+            pipeline.config().measurement,
+        )
+    }
 }
 
 #[cfg(not(feature = "sparse-patchify-wgpu"))]
 fn run_feature_frame_pipeline_sparse_patchify(
     _pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     _image: Tensor<JepaBevyBackend, 4>,
-    _mask: &SparseTokenMask,
+    _write_mask: &SparseTokenMask,
+    _encode_mask: &SparseTokenMask,
     _request: FeatureFrameRequest,
 ) -> Result<burn_jepa::MeasuredFeatureFrameBatch<JepaBevyBackend>> {
     bail!("Bevy sparse patchify requires building bevy_jepa with --features sparse-patchify-wgpu")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_stage_step_metrics(
     config: &BevyJepaConfig,
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     id: FrameId,
     grid: TokenGridShape,
     patch_size: usize,
@@ -1391,7 +1511,8 @@ fn run_stage_step_metrics(
         config,
         pipeline,
         image,
-        mask,
+        write_mask,
+        encode_mask,
         id,
         grid,
         patch_size,
@@ -1401,11 +1522,13 @@ fn run_stage_step_metrics(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_stage_step_metrics_with_request(
     config: &BevyJepaConfig,
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     id: FrameId,
     grid: TokenGridShape,
     patch_size: usize,
@@ -1413,7 +1536,14 @@ fn run_stage_step_metrics_with_request(
     camera_frame_received: bool,
     request: FeatureFrameRequest,
 ) -> Result<ProcessedFrame> {
-    let stage = run_stage_step_with_config_and_request(config, pipeline, image, mask, request)?;
+    let stage = run_stage_step_with_config_and_request(
+        config,
+        pipeline,
+        image,
+        write_mask,
+        encode_mask,
+        request,
+    )?;
     let frame = MetricFrameContext {
         frame_index: id.sequence,
         encoder_source: config.encoder_source,
@@ -1421,8 +1551,8 @@ fn run_stage_step_metrics_with_request(
         camera_frame_received,
         mask_source: config.mask_source,
         display_transfer: config.display_transfer,
-        context_tokens: mask.len(),
-        dense_tokens: mask.dense_len(),
+        context_tokens: write_mask.len(),
+        dense_tokens: write_mask.dense_len(),
         grid,
         patch_size,
     };
@@ -1430,11 +1560,13 @@ fn run_stage_step_metrics_with_request(
     Ok(ProcessedFrame { metrics })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pipeline_step(
     config: &BevyJepaConfig,
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     id: FrameId,
     grid: TokenGridShape,
     patch_size: usize,
@@ -1442,17 +1574,23 @@ fn run_pipeline_step(
     camera_frame_received: bool,
     request: FeatureFrameRequest,
 ) -> Result<ProcessedFrame> {
-    let stage =
-        run_stage_step_with_config_and_request(config, pipeline, image.clone(), mask, request)?;
+    let stage = run_stage_step_with_config_and_request(
+        config,
+        pipeline,
+        image.clone(),
+        write_mask,
+        encode_mask,
+        request,
+    )?;
     let metrics = stage.metrics;
     let output = stage.output;
     let image_size = pipeline.image_size();
-    let display_start = Instant::now();
+    let display_start = viewer_now();
     let low_res_pca = low_res_pca_or_features(output.low_res)?;
     let high_res_pca = high_res_pca_or_low_res(output.high_res, low_res_pca.clone())?;
     let input_rgba = nchw_to_rgba_tensor(image)?;
     let mask_rgba = sparse_mask_to_rgba_tensor::<JepaBevyBackend>(
-        mask,
+        write_mask,
         pipeline.grid(),
         image_size,
         &input_rgba.device(),
@@ -1477,7 +1615,7 @@ fn run_pipeline_step(
     if config.display_transfer == BevyJepaDisplayTransfer::Cpu && config.sync_measurements {
         JepaBevyBackend::sync(&display_device)?;
     }
-    let display_tensor_us = micros_u64(display_start.elapsed().as_micros());
+    let display_tensor_us = viewer_elapsed_us(display_start);
     let viewer_total_us = stage.wall_us.saturating_add(display_tensor_us);
     let frame = MetricFrameContext {
         frame_index: id.sequence,
@@ -1485,8 +1623,8 @@ fn run_pipeline_step(
         frame_source,
         camera_frame_received,
         mask_source: config.mask_source,
-        context_tokens: mask.len(),
-        dense_tokens: mask.dense_len(),
+        context_tokens: write_mask.len(),
+        dense_tokens: write_mask.dense_len(),
         display_transfer: config.display_transfer,
         grid,
         patch_size,
@@ -1496,11 +1634,13 @@ fn run_pipeline_step(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_stage_pipeline_step(
     config: &BevyJepaConfig,
     pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
-    mask: &SparseTokenMask,
+    write_mask: &SparseTokenMask,
+    encode_mask: &SparseTokenMask,
     id: FrameId,
     grid: TokenGridShape,
     patch_size: usize,
@@ -1508,16 +1648,32 @@ fn run_stage_pipeline_step(
     camera_frame_received: bool,
     request: FeatureFrameRequest,
 ) -> Result<StageProcessedFrame> {
-    let stage =
-        run_stage_step_with_config_and_request(config, pipeline, image.clone(), mask, request)?;
+    let stage = run_stage_step_with_config_and_request(
+        config,
+        pipeline,
+        image.clone(),
+        write_mask,
+        encode_mask,
+        request,
+    )?;
     let metrics = stage.metrics;
     let output = stage.output;
     let image_size = pipeline.image_size();
-    let display_start = Instant::now();
+    let display_start = viewer_now();
+    let high_res_input =
+        high_res_scheduled_for_frame(config, id.sequence).then(|| HighResFrameInput {
+            signature: RuntimePipelineSignature::new(config, config.pipeline_image_size()),
+            id,
+            image: image.clone(),
+            low_res_features: output.low_res.features.clone(),
+            pca: pipeline.pca().clone(),
+            display_transfer: config.display_transfer,
+            sync_measurements: config.sync_measurements,
+        });
     let low_res_pca = low_res_pca_or_features(output.low_res)?;
     let high_res_pca = output.high_res.and_then(|high_res| high_res.pca_display);
     let mask_rgba = sparse_mask_to_rgba_tensor::<JepaBevyBackend>(
-        mask,
+        write_mask,
         pipeline.grid(),
         image_size,
         &image.device(),
@@ -1530,7 +1686,7 @@ fn run_stage_pipeline_step(
     if config.sync_measurements {
         JepaBevyBackend::sync(&image.device())?;
     }
-    let display_tensor_us = micros_u64(display_start.elapsed().as_micros());
+    let display_tensor_us = viewer_elapsed_us(display_start);
     let viewer_total_us = stage.wall_us.saturating_add(display_tensor_us);
     let frame = MetricFrameContext {
         frame_index: id.sequence,
@@ -1539,8 +1695,8 @@ fn run_stage_pipeline_step(
         camera_frame_received,
         mask_source: config.mask_source,
         display_transfer: config.display_transfer,
-        context_tokens: mask.len(),
-        dense_tokens: mask.dense_len(),
+        context_tokens: write_mask.len(),
+        dense_tokens: write_mask.dense_len(),
         grid,
         patch_size,
     };
@@ -1565,6 +1721,82 @@ fn run_stage_pipeline_step(
         metrics,
         panels,
         high_res_updated,
+        high_res_input,
+    })
+}
+
+fn run_high_res_anyup_step(
+    runtime: &mut AnyUpHighResRuntime,
+    input: HighResFrameInput,
+) -> Result<HighResProcessedFrame> {
+    let total_start = viewer_now();
+    let device = input.image.device();
+
+    let context_start = viewer_now();
+    let context = runtime.anyup.prepare_image_context_with_grid(
+        input.image,
+        &runtime.anyup_image_grid,
+        Some(runtime.image_size),
+        [runtime.grid.height, runtime.grid.width],
+    );
+    if input.sync_measurements {
+        JepaBevyBackend::sync(&device)?;
+    }
+    let anyup_context_us = viewer_elapsed_us(context_start);
+
+    let pca_start = viewer_now();
+    let pca_values = input.pca.project_nchw(input.low_res_features.clone())?;
+    if input.sync_measurements {
+        JepaBevyBackend::sync(&device)?;
+    }
+    let low_res_pca_us = viewer_elapsed_us(pca_start);
+
+    let decode_start = viewer_now();
+    let pca_values = runtime.anyup.upsample_values_with_context(
+        &context,
+        input.low_res_features,
+        pca_values,
+        Some(runtime.q_chunk_size),
+    );
+    if input.sync_measurements {
+        JepaBevyBackend::sync(&device)?;
+    }
+    let anyup_decode_us = viewer_elapsed_us(decode_start);
+
+    let display_pca_start = viewer_now();
+    let high_res_pca = input.pca.display_nchw(pca_values)?;
+    if input.sync_measurements {
+        JepaBevyBackend::sync(&device)?;
+    }
+    let high_res_pca_us = low_res_pca_us.saturating_add(viewer_elapsed_us(display_pca_start));
+
+    let display_start = viewer_now();
+    let high_res_rgba = nchw_to_rgba_tensor(resize_nchw(high_res_pca, runtime.image_size))?;
+    if input.sync_measurements {
+        JepaBevyBackend::sync(&device)?;
+    }
+    let display_tensor_us = viewer_elapsed_us(display_start);
+    let panels = match input.display_transfer {
+        BevyJepaDisplayTransfer::Gpu => HighResPanelData::Tensor {
+            width: runtime.image_size[1] as u32,
+            height: runtime.image_size[0] as u32,
+            high_res_rgba,
+        },
+        BevyJepaDisplayTransfer::Cpu => HighResPanelData::Host {
+            width: runtime.image_size[1] as u32,
+            height: runtime.image_size[0] as u32,
+            high_res_rgba: tensor_rgba_to_host(high_res_rgba)?,
+        },
+    };
+
+    Ok(HighResProcessedFrame {
+        id: input.id,
+        panels,
+        anyup_context_us,
+        anyup_decode_us,
+        high_res_pca_us,
+        display_tensor_us,
+        total_us: viewer_elapsed_us(total_start),
     })
 }
 
@@ -1747,34 +1979,6 @@ fn pending_stage_image(
     )
 }
 
-fn run_sparse_mask_node(
-    config: &BevyJepaConfig,
-    prev_image: Option<&Tensor<JepaBevyBackend, 4>>,
-    prev_rgba: Option<&RgbaImage>,
-    rgba: Option<&RgbaImage>,
-    image: &Tensor<JepaBevyBackend, 4>,
-    model_config: &VJepaConfig,
-    grid: TokenGridShape,
-) -> Result<SparseMaskNodeOutput> {
-    let mask = match config.mask_source {
-        BevyJepaMaskSource::Autogaze => anyhow::bail!(
-            "AutoGaze mask source requires a loaded model-backed AutoGaze node; \
-             this viewer will not synthesize AutoGaze masks. Use --mask-source patch-diff \
-             or wire a real burn_autogaze pipeline into this graph."
-        ),
-        BevyJepaMaskSource::PatchDiff => patch_diff_mask(
-            prev_image,
-            prev_rgba,
-            rgba,
-            image,
-            model_config,
-            grid,
-            config,
-        ),
-    }?;
-    Ok(SparseMaskNodeOutput { mask })
-}
-
 fn receive_frame() -> Option<RgbaImage> {
     platform::camera::receive_image()
 }
@@ -1869,9 +2073,11 @@ fn rgba_image_to_tensor(
         for x in 0..width {
             let pixel = (y * width + x) * 4;
             let index = y * width + x;
-            values[index] = raw[pixel] as f32 / 255.0;
-            values[height * width + index] = raw[pixel + 1] as f32 / 255.0;
-            values[2 * height * width + index] = raw[pixel + 2] as f32 / 255.0;
+            values[index] = normalize_model_rgb_channel(raw[pixel] as f32 / 255.0, 0);
+            values[height * width + index] =
+                normalize_model_rgb_channel(raw[pixel + 1] as f32 / 255.0, 1);
+            values[2 * height * width + index] =
+                normalize_model_rgb_channel(raw[pixel + 2] as f32 / 255.0, 2);
         }
     }
     Ok(Tensor::<JepaBevyBackend, 4>::from_data(
@@ -1903,135 +2109,6 @@ fn center_square_crop_rgba(frame: &RgbaImage) -> RgbaImage {
     image::imageops::crop_imm(frame, x, y, side, side).to_image()
 }
 
-fn patch_diff_mask(
-    prev_image: Option<&Tensor<JepaBevyBackend, 4>>,
-    prev_rgba: Option<&RgbaImage>,
-    rgba: Option<&RgbaImage>,
-    image: &Tensor<JepaBevyBackend, 4>,
-    model_config: &VJepaConfig,
-    grid: TokenGridShape,
-    config: &BevyJepaConfig,
-) -> Result<SparseTokenMask> {
-    let Some(prev_image) = prev_image else {
-        return center_prior_mask(grid, config.bootstrap_context_tokens(grid.len()));
-    };
-    if let (Some(prev_rgba), Some(rgba)) = (prev_rgba, rgba) {
-        return patch_diff_mask_from_rgba(prev_rgba, rgba, model_config, grid, config);
-    }
-    let video = Tensor::cat(
-        vec![
-            prev_image.clone().reshape([
-                1,
-                3,
-                1,
-                image.shape().dims::<4>()[2],
-                image.shape().dims::<4>()[3],
-            ]),
-            image.clone().reshape([
-                1,
-                3,
-                1,
-                image.shape().dims::<4>()[2],
-                image.shape().dims::<4>()[3],
-            ]),
-        ],
-        2,
-    );
-    let config = patch_diff_sparsity_config(config, grid);
-    patch_diff_context_mask_from_video(&video, model_config, grid, &config)
-}
-
-fn patch_diff_mask_from_rgba(
-    prev: &RgbaImage,
-    current: &RgbaImage,
-    model_config: &VJepaConfig,
-    grid: TokenGridShape,
-    config: &BevyJepaConfig,
-) -> Result<SparseTokenMask> {
-    anyhow::ensure!(
-        grid.depth == 1,
-        "RGBA patch-diff mask expects a single-frame token grid"
-    );
-    anyhow::ensure!(
-        prev.dimensions() == current.dimensions(),
-        "RGBA patch-diff frames must have matching dimensions"
-    );
-    let patch_size = model_config.patch_size.max(1);
-    let height = current.height() as usize;
-    let width = current.width() as usize;
-    anyhow::ensure!(
-        height == grid.height * patch_size && width == grid.width * patch_size,
-        "RGBA patch-diff frame size must match the V-JEPA patch grid"
-    );
-    let prev = prev.as_raw();
-    let current = current.as_raw();
-    let mut scores = vec![0.0f32; grid.len()];
-    for row in 0..grid.height {
-        for col in 0..grid.width {
-            let mut diff_sum = 0.0f32;
-            for y in row * patch_size..(row + 1) * patch_size {
-                for x in col * patch_size..(col + 1) * patch_size {
-                    let offset = (y * width + x) * 4;
-                    for channel in 0..3 {
-                        diff_sum += (current[offset + channel] as f32
-                            - prev[offset + channel] as f32)
-                            .abs()
-                            / 255.0;
-                    }
-                }
-            }
-            let denom = (3 * patch_size * patch_size) as f32;
-            scores[coords_to_token_index(0, row, col, grid)] = diff_sum / denom;
-        }
-    }
-    patch_diff_context_mask_from_scores(scores, grid, &patch_diff_sparsity_config(config, grid))
-}
-
-fn patch_diff_sparsity_config(
-    config: &BevyJepaConfig,
-    grid: TokenGridShape,
-) -> SparseJepaPatchDiffSparsityConfig {
-    let max_context_tokens = config.context_tokens(grid.len());
-    let min_context_tokens = config
-        .min_context_tokens(grid.len())
-        .min(max_context_tokens);
-    let target_tokens = grid.len().saturating_sub(max_context_tokens).max(1);
-    SparseJepaPatchDiffSparsityConfig::adaptive_threshold(
-        config.patch_diff_threshold,
-        min_context_tokens,
-        max_context_tokens,
-        target_tokens,
-    )
-}
-
-fn center_prior_mask(grid: TokenGridShape, context_tokens: usize) -> Result<SparseTokenMask> {
-    let center_row = grid.height.saturating_sub(1) as f32 * 0.5;
-    let center_col = grid.width.saturating_sub(1) as f32 * 0.5;
-    let mut scores = Vec::with_capacity(grid.len());
-    for row in 0..grid.height {
-        for col in 0..grid.width {
-            let dr = row as f32 - center_row;
-            let dc = col as f32 - center_col;
-            let dist = dr * dr + dc * dc;
-            scores.push((coords_to_token_index(0, row, col, grid), dist));
-        }
-    }
-    scores.sort_by(|left, right| {
-        left.1
-            .partial_cmp(&right.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    SparseTokenMask::new(
-        scores
-            .into_iter()
-            .take(context_tokens.max(1).min(grid.len()))
-            .map(|(index, _)| index)
-            .collect(),
-        grid.len(),
-    )
-}
-
 fn synthetic_image_tensor(
     frame_index: u64,
     image_size: usize,
@@ -2052,13 +2129,20 @@ fn synthetic_image_tensor(
             let base =
                 (x as f32 / width.max(1) as f32 * 0.45) + (y as f32 / height.max(1) as f32 * 0.25);
             let index = y * width + x;
-            values[index] = (base + blob * 0.6).clamp(0.0, 1.0);
-            values[height * width + index] = ((1.0 - base) * 0.55 + blob * 0.35).clamp(0.0, 1.0);
-            values[2 * height * width + index] =
-                ((phase.sin() * 0.15 + 0.25) + blob * 0.5).clamp(0.0, 1.0);
+            values[index] = normalize_model_rgb_channel((base + blob * 0.6).clamp(0.0, 1.0), 0);
+            values[height * width + index] =
+                normalize_model_rgb_channel(((1.0 - base) * 0.55 + blob * 0.35).clamp(0.0, 1.0), 1);
+            values[2 * height * width + index] = normalize_model_rgb_channel(
+                ((phase.sin() * 0.15 + 0.25) + blob * 0.5).clamp(0.0, 1.0),
+                2,
+            );
         }
     }
     Tensor::<JepaBevyBackend, 4>::from_data(TensorData::new(values, [1, 3, height, width]), device)
+}
+
+fn normalize_model_rgb_channel(value: f32, channel: usize) -> f32 {
+    (value - VJEPA_IMAGE_MEAN[channel]) / VJEPA_IMAGE_STD[channel]
 }
 
 fn nchw_to_rgba_tensor(tensor: Tensor<JepaBevyBackend, 4>) -> Result<Tensor<JepaBevyBackend, 3>> {
@@ -2142,98 +2226,77 @@ fn update_metrics_overlay(
     runtime: Res<JepaRuntime>,
     mut query: Query<&mut TextSpan, With<MetricsText>>,
 ) {
-    if !config.show_metrics || (!metrics.is_changed() && !runtime.is_changed()) {
+    if !metrics.is_changed() && !runtime.is_changed() {
         return;
     }
-    let text = if let Some(error) = runtime.last_error.as_ref().or(metrics.last_error.as_ref()) {
-        format!(
-            "status:{:<12} error:{:<64}",
-            "error",
-            truncate_metric_text(error, 64)
-        )
-    } else {
-        format_metrics_line(&config, &metrics)
-    };
+    publish_wasm_metrics(&metrics);
+    if !config.show_metrics {
+        return;
+    }
+    if let Some(error) = runtime.last_error.as_ref().or(metrics.last_error.as_ref()) {
+        publish_wasm_error(error);
+    }
+    let text = format_metrics_line(&config, &metrics);
     for mut span in &mut query {
         **span = text.clone();
     }
 }
 
-fn format_metrics_waiting_line() -> String {
-    format_metrics_line(&BevyJepaConfig::default(), &BevyJepaMetrics::default())
+#[cfg(target_arch = "wasm32")]
+fn publish_wasm_error(error: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let _ = js_sys::Reflect::set(
+        window.as_ref(),
+        &"__jepaLastError".into(),
+        &wasm_bindgen::JsValue::from_str(error),
+    );
 }
 
-fn format_metrics_line(config: &BevyJepaConfig, metrics: &BevyJepaMetrics) -> String {
-    let source = metrics_source_status(config, metrics);
-    format!(
-        "src:{:<18} model:{:<13} enc:{:<15} mask:{:<10} seq:{:>5}/{:<5} grid:{:>3}x{:<3} p:{:<2} sparse:{:>5.1}% fps:{:>5.1}/{:>5.1}/{:>5.1} infl:{:>1} drop:{:>4} ovw:{:>4} view:{:>7.2}ms core:{:>7.2}ms disp:{:>6.2}ms enc:{:>6.2}ms cache:{:>6.2}ms any:{:>6.2}/{:>6.2}ms pca:{:>6.2}/{:>6.2}ms upd:{:<3} {:>3}/{:<3}f",
-        source,
-        metrics.encoder_source,
-        metrics.encode_path,
-        metrics.mask_source,
-        metrics.input_frame_index,
-        metrics.frame_index,
-        metrics.grid_height,
-        metrics.grid_width,
-        metrics.patch_size,
-        metrics.density() * 100.0,
-        metrics.input_fps,
-        metrics.low_res_fps,
-        metrics.high_res_fps,
-        metrics.in_flight_frames,
-        metrics.queue_dropped_frames,
-        metrics.queue_overwritten_frames,
-        micros_to_ms(metrics.viewer_total_us),
-        micros_to_ms(metrics.total_us),
-        micros_to_ms(metrics.display_tensor_us),
-        micros_to_ms(metrics.encode_us),
-        micros_to_ms(metrics.cache_update_us),
-        micros_to_ms(metrics.anyup_context_us),
-        micros_to_ms(metrics.anyup_decode_us),
-        micros_to_ms(metrics.low_res_pca_us),
-        micros_to_ms(metrics.high_res_pca_us),
-        if metrics.pca_update_applied {
-            "yes"
-        } else {
-            "no"
-        },
-        metrics.pca_sample_frames,
-        metrics.pca_sample_window_frames,
-    )
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_wasm_error(_error: &str) {}
+
+#[cfg(target_arch = "wasm32")]
+fn publish_wasm_metrics(metrics: &BevyJepaMetrics) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let object = js_sys::Object::new();
+    let fields = [
+        ("frameIndex", metrics.frame_index as f64),
+        ("inputFrameIndex", metrics.input_frame_index as f64),
+        ("inputFramesSeen", metrics.input_frames_seen as f64),
+        ("completedFrames", metrics.completed_frames as f64),
+        ("contextTokens", metrics.context_tokens as f64),
+        ("denseTokens", metrics.dense_tokens as f64),
+        ("gridHeight", metrics.grid_height as f64),
+        ("gridWidth", metrics.grid_width as f64),
+        ("patchSize", metrics.patch_size as f64),
+        ("encodeUs", metrics.encode_us as f64),
+        ("cacheUpdateUs", metrics.cache_update_us as f64),
+        ("lowResPcaUs", metrics.low_res_pca_us as f64),
+        ("totalUs", metrics.total_us as f64),
+        ("viewerTotalUs", metrics.viewer_total_us as f64),
+    ];
+    for (key, value) in fields {
+        let _ = js_sys::Reflect::set(&object, &key.into(), &value.into());
+    }
+    let _ = js_sys::Reflect::set(
+        &object,
+        &"encoderSource".into(),
+        &metrics.encoder_source.to_string().into(),
+    );
+    let _ = js_sys::Reflect::set(
+        &object,
+        &"maskSource".into(),
+        &metrics.mask_source.to_string().into(),
+    );
+    let _ = js_sys::Reflect::set(&window, &"__jepaPipelineMetrics".into(), object.as_ref());
 }
 
-fn metrics_source_status(config: &BevyJepaConfig, metrics: &BevyJepaMetrics) -> &'static str {
-    if !metrics.frame_ready {
-        return match config.source {
-            BevyJepaFrameSource::Camera => "camera:wait",
-            BevyJepaFrameSource::StaticImage => "static:wait",
-            BevyJepaFrameSource::SyntheticLocalMotion => "synthetic:wait",
-        };
-    }
-
-    match metrics.frame_source {
-        BevyJepaFrameSource::Camera => "camera:live",
-        BevyJepaFrameSource::StaticImage => "static:ready",
-        BevyJepaFrameSource::SyntheticLocalMotion => "synthetic:ready",
-    }
-}
-
-fn truncate_metric_text(value: &str, max_chars: usize) -> String {
-    let total = value.chars().count();
-    if total <= max_chars {
-        return value.to_string();
-    }
-    let keep = max_chars.saturating_sub(3);
-    let mut output = String::new();
-    for (index, ch) in value.chars().enumerate() {
-        if index >= keep {
-            break;
-        }
-        output.push(ch);
-    }
-    output.push_str("...");
-    output
-}
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_wasm_metrics(_metrics: &BevyJepaMetrics) {}
 
 fn keyboard_controls(
     mut config: ResMut<BevyJepaConfig>,
@@ -2333,790 +2396,4 @@ fn micros_u64(value: u128) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use burn_jepa::FeatureFrameJepaEncoderKind;
-
-    fn tiny_viewer_config() -> BevyJepaConfig {
-        BevyJepaConfig {
-            encoder_source: BevyJepaEncoderSource::TinyTest,
-            ttt_model_path: None,
-            jepa_checkpoint_dir: None,
-            jepa_config_path: None,
-            ..BevyJepaConfig::default()
-        }
-    }
-
-    fn values4(tensor: Tensor<JepaBevyBackend, 4>) -> Vec<f32> {
-        tensor.to_data().to_vec::<f32>().expect("tensor values")
-    }
-
-    #[test]
-    fn center_prior_mask_keeps_requested_density() {
-        let grid = TokenGridShape::new(1, 4, 4);
-        let mask = center_prior_mask(grid, 5).expect("mask");
-        assert_eq!(mask.dense_len(), 16);
-        assert_eq!(mask.len(), 5);
-    }
-
-    #[test]
-    fn synthetic_source_uses_model_sized_tensor() {
-        let device = JepaBevyDevice::default();
-        let image = synthetic_image_tensor(0, 64, &device);
-        assert_eq!(image.shape().dims::<4>(), [1, 3, 64, 64]);
-    }
-
-    #[test]
-    fn default_source_is_camera() {
-        assert_eq!(
-            BevyJepaConfig::default().source,
-            BevyJepaFrameSource::Camera
-        );
-    }
-
-    #[test]
-    fn default_mask_source_is_patch_diff() {
-        assert_eq!(
-            BevyJepaConfig::default().encoder_source,
-            BevyJepaEncoderSource::TrainedTtt
-        );
-        assert_eq!(
-            BevyJepaConfig::default().encode_path,
-            BevyJepaEncodePath::Auto
-        );
-        assert_eq!(
-            BevyJepaConfig::default().mask_source,
-            BevyJepaMaskSource::PatchDiff
-        );
-        assert_eq!(BevyJepaConfig::default().image_size, DEFAULT_IMAGE_SIZE);
-        assert_eq!(
-            BevyJepaConfig::default().pipeline_image_size(),
-            DEFAULT_IMAGE_SIZE
-        );
-        assert_eq!(BevyJepaConfig::default().context_density, 1.0);
-        assert_eq!(
-            BevyJepaConfig::default().min_context_density,
-            DEFAULT_MIN_CONTEXT_DENSITY
-        );
-        assert_eq!(BevyJepaConfig::default().min_context_density, 0.0);
-        assert!(
-            (BevyJepaConfig::default().patch_diff_quality() - DEFAULT_PATCH_DIFF_QUALITY).abs()
-                <= f32::EPSILON
-        );
-        assert_eq!(BevyJepaConfig::default().bootstrap_context_density, 1.0);
-        assert_eq!(
-            BevyJepaConfig::default().pca_update_every,
-            DEFAULT_PCA_UPDATE_EVERY
-        );
-        assert_eq!(
-            BevyJepaConfig::default().high_res_pca_every,
-            DEFAULT_HIGH_RES_PCA_EVERY
-        );
-        assert_eq!(
-            stage_request_for_frame(&BevyJepaConfig::default(), 0),
-            FeatureFrameRequest::full_pca()
-        );
-        assert_eq!(
-            stage_request_for_frame(&BevyJepaConfig::default(), 1),
-            FeatureFrameRequest::low_res()
-        );
-        assert_eq!(
-            BevyJepaMaskSource::PatchDiff.next(),
-            BevyJepaMaskSource::PatchDiff
-        );
-    }
-
-    #[test]
-    fn viewer_pipeline_promotes_small_image_requests_to_minimum_resolution() {
-        let config = BevyJepaConfig {
-            image_size: 64,
-            ..BevyJepaConfig::default()
-        };
-        assert_eq!(config.pipeline_image_size(), MIN_PIPELINE_IMAGE_SIZE);
-    }
-
-    #[test]
-    fn viewer_pipeline_accepts_trained_256_resolution() {
-        let config = BevyJepaConfig {
-            image_size: MIN_PIPELINE_IMAGE_SIZE,
-            ..BevyJepaConfig::default()
-        };
-        assert_eq!(config.pipeline_image_size(), 256);
-    }
-
-    #[test]
-    fn default_patch_diff_quality_is_threshold_not_static_sparsity() {
-        let config = BevyJepaConfig::default();
-        assert_eq!(config.min_context_tokens(256), 1);
-        assert_eq!(config.min_context_tokens(1024), 1);
-        assert!((config.patch_diff_threshold - 0.15).abs() <= f32::EPSILON);
-        assert!((config.patch_diff_quality() - 0.85).abs() <= f32::EPSILON);
-    }
-
-    #[test]
-    fn default_patch_diff_static_frame_keeps_dynamic_minimum_only() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::Camera,
-            mask_source: BevyJepaMaskSource::PatchDiff,
-            ..BevyJepaConfig::default()
-        };
-        let mut model_config = VJepaConfig::tiny_for_tests();
-        model_config.image_size = 64;
-        model_config.num_frames = 2;
-        model_config.tubelet_size = 2;
-        model_config.patch_size = 16;
-        let grid = TokenGridShape::new(1, 4, 4);
-        let previous_rgba = RgbaImage::new(64, 64);
-        let current_rgba = previous_rgba.clone();
-        let previous = rgba_image_to_tensor(previous_rgba.clone(), 64, &device).expect("prev");
-        let current = rgba_image_to_tensor(current_rgba.clone(), 64, &device).expect("current");
-
-        let output = run_sparse_mask_node(
-            &config,
-            Some(&previous),
-            Some(&previous_rgba),
-            Some(&current_rgba),
-            &current,
-            &model_config,
-            grid,
-        )
-        .expect("static patch-diff mask");
-
-        assert_eq!(output.mask.dense_len(), grid.len());
-        assert_eq!(output.mask.len(), 1);
-        assert!(
-            output.mask.len() < (grid.len() as f32 * DEFAULT_PATCH_DIFF_QUALITY).round() as usize,
-            "patch-diff quality must not be interpreted as a fixed sparsity floor"
-        );
-    }
-
-    #[test]
-    fn low_res_feature_fallback_preserves_nchw_spatial_grid() {
-        let device = JepaBevyDevice::default();
-        let features = Tensor::<JepaBevyBackend, 4>::from_data(
-            TensorData::new(
-                vec![
-                    1.0, 2.0, 3.0, 4.0, //
-                    10.0, 20.0, 30.0, 40.0, //
-                    -1.0, -2.0, -3.0, -4.0, //
-                    99.0, 98.0, 97.0, 96.0,
-                ],
-                [1, 4, 2, 2],
-            ),
-            &device,
-        );
-
-        let display = low_res_pca_or_features(LowResFrameArtifacts {
-            features,
-            pca_display: None,
-        })
-        .expect("low-res display fallback");
-
-        assert_eq!(display.shape().dims::<4>(), [1, 3, 2, 2]);
-        assert_eq!(
-            values4(display),
-            vec![
-                1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, -1.0, -2.0, -3.0, -4.0
-            ]
-        );
-    }
-
-    #[test]
-    fn low_res_display_resize_preserves_patch_grid_colors() {
-        let device = JepaBevyDevice::default();
-        let low_res = Tensor::<JepaBevyBackend, 4>::from_data(
-            TensorData::new(
-                vec![
-                    1.0, 0.0, 0.0, 1.0, //
-                    0.0, 1.0, 0.0, 1.0, //
-                    0.0, 0.0, 1.0, 1.0,
-                ],
-                [1, 3, 2, 2],
-            ),
-            &device,
-        );
-
-        let resized = resize_nchw(low_res, [32, 32]);
-        let rgba = tensor_rgba_to_host(nchw_to_rgba_tensor(resized).expect("rgba tensor"))
-            .expect("host rgba");
-        let sample = |x: usize, y: usize| {
-            let offset = (y * 32 + x) * 4;
-            [rgba[offset], rgba[offset + 1], rgba[offset + 2]]
-        };
-
-        assert_eq!(sample(4, 4), [255, 0, 0]);
-        assert_eq!(sample(28, 4), [0, 255, 0]);
-        assert_eq!(sample(4, 28), [0, 0, 255]);
-        assert_eq!(sample(28, 28), [255, 255, 255]);
-    }
-
-    #[test]
-    fn viewer_pipeline_rounds_image_requests_to_patch_multiple() {
-        let config = BevyJepaConfig {
-            image_size: MIN_PIPELINE_IMAGE_SIZE + 1,
-            ..BevyJepaConfig::default()
-        };
-        assert_eq!(
-            config.pipeline_image_size() % PIPELINE_IMAGE_SIZE_MULTIPLE,
-            0
-        );
-        assert!(config.pipeline_image_size() > MIN_PIPELINE_IMAGE_SIZE);
-    }
-
-    #[test]
-    fn camera_source_waits_without_generating_synthetic_warmup() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::Camera,
-            ..BevyJepaConfig::default()
-        };
-        let mut pipeline = BevyJepaHeadlessPipeline::new(config, device);
-        let err = pipeline
-            .step_stage_only()
-            .expect_err("camera source should wait for a real frame");
-        assert!(err.to_string().contains("camera frame is not ready"));
-    }
-
-    #[test]
-    fn camera_source_without_frame_does_not_initialize_pipeline() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::Camera,
-            ..BevyJepaConfig::default()
-        };
-        let mut runtime = JepaRuntime::default();
-        let processed =
-            process_runtime_frame(&config, &mut runtime, &device, BevyJepaStepMode::StageOnly)
-                .expect("camera wait should not be an error inside the Bevy schedule");
-        assert!(processed.is_none());
-        assert_eq!(runtime.frame_index, 0);
-        assert!(runtime.pipeline.is_none());
-        assert!(runtime.prev_image.is_none());
-    }
-
-    #[test]
-    fn source_node_keeps_latest_pending_stage_frame_while_worker_runs() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::SyntheticLocalMotion,
-            high_res_pca_every: 8,
-            ..tiny_viewer_config()
-        };
-        let mut runtime = JepaRuntime::default();
-
-        let first = process_runtime_source_frame(&config, &mut runtime, &device)
-            .expect("first source frame")
-            .expect("synthetic source");
-        assert_eq!(first.source, BevyJepaFrameSource::SyntheticLocalMotion);
-        assert_eq!(first.sequence, 0);
-        assert!(runtime.active_task.is_some());
-        assert!(runtime.pending_stage.is_none());
-        assert!(runtime.prev_stage_image.is_some());
-        assert_eq!(runtime.input_frames_seen, 1);
-
-        process_runtime_source_frame(&config, &mut runtime, &device)
-            .expect("second source frame")
-            .expect("synthetic source");
-        assert!(runtime.active_task.is_some());
-        assert_eq!(
-            runtime
-                .pending_stage
-                .as_ref()
-                .map(|pending| pending.id.sequence),
-            Some(1)
-        );
-        assert_eq!(runtime.dropped_frames, 0);
-        assert_eq!(runtime.overwritten_frames, 0);
-
-        process_runtime_source_frame(&config, &mut runtime, &device)
-            .expect("third source frame")
-            .expect("synthetic source");
-        assert_eq!(
-            runtime
-                .pending_stage
-                .as_ref()
-                .map(|pending| pending.id.sequence),
-            Some(2)
-        );
-        assert_eq!(runtime.input_frames_seen, 3);
-        assert_eq!(runtime.dropped_frames, 1);
-        assert_eq!(runtime.overwritten_frames, 1);
-
-        let mut metrics = BevyJepaMetrics::default();
-        runtime.apply_runtime_counts(&mut metrics);
-        assert_eq!(metrics.in_flight_frames, 2);
-        assert_eq!(metrics.queue_dropped_frames, 1);
-        assert_eq!(metrics.queue_overwritten_frames, 1);
-        assert_eq!(metrics.input_frame_index, 2);
-    }
-
-    #[test]
-    fn autogaze_mask_source_requires_real_model_node() {
-        let device = JepaBevyDevice::default();
-        let mut pipeline = BevyJepaHeadlessPipeline::new(
-            BevyJepaConfig {
-                source: BevyJepaFrameSource::SyntheticLocalMotion,
-                mask_source: BevyJepaMaskSource::Autogaze,
-                ..tiny_viewer_config()
-            },
-            device,
-        );
-        let err = pipeline
-            .step_stage_only()
-            .expect_err("fake AutoGaze masks must not run");
-        assert!(
-            err.to_string()
-                .contains("loaded model-backed AutoGaze node")
-        );
-    }
-
-    #[test]
-    fn patch_diff_mask_selects_changed_camera_patch() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::Camera,
-            mask_source: BevyJepaMaskSource::PatchDiff,
-            context_density: 1.0 / 16.0,
-            patch_diff_threshold: 0.01,
-            ..BevyJepaConfig::default()
-        };
-        let mut model_config = VJepaConfig::tiny_for_tests();
-        model_config.image_size = 64;
-        model_config.num_frames = 2;
-        model_config.tubelet_size = 2;
-        model_config.patch_size = 16;
-        let grid = TokenGridShape::new(1, 4, 4);
-        let previous_rgba = RgbaImage::new(64, 64);
-        let current_rgba =
-            rgba_with_patches(64, 64, &[(2, 1)], 16, image::Rgba([255, 255, 255, 255]));
-        let previous = rgba_image_to_tensor(previous_rgba.clone(), 64, &device).expect("prev");
-        let current = rgba_image_to_tensor(current_rgba.clone(), 64, &device).expect("current");
-
-        let output = run_sparse_mask_node(
-            &config,
-            Some(&previous),
-            Some(&previous_rgba),
-            Some(&current_rgba),
-            &current,
-            &model_config,
-            grid,
-        )
-        .expect("patch-diff mask");
-        assert_eq!(output.mask.len(), 1);
-        assert_eq!(output.mask.dense_len(), grid.len());
-        assert_eq!(
-            output.mask.indices(),
-            &[coords_to_token_index(0, 2, 1, grid)]
-        );
-    }
-
-    #[test]
-    fn patch_diff_mask_includes_all_patches_above_threshold() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::Camera,
-            mask_source: BevyJepaMaskSource::PatchDiff,
-            context_density: 1.0 / 16.0,
-            patch_diff_threshold: 0.01,
-            ..BevyJepaConfig::default()
-        };
-        let mut model_config = VJepaConfig::tiny_for_tests();
-        model_config.image_size = 64;
-        model_config.num_frames = 2;
-        model_config.tubelet_size = 2;
-        model_config.patch_size = 16;
-        let grid = TokenGridShape::new(1, 4, 4);
-        let changed = [(0, 0), (1, 3), (2, 1), (3, 2)];
-        let previous_rgba = RgbaImage::new(64, 64);
-        let current_rgba =
-            rgba_with_patches(64, 64, &changed, 16, image::Rgba([255, 255, 255, 255]));
-        let previous = rgba_image_to_tensor(previous_rgba.clone(), 64, &device).expect("prev");
-        let current = rgba_image_to_tensor(current_rgba.clone(), 64, &device).expect("current");
-
-        let output = run_sparse_mask_node(
-            &config,
-            Some(&previous),
-            Some(&previous_rgba),
-            Some(&current_rgba),
-            &current,
-            &model_config,
-            grid,
-        )
-        .expect("patch-diff mask");
-
-        assert_eq!(
-            output.mask.len(),
-            changed.len(),
-            "adaptive patch-diff thresholding must not top-k cap changed patches"
-        );
-        assert_eq!(
-            output.mask.indices(),
-            &[
-                coords_to_token_index(0, 0, 0, grid),
-                coords_to_token_index(0, 1, 3, grid),
-                coords_to_token_index(0, 2, 1, grid),
-                coords_to_token_index(0, 3, 2, grid),
-            ]
-        );
-    }
-
-    #[test]
-    fn patch_diff_mask_uses_adaptive_density_for_changed_patches() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::Camera,
-            mask_source: BevyJepaMaskSource::PatchDiff,
-            context_density: 1.0,
-            patch_diff_threshold: 0.01,
-            ..BevyJepaConfig::default()
-        };
-        let mut model_config = VJepaConfig::tiny_for_tests();
-        model_config.image_size = 64;
-        model_config.num_frames = 2;
-        model_config.tubelet_size = 2;
-        model_config.patch_size = 16;
-        let grid = TokenGridShape::new(1, 4, 4);
-        let previous_rgba = RgbaImage::new(64, 64);
-        let current_rgba = rgba_with_patches(
-            64,
-            64,
-            &[(0, 0), (3, 2)],
-            16,
-            image::Rgba([255, 255, 255, 255]),
-        );
-        let previous = rgba_image_to_tensor(previous_rgba.clone(), 64, &device).expect("prev");
-        let current = rgba_image_to_tensor(current_rgba.clone(), 64, &device).expect("current");
-
-        let output = run_sparse_mask_node(
-            &config,
-            Some(&previous),
-            Some(&previous_rgba),
-            Some(&current_rgba),
-            &current,
-            &model_config,
-            grid,
-        )
-        .expect("patch-diff mask");
-        assert_eq!(output.mask.len(), 2);
-        assert_eq!(
-            output.mask.indices(),
-            &[
-                coords_to_token_index(0, 0, 0, grid),
-                coords_to_token_index(0, 3, 2, grid),
-            ]
-        );
-    }
-
-    #[test]
-    fn patch_diff_first_frame_bootstraps_dense_token_cache() {
-        let device = JepaBevyDevice::default();
-        let config = BevyJepaConfig {
-            bootstrap_context_density: 1.0,
-            ..BevyJepaConfig::default()
-        };
-        let mut model_config = VJepaConfig::tiny_for_tests();
-        model_config.image_size = 64;
-        model_config.num_frames = 2;
-        model_config.tubelet_size = 2;
-        model_config.patch_size = 16;
-        let grid = TokenGridShape::new(1, 4, 4);
-        let current = rgba_image_to_tensor(RgbaImage::new(64, 64), 64, &device).expect("current");
-
-        let output = run_sparse_mask_node(&config, None, None, None, &current, &model_config, grid)
-            .expect("bootstrap mask");
-        assert_eq!(output.mask.len(), grid.len());
-    }
-
-    #[test]
-    fn rgba_camera_frame_converts_to_model_sized_tensor() {
-        let device = JepaBevyDevice::default();
-        let frame = RgbaImage::from_pixel(4, 2, image::Rgba([128, 64, 32, 255]));
-        let tensor = rgba_image_to_tensor(frame, 64, &device).expect("rgba tensor");
-        assert_eq!(tensor.shape().dims::<4>(), [1, 3, 64, 64]);
-    }
-
-    #[test]
-    fn rgba_camera_preprocess_center_crops_before_resizing() {
-        let mut frame = RgbaImage::new(4, 2);
-        for y in 0..2 {
-            frame.put_pixel(0, y, image::Rgba([255, 0, 0, 255]));
-            frame.put_pixel(1, y, image::Rgba([0, 255, 0, 255]));
-            frame.put_pixel(2, y, image::Rgba([0, 0, 255, 255]));
-            frame.put_pixel(3, y, image::Rgba([255, 0, 0, 255]));
-        }
-
-        let cropped = resize_source_rgba(frame, 2);
-
-        assert_eq!(cropped.dimensions(), (2, 2));
-        assert_eq!(*cropped.get_pixel(0, 0), image::Rgba([0, 255, 0, 255]));
-        assert_eq!(*cropped.get_pixel(1, 0), image::Rgba([0, 0, 255, 255]));
-        assert_eq!(*cropped.get_pixel(0, 1), image::Rgba([0, 255, 0, 255]));
-        assert_eq!(*cropped.get_pixel(1, 1), image::Rgba([0, 0, 255, 255]));
-    }
-
-    #[test]
-    fn frame_source_parses_camera_aliases() {
-        assert_eq!(
-            "webcam".parse::<BevyJepaFrameSource>().expect("webcam"),
-            BevyJepaFrameSource::Camera
-        );
-        assert_eq!(
-            "image".parse::<BevyJepaFrameSource>().expect("image"),
-            BevyJepaFrameSource::StaticImage
-        );
-    }
-
-    #[test]
-    fn metrics_overlay_line_uses_stable_field_widths() {
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::SyntheticLocalMotion,
-            ..tiny_viewer_config()
-        };
-        let mut first = BevyJepaMetrics {
-            frame_ready: true,
-            frame_source: BevyJepaFrameSource::SyntheticLocalMotion,
-            mask_source: BevyJepaMaskSource::PatchDiff,
-            context_tokens: 1,
-            dense_tokens: 16,
-            viewer_total_us: 9_000,
-            total_us: 8_000,
-            ..BevyJepaMetrics::default()
-        };
-        let mut second = first.clone();
-        second.context_tokens = 16;
-        second.viewer_total_us = 123_450;
-        second.total_us = 98_760;
-        second.anyup_decode_us = 12_345;
-        second.pca_sample_frames = 16;
-        second.pca_sample_window_frames = 16;
-        second.pca_update_applied = true;
-
-        assert_eq!(
-            format_metrics_line(&config, &first).len(),
-            format_metrics_line(&config, &second).len()
-        );
-        first.frame_ready = false;
-        assert_eq!(
-            format_metrics_waiting_line().len(),
-            format_metrics_line(&config, &first).len()
-        );
-    }
-
-    #[test]
-    fn headless_metrics_align_with_raw_stage_metrics() {
-        let device = JepaBevyDevice::default();
-        let mut pipeline = BevyJepaHeadlessPipeline::new(
-            BevyJepaConfig {
-                source: BevyJepaFrameSource::SyntheticLocalMotion,
-                ..tiny_viewer_config()
-            },
-            device,
-        );
-
-        let core = pipeline.step_stage_only().expect("stage-only viewer step");
-        assert!(core.metrics.aligns_with_stage_metrics());
-        assert_eq!(core.metrics.display_tensor_us, 0);
-        assert_eq!(
-            core.metrics.context_tokens,
-            core.metrics.stage_metrics.sparse_width
-        );
-        assert_eq!(
-            core.metrics.dense_tokens,
-            core.metrics.stage_metrics.dense_tokens_per_frame
-        );
-        assert_eq!(core.metrics.grid_height, DEFAULT_IMAGE_SIZE / 16);
-        assert_eq!(core.metrics.grid_width, DEFAULT_IMAGE_SIZE / 16);
-        assert_eq!(core.metrics.patch_size, 16);
-        assert_eq!(core.metrics.dense_tokens, 256);
-        assert_eq!(core.metrics.encoder_source, BevyJepaEncoderSource::TinyTest);
-
-        let display = pipeline
-            .step_with_display_panels()
-            .expect("display viewer step");
-        assert!(display.metrics.aligns_with_stage_metrics());
-        assert_eq!(
-            display.metrics.display_transfer,
-            BevyJepaDisplayTransfer::Gpu
-        );
-        assert!(display.metrics.viewer_total_us >= display.metrics.total_us);
-        assert!(display.metrics.viewer_total_us >= display.metrics.display_tensor_us);
-    }
-
-    #[test]
-    fn headless_stage_request_can_measure_low_res_only_path() {
-        let device = JepaBevyDevice::default();
-        let mut pipeline = BevyJepaHeadlessPipeline::new(
-            BevyJepaConfig {
-                source: BevyJepaFrameSource::SyntheticLocalMotion,
-                ..tiny_viewer_config()
-            },
-            device,
-        );
-
-        let output = pipeline
-            .step_with_stage_request(FeatureFrameRequest::low_res())
-            .expect("low-res-only viewer step");
-
-        assert!(output.metrics.aligns_with_stage_metrics());
-        assert_eq!(output.metrics.anyup_decode_us, 0);
-        assert_eq!(output.metrics.high_res_pca_us, 0);
-        assert!(output.metrics.low_res_pca_us > 0 || !output.metrics.stage_metrics.measured);
-    }
-
-    #[test]
-    fn highres_pipeline_can_run_ttt_encoder_branch() {
-        let device = JepaBevyDevice::default();
-        let model_config = tiny_viewer_model_config(32);
-        let base = VJepa2_1Model::<JepaBevyBackend>::new(&model_config, &device);
-        let ttt = VJepaTttModel::from_model(base, TttEncoderConfig::default(), &device)
-            .expect("TTT model");
-        let mut anyup_config = AnyUpConfig::tiny_for_tests();
-        anyup_config.input_dim = 3;
-        let anyup = AnyUp::<JepaBevyBackend>::new(anyup_config, &device).expect("AnyUp");
-        let mut pipeline = FeatureFramePipeline::<JepaBevyBackend>::new_with_encoder(
-            FeatureFrameJepaEncoder::ttt(ttt),
-            anyup,
-            &model_config,
-            FeatureFramePipelineConfig::default(),
-            1,
-            [32, 32],
-            &device,
-        )
-        .expect("TTT feature-frame pipeline");
-        assert_eq!(pipeline.encoder_kind(), FeatureFrameJepaEncoderKind::Ttt);
-
-        let image = synthetic_image_tensor(0, 32, &device);
-        let mask = SparseTokenMask::all(pipeline.grid().len());
-        let output = pipeline
-            .step_image_with_mask_nodes_measured(image, &mask, FeatureFrameRequest::low_res())
-            .expect("TTT pipeline step");
-        assert_eq!(output.output.encoded.grid, pipeline.grid());
-        assert_eq!(
-            output.output.encoded.tokens.shape().dims::<3>()[1],
-            pipeline.grid().len()
-        );
-    }
-
-    #[cfg(feature = "sparse-patchify-wgpu")]
-    #[test]
-    fn highres_pipeline_can_run_ttt_sparse_patchify_branch() {
-        let device = JepaBevyDevice::default();
-        let model_config = tiny_viewer_model_config(32);
-        let base = VJepa2_1Model::<JepaBevyBackend>::new(&model_config, &device);
-        let ttt = VJepaTttModel::from_model(base, TttEncoderConfig::default(), &device)
-            .expect("TTT model");
-        let mut anyup_config = AnyUpConfig::tiny_for_tests();
-        anyup_config.input_dim = 3;
-        let anyup = AnyUp::<JepaBevyBackend>::new(anyup_config, &device).expect("AnyUp");
-        let mut pipeline = FeatureFramePipeline::<JepaBevyBackend>::new_with_encoder(
-            FeatureFrameJepaEncoder::ttt(ttt),
-            anyup,
-            &model_config,
-            FeatureFramePipelineConfig::default(),
-            1,
-            [32, 32],
-            &device,
-        )
-        .expect("TTT feature-frame pipeline");
-
-        let image = synthetic_image_tensor(0, 32, &device);
-        let mask = SparseTokenMask::all(pipeline.grid().len());
-        let batch_mask = SparseMaskBatch::uniform(mask, 1, pipeline.device()).expect("mask batch");
-        let patchify_plan =
-            SparsePatchifyBatchPlan::new(batch_mask, pipeline.grid(), pipeline.device())
-                .expect("patchify plan");
-        let output = pipeline
-            .step_image_with_sparse_patchify_plan_wgpu_nodes_measured(
-                image,
-                &patchify_plan,
-                FeatureFrameRequest::low_res(),
-                pipeline.config().measurement,
-            )
-            .expect("TTT sparse patchify pipeline step");
-        assert_eq!(
-            output.metrics.encode_path,
-            FeatureFrameEncodePath::SparsePatchify
-        );
-        assert_eq!(output.output.encoded.grid, pipeline.grid());
-        assert_eq!(
-            output.output.encoded.tokens.shape().dims::<3>()[1],
-            pipeline.grid().len()
-        );
-    }
-
-    #[test]
-    #[ignore = "loads the local 433 MiB production TTT checkpoint"]
-    fn default_trained_ttt_artifact_initializes_viewer_encoder() {
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::SyntheticLocalMotion,
-            image_size: MIN_PIPELINE_IMAGE_SIZE,
-            ..BevyJepaConfig::default()
-        };
-        let path = effective_ttt_model_path(&config).expect("default trained TTT path");
-        if !path.exists() {
-            eprintln!(
-                "skipping: trained TTT checkpoint is missing at {}",
-                path.display()
-            );
-            return;
-        }
-        let device = JepaBevyDevice::default();
-        let (encoder, model_config) =
-            load_viewer_encoder(&config, config.pipeline_image_size(), &device)
-                .expect("load default trained TTT encoder");
-        assert_eq!(encoder.kind(), FeatureFrameJepaEncoderKind::Ttt);
-        assert_eq!(model_config.model_type, "vjepa2_1");
-        assert_eq!(model_config.encoder.embed_dim, 768);
-    }
-
-    #[test]
-    #[ignore = "loads the local production TTT checkpoint and runs a WebGPU forward step"]
-    fn default_trained_ttt_pipeline_runs_core_step() {
-        let config = BevyJepaConfig {
-            source: BevyJepaFrameSource::SyntheticLocalMotion,
-            image_size: MIN_PIPELINE_IMAGE_SIZE,
-            ..BevyJepaConfig::default()
-        };
-        let path = effective_ttt_model_path(&config).expect("default trained TTT path");
-        if !path.exists() {
-            eprintln!(
-                "skipping: trained TTT checkpoint is missing at {}",
-                path.display()
-            );
-            return;
-        }
-        let device = JepaBevyDevice::default();
-        let mut pipeline = BevyJepaHeadlessPipeline::new(config, device);
-        let output = pipeline
-            .step_stage_only()
-            .expect("trained TTT viewer stage-only step");
-        assert_eq!(
-            output.metrics.encoder_source,
-            BevyJepaEncoderSource::TrainedTtt
-        );
-        assert_eq!(output.metrics.grid_height, MIN_PIPELINE_IMAGE_SIZE / 16);
-        assert_eq!(output.metrics.grid_width, MIN_PIPELINE_IMAGE_SIZE / 16);
-        assert_eq!(output.metrics.dense_tokens, 256);
-    }
-
-    fn rgba_with_patches(
-        width: u32,
-        height: u32,
-        patches: &[(usize, usize)],
-        patch_size: usize,
-        color: image::Rgba<u8>,
-    ) -> RgbaImage {
-        let mut image = RgbaImage::new(width, height);
-        for &(patch_row, patch_col) in patches {
-            let row_start = patch_row * patch_size;
-            let col_start = patch_col * patch_size;
-            for y in row_start..(row_start + patch_size).min(height as usize) {
-                for x in col_start..(col_start + patch_size).min(width as usize) {
-                    image.put_pixel(x as u32, y as u32, color);
-                }
-            }
-        }
-        image
-    }
-}
+mod tests;

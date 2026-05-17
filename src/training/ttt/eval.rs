@@ -11,7 +11,7 @@ use crate::{TttMemoryUpdateSource, TttStateResetMode, TttSupervisionMode};
 use anyhow::{Context, Result};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 pub(super) struct TttEvalSummary {
@@ -76,6 +76,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
     let mut stage = TttStageMetrics::default();
     let mut domains = BTreeMap::<String, DomainTotals>::new();
     let mut teacher_cache = BTreeMap::<String, step::TeacherTokenTargets<B>>::new();
+    let mut teacher_cache_order = VecDeque::<String>::new();
     let mut utilization = None;
     let mut temporal_diagnostics = TemporalDiagnosticAccumulator::default();
     let mut temporal_segments = TemporalSegmentAccumulator::new(3);
@@ -105,7 +106,9 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             start_index,
             &capture_layers,
             config.training.cache_teacher_tokens,
+            config.training.teacher_cache_max_entries,
             &mut teacher_cache,
+            &mut teacher_cache_order,
             &mut stage,
         )?;
         let batch_size = batch.student.shape().dims::<5>()[0];

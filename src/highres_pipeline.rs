@@ -4,7 +4,8 @@ use crate::{
     FeaturePcaConfig, FeaturePcaProjector, FeaturePcaUpdateConfig, FeaturePcaUpdateScheduler,
     InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig,
     InterframeJepaFeatureMemoryOutput, SparseMaskBatch, SparseTokenMask, TokenGridShape, TttState,
-    VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaTttModel, jepa_feature_tokens_to_nchw,
+    VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaTttModel, apply_token_mask,
+    jepa_feature_tokens_to_nchw,
 };
 use anyhow::{Result, bail, ensure};
 use burn::tensor::Tensor;
@@ -13,7 +14,43 @@ use burn_anyup::{AnyUp, AnyUpImageGrid};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::time::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
+type PipelineInstant = std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+type PipelineInstant = f64;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pipeline_now() -> PipelineInstant {
+    std::time::Instant::now()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pipeline_now() -> PipelineInstant {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map(|performance| performance.now())
+        .unwrap_or_else(js_sys::Date::now)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pipeline_delta_us(now: PipelineInstant, previous: PipelineInstant) -> u64 {
+    micros_u64(now.duration_since(previous).as_micros())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pipeline_delta_us(now: PipelineInstant, previous: PipelineInstant) -> u64 {
+    let elapsed_ms = now - previous;
+    if elapsed_ms.is_finite() && elapsed_ms > 0.0 {
+        micros_u64((elapsed_ms * 1000.0) as u128)
+    } else {
+        0
+    }
+}
+
+fn pipeline_elapsed_us(start: PipelineInstant) -> u64 {
+    pipeline_delta_us(pipeline_now(), start)
+}
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -159,7 +196,7 @@ impl Default for FeatureFrameSchedule {
     fn default() -> Self {
         Self {
             low_res_pca_every: Some(1),
-            high_res_pca_every: Some(8),
+            high_res_pca_every: None,
         }
     }
 }
@@ -371,7 +408,7 @@ pub enum FeatureFrameJepaEncoderKind {
 }
 
 pub enum FeatureFrameJepaEncoder<B: Backend> {
-    Base(VJepa2_1Model<B>),
+    Base(Box<VJepa2_1Model<B>>),
     Ttt {
         model: Box<VJepaTttModel<B>>,
         state: TttState<B>,
@@ -380,7 +417,7 @@ pub enum FeatureFrameJepaEncoder<B: Backend> {
 
 impl<B: Backend> FeatureFrameJepaEncoder<B> {
     pub fn base(model: VJepa2_1Model<B>) -> Self {
-        Self::Base(model)
+        Self::Base(Box::new(model))
     }
 
     pub fn ttt(model: VJepaTttModel<B>) -> Self {
@@ -407,7 +444,7 @@ impl<B: Backend> FeatureFrameJepaEncoder<B> {
 
     pub fn base_model(&self) -> Option<&VJepa2_1Model<B>> {
         match self {
-            Self::Base(model) => Some(model),
+            Self::Base(model) => Some(model.as_ref()),
             Self::Ttt { .. } => None,
         }
     }
@@ -648,6 +685,17 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         self.pca_samples.reset();
     }
 
+    pub fn reset_visualization_state(&mut self) -> Result<()> {
+        self.reset();
+        let effective_pca_update = self.config.effective_pca_update();
+        let feature_dim = self.pca.feature_dim();
+        let pca_config = self.config.pca.clone();
+        self.pca = FeaturePcaProjector::identity(feature_dim, pca_config, &self.device)?;
+        self.pca_update_scheduler = FeaturePcaUpdateScheduler::new(effective_pca_update.clone())?;
+        self.pca_samples = FeaturePcaSampleBuffer::new(effective_pca_update.sample_window_frames)?;
+        Ok(())
+    }
+
     pub fn step_image_keep_ratio(
         &mut self,
         image: Tensor<B, 4>,
@@ -697,6 +745,27 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         self.step_image_with_mask_batch_nodes_measured(
             image,
             batch_mask,
+            request,
+            self.config.measurement,
+        )
+    }
+
+    pub fn step_image_with_encode_write_masks_nodes_measured(
+        &mut self,
+        image: Tensor<B, 4>,
+        encode_mask: &SparseTokenMask,
+        write_mask: &SparseTokenMask,
+        request: FeatureFrameRequest,
+    ) -> Result<MeasuredFeatureFrameBatch<B>> {
+        if encode_mask == write_mask {
+            return self.step_image_with_mask_nodes_measured(image, write_mask, request);
+        }
+        let encode_mask = SparseMaskBatch::uniform(encode_mask.clone(), self.batch, &self.device)?;
+        let write_mask = SparseMaskBatch::uniform(write_mask.clone(), self.batch, &self.device)?;
+        self.step_image_with_encode_write_mask_batch_nodes_measured(
+            image,
+            encode_mask,
+            write_mask,
             request,
             self.config.measurement,
         )
@@ -774,12 +843,38 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         mut timer: StageTimer,
         mut metrics: SparseJepaAnyUpPcaStageMetrics,
     ) -> Result<MeasuredFeatureFrameBatch<B>> {
-        let token_cache = self.token_memory.update_tokens(
-            encoded.tokens.clone(),
-            encoded.token_indices.clone(),
-            encoded.grid,
-        )?;
+        let token_cache = if mask.is_dense_ordered() {
+            self.token_memory
+                .update_dense_ordered_tokens(encoded.tokens.clone(), encoded.grid)?
+        } else {
+            self.token_memory.update_tokens(
+                encoded.tokens.clone(),
+                encoded.token_indices.clone(),
+                encoded.grid,
+            )?
+        };
         metrics.cache_update_us = timer.mark::<B>(&self.device)?;
+        self.finish_encoded_batch_nodes_with_cache(
+            image,
+            mask,
+            encoded,
+            token_cache,
+            request,
+            timer,
+            metrics,
+        )
+    }
+
+    fn finish_encoded_batch_nodes_with_cache(
+        &mut self,
+        image: Tensor<B, 4>,
+        mask: SparseMaskBatch<B>,
+        encoded: VJepaEncoderOutput<B>,
+        token_cache: InterframeJepaFeatureMemoryOutput<B>,
+        request: FeatureFrameRequest,
+        mut timer: StageTimer,
+        mut metrics: SparseJepaAnyUpPcaStageMetrics,
+    ) -> Result<MeasuredFeatureFrameBatch<B>> {
         let low_res_features =
             jepa_feature_tokens_to_nchw(token_cache.features.clone(), self.grid)?;
         metrics.token_view_us = timer.mark::<B>(&self.device)?;
@@ -943,6 +1038,39 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
     }
 
+    pub fn step_image_with_encode_write_mask_batch_nodes_measured(
+        &mut self,
+        image: Tensor<B, 4>,
+        encode_mask: SparseMaskBatch<B>,
+        write_mask: SparseMaskBatch<B>,
+        request: FeatureFrameRequest,
+        measurement: SparseJepaAnyUpPcaMeasurementConfig,
+    ) -> Result<MeasuredFeatureFrameBatch<B>> {
+        let [batch, _channels, height, width] =
+            self.validate_batch_step_input(&image, &encode_mask)?;
+        ensure!(
+            write_mask.batch() == batch && write_mask.dense_len() == encode_mask.dense_len(),
+            "write mask batch and dense length must match the encode mask"
+        );
+        let mut metrics = self.initial_stage_metrics(
+            batch,
+            height,
+            width,
+            &write_mask,
+            measurement,
+            SparseJepaAnyUpPcaEncodePath::DensePatchEmbed,
+        );
+        let mut timer = StageTimer::new(measurement);
+
+        let encoded = self
+            .encoder
+            .encode_image_batch(image.clone(), encode_mask.clone())?;
+        metrics.encode_us = timer.mark::<B>(&self.device)?;
+        let encoded =
+            restrict_encoded_to_write_mask(encoded, &encode_mask, &write_mask, &self.device)?;
+        self.finish_encoded_batch_nodes(image, write_mask, encoded, request, timer, metrics)
+    }
+
     pub fn step_image_with_mask_batch_measured(
         &mut self,
         image: Tensor<B, 4>,
@@ -966,6 +1094,71 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         metrics.encode_us = timer.mark::<B>(&self.device)?;
         self.finish_encoded_batch_step(image, mask, encoded, timer, metrics)
     }
+}
+
+fn restrict_encoded_to_write_mask<B: Backend>(
+    encoded: VJepaEncoderOutput<B>,
+    encode_mask: &SparseMaskBatch<B>,
+    write_mask: &SparseMaskBatch<B>,
+    device: &B::Device,
+) -> Result<VJepaEncoderOutput<B>> {
+    ensure!(
+        encode_mask.batch() == write_mask.batch()
+            && encode_mask.dense_len() == write_mask.dense_len(),
+        "encode and write masks must have matching batch and dense lengths"
+    );
+    ensure!(
+        !encode_mask.is_ragged() && !write_mask.is_ragged(),
+        "separate encode/write masks currently require uniform or fixed-width mask batches"
+    );
+    let [batch, encode_width, _embed_dim] = encoded.tokens.shape().dims::<3>();
+    ensure!(
+        batch == encode_mask.batch() && encode_width == encode_mask.len(),
+        "encoded token shape must match the encode mask"
+    );
+
+    let encode_rows = encode_mask.rows();
+    let write_rows = write_mask.rows();
+    let write_width = write_mask.len();
+    ensure!(
+        write_rows.iter().all(|row| row.len() == write_width),
+        "write mask rows must have a fixed width"
+    );
+
+    let mut position_rows = Vec::with_capacity(batch);
+    for (row_index, (encode_row, write_row)) in
+        encode_rows.iter().zip(write_rows.iter()).enumerate()
+    {
+        ensure!(
+            encode_row.len() == encode_width,
+            "encode mask row {row_index} width does not match encoded tokens"
+        );
+        let mut positions = Vec::with_capacity(write_width);
+        for &token_index in write_row {
+            let Ok(position) = encode_row.binary_search(&token_index) else {
+                bail!(
+                    "write mask token {token_index} at batch row {row_index} is absent from the encode mask"
+                );
+            };
+            positions.push(position);
+        }
+        position_rows.push(positions);
+    }
+
+    let positions = SparseMaskBatch::from_rows(position_rows, encode_width, device)?.indices();
+    let tokens = apply_token_mask(encoded.tokens, positions.clone());
+    let hierarchical = encoded
+        .hierarchical
+        .into_iter()
+        .map(|tokens| apply_token_mask(tokens, positions.clone()))
+        .collect();
+    Ok(VJepaEncoderOutput {
+        tokens,
+        hierarchical,
+        captured_layers: encoded.captured_layers,
+        token_indices: write_mask.indices(),
+        grid: encoded.grid,
+    })
 }
 
 #[cfg(feature = "sparse-patchify-wgpu")]
@@ -1075,7 +1268,84 @@ impl SparseJepaAnyUpPcaPipeline<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             .encoder
             .encode_image_sparse_patchify_wgpu_batch(image.clone(), patchify_plan)?;
         metrics.encode_us = timer.mark::<burn_flex_gmm::wgpu::DefaultWgpuBackend>(&self.device)?;
-        self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
+        let token_cache = if mask.is_dense_ordered() {
+            self.token_memory
+                .update_dense_ordered_tokens(encoded.tokens.clone(), encoded.grid)?
+        } else {
+            self.token_memory.update_tokens_tiled_assign_wgpu_raw(
+                encoded.tokens.clone(),
+                encoded.token_indices.clone(),
+                encoded.grid,
+            )?
+        };
+        metrics.cache_update_us =
+            timer.mark::<burn_flex_gmm::wgpu::DefaultWgpuBackend>(&self.device)?;
+        self.finish_encoded_batch_nodes_with_cache(
+            image,
+            mask,
+            encoded,
+            token_cache,
+            request,
+            timer,
+            metrics,
+        )
+    }
+
+    pub fn step_image_with_sparse_patchify_plan_wgpu_nodes_measured_with_write_mask(
+        &mut self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        patchify_plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        write_mask: SparseMaskBatch<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        request: FeatureFrameRequest,
+        measurement: SparseJepaAnyUpPcaMeasurementConfig,
+    ) -> Result<MeasuredFeatureFrameBatch<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        ensure!(
+            patchify_plan.grid == self.grid && patchify_plan.batch == self.batch,
+            "sparse patchify plan must match the high-res pipeline grid and batch"
+        );
+        let encode_mask = patchify_plan.mask.clone();
+        let [batch, _channels, height, width] =
+            self.validate_batch_step_input(&image, &encode_mask)?;
+        ensure!(
+            write_mask.batch() == batch && write_mask.dense_len() == encode_mask.dense_len(),
+            "write mask batch and dense length must match the sparse patchify plan"
+        );
+        let mut metrics = self.initial_stage_metrics(
+            batch,
+            height,
+            width,
+            &write_mask,
+            measurement,
+            SparseJepaAnyUpPcaEncodePath::SparsePatchify,
+        );
+        let mut timer = StageTimer::new(measurement);
+        let encoded = self
+            .encoder
+            .encode_image_sparse_patchify_wgpu_batch(image.clone(), patchify_plan)?;
+        metrics.encode_us = timer.mark::<burn_flex_gmm::wgpu::DefaultWgpuBackend>(&self.device)?;
+        let encoded =
+            restrict_encoded_to_write_mask(encoded, &encode_mask, &write_mask, &self.device)?;
+        let token_cache = if write_mask.is_dense_ordered() {
+            self.token_memory
+                .update_dense_ordered_tokens(encoded.tokens.clone(), encoded.grid)?
+        } else {
+            self.token_memory.update_tokens_tiled_assign_wgpu_raw(
+                encoded.tokens.clone(),
+                encoded.token_indices.clone(),
+                encoded.grid,
+            )?
+        };
+        metrics.cache_update_us =
+            timer.mark::<burn_flex_gmm::wgpu::DefaultWgpuBackend>(&self.device)?;
+        self.finish_encoded_batch_nodes_with_cache(
+            image,
+            write_mask,
+            encoded,
+            token_cache,
+            request,
+            timer,
+            metrics,
+        )
     }
 }
 
@@ -1107,7 +1377,82 @@ impl SparseJepaAnyUpPcaPipeline<burn::backend::Wgpu<f32, i32>> {
             .encoder
             .encode_image_sparse_patchify_wgpu_fusion_batch(image.clone(), patchify_plan)?;
         metrics.encode_us = timer.mark::<burn::backend::Wgpu<f32, i32>>(&self.device)?;
-        self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
+        let token_cache = if mask.is_dense_ordered() {
+            self.token_memory
+                .update_dense_ordered_tokens(encoded.tokens.clone(), encoded.grid)?
+        } else {
+            self.token_memory.update_tokens_tiled_assign_wgpu(
+                encoded.tokens.clone(),
+                encoded.token_indices.clone(),
+                encoded.grid,
+            )?
+        };
+        metrics.cache_update_us = timer.mark::<burn::backend::Wgpu<f32, i32>>(&self.device)?;
+        self.finish_encoded_batch_nodes_with_cache(
+            image,
+            mask,
+            encoded,
+            token_cache,
+            request,
+            timer,
+            metrics,
+        )
+    }
+
+    pub fn step_image_with_sparse_patchify_plan_wgpu_nodes_measured_with_write_mask(
+        &mut self,
+        image: Tensor<burn::backend::Wgpu<f32, i32>, 4>,
+        patchify_plan: &SparsePatchifyBatchPlan<burn::backend::Wgpu<f32, i32>>,
+        write_mask: SparseMaskBatch<burn::backend::Wgpu<f32, i32>>,
+        request: FeatureFrameRequest,
+        measurement: SparseJepaAnyUpPcaMeasurementConfig,
+    ) -> Result<MeasuredFeatureFrameBatch<burn::backend::Wgpu<f32, i32>>> {
+        ensure!(
+            patchify_plan.grid == self.grid && patchify_plan.batch == self.batch,
+            "sparse patchify plan must match the high-res pipeline grid and batch"
+        );
+        let encode_mask = patchify_plan.mask.clone();
+        let [batch, _channels, height, width] =
+            self.validate_batch_step_input(&image, &encode_mask)?;
+        ensure!(
+            write_mask.batch() == batch && write_mask.dense_len() == encode_mask.dense_len(),
+            "write mask batch and dense length must match the sparse patchify plan"
+        );
+        let mut metrics = self.initial_stage_metrics(
+            batch,
+            height,
+            width,
+            &write_mask,
+            measurement,
+            SparseJepaAnyUpPcaEncodePath::SparsePatchify,
+        );
+        let mut timer = StageTimer::new(measurement);
+        let encoded = self
+            .encoder
+            .encode_image_sparse_patchify_wgpu_fusion_batch(image.clone(), patchify_plan)?;
+        metrics.encode_us = timer.mark::<burn::backend::Wgpu<f32, i32>>(&self.device)?;
+        let encoded =
+            restrict_encoded_to_write_mask(encoded, &encode_mask, &write_mask, &self.device)?;
+        let token_cache = if write_mask.is_dense_ordered() {
+            self.token_memory
+                .update_dense_ordered_tokens(encoded.tokens.clone(), encoded.grid)?
+        } else {
+            self.token_memory.update_tokens_tiled_assign_wgpu(
+                encoded.tokens.clone(),
+                encoded.token_indices.clone(),
+                encoded.grid,
+            )?
+        };
+        metrics.cache_update_us = timer.mark::<burn::backend::Wgpu<f32, i32>>(&self.device)?;
+        self.finish_encoded_batch_nodes_with_cache(
+            image,
+            write_mask,
+            encoded,
+            token_cache,
+            request,
+            timer,
+            metrics,
+        )
     }
 }
 
@@ -1224,7 +1569,27 @@ impl SparseJepaAnyUpPcaPipeline<burn_flex_gmm::cuda::DefaultCudaBackend> {
             })?
             .encode_image_sparse_patchify_cuda_batch(image.clone(), patchify_plan)?;
         metrics.encode_us = timer.mark::<burn_flex_gmm::cuda::DefaultCudaBackend>(&self.device)?;
-        self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
+        let token_cache = if mask.is_dense_ordered() {
+            self.token_memory
+                .update_dense_ordered_tokens(encoded.tokens.clone(), encoded.grid)?
+        } else {
+            self.token_memory.update_tokens_tiled_assign_cuda_raw(
+                encoded.tokens.clone(),
+                encoded.token_indices.clone(),
+                encoded.grid,
+            )?
+        };
+        metrics.cache_update_us =
+            timer.mark::<burn_flex_gmm::cuda::DefaultCudaBackend>(&self.device)?;
+        self.finish_encoded_batch_nodes_with_cache(
+            image,
+            mask,
+            encoded,
+            token_cache,
+            request,
+            timer,
+            metrics,
+        )
     }
 }
 
@@ -1345,13 +1710,13 @@ impl<B: Backend> FeaturePcaSampleBuffer<B> {
 
 struct StageTimer {
     measurement: SparseJepaAnyUpPcaMeasurementConfig,
-    start: Option<Instant>,
-    last: Option<Instant>,
+    start: Option<PipelineInstant>,
+    last: Option<PipelineInstant>,
 }
 
 impl StageTimer {
     fn new(measurement: SparseJepaAnyUpPcaMeasurementConfig) -> Self {
-        let now = measurement.enabled.then(Instant::now);
+        let now = measurement.enabled.then(pipeline_now);
         Self {
             measurement,
             start: now,
@@ -1366,19 +1731,17 @@ impl StageTimer {
         if self.measurement.sync_backend {
             B::sync(device)?;
         }
-        let now = Instant::now();
+        let now = pipeline_now();
         let elapsed = self
             .last
             .replace(now)
-            .map(|last| micros_u64(now.duration_since(last).as_micros()))
+            .map(|last| pipeline_delta_us(now, last))
             .unwrap_or(0);
         Ok(elapsed)
     }
 
     fn total_us(&self) -> u64 {
-        self.start
-            .map(|start| micros_u64(start.elapsed().as_micros()))
-            .unwrap_or(0)
+        self.start.map(pipeline_elapsed_us).unwrap_or(0)
     }
 }
 
@@ -1502,7 +1865,7 @@ pub struct SparseJepaAnyUpPcaStream<B: Backend> {
 
 struct QueuedFrame<B: Backend> {
     input: SparseJepaAnyUpPcaFrameInput<B>,
-    queued_at: Instant,
+    queued_at: PipelineInstant,
 }
 
 struct DequeuedBatch<B: Backend> {
@@ -1637,7 +2000,7 @@ impl<B: Backend> SparseJepaAnyUpPcaStream<B> {
             .insert(input.id.stream_id, input.id.sequence);
         self.pending.push_back(QueuedFrame {
             input,
-            queued_at: Instant::now(),
+            queued_at: pipeline_now(),
         });
         Ok(SparseJepaAnyUpPcaQueueReport {
             accepted: true,
@@ -1700,7 +2063,7 @@ impl<B: Backend> SparseJepaAnyUpPcaStream<B> {
             "front in-flight batch has variable sparse mask widths; use batch_size=1 or group masks by token budget"
         );
 
-        let now = Instant::now();
+        let now = pipeline_now();
         let mut ids = Vec::with_capacity(self.config.batch_size);
         let mut timings = Vec::with_capacity(self.config.batch_size);
         let mut images = Vec::with_capacity(self.config.batch_size);
@@ -1713,7 +2076,7 @@ impl<B: Backend> SparseJepaAnyUpPcaStream<B> {
             ids.push(queued.input.id);
             timings.push(SparseJepaAnyUpPcaQueuedFrameTiming {
                 id: queued.input.id,
-                queue_wait_us: micros_u64(now.duration_since(queued.queued_at).as_micros()),
+                queue_wait_us: pipeline_delta_us(now, queued.queued_at),
             });
             rows.push(queued.input.mask.indices().to_vec());
             images.push(queued.input.image);

@@ -7,6 +7,11 @@
     "check:web": "cargo check --target wasm32-unknown-unknown",
     "build:wasm": "cargo build --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir www/out --out-name bevy_jepa ../../target/wasm32-unknown-unknown/release/bevy_jepa.wasm",
     "serve": "python3 -m http.server 8080 -d www",
-    "test:static": "node tests/static-source.spec.mjs"
+    "test:static": "node tests/static-source.spec.mjs",
+    "test:browser": "playwright test --config playwright.config.mjs",
+    "test:wasm-api": "node tests/wasm-api-smoke.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
   }
 }

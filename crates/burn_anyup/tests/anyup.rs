@@ -85,6 +85,40 @@ fn prepared_image_grid_matches_uncached_rope_path() {
 }
 
 #[test]
+fn value_projection_commutes_with_anyup_decode() {
+    let device = Default::default();
+    let config = AnyUpConfig::tiny_for_tests();
+    let model = AnyUp::<B>::new(config, &device).expect("AnyUp model");
+    let image = ramp([1, 3, 8, 8], &device);
+    let features = ramp([1, 5, 2, 2], &device);
+    let projection = Tensor::<B, 2>::from_data(
+        TensorData::new(
+            vec![
+                0.2, -0.4, 0.7, //
+                -0.1, 0.3, 0.2, //
+                0.6, 0.1, -0.5, //
+                -0.3, 0.8, 0.4, //
+                0.5, -0.2, 0.1,
+            ],
+            [5, 3],
+        ),
+        &device,
+    );
+    let mean = Tensor::<B, 3>::from_data(
+        TensorData::new(vec![0.01, -0.02, 0.03, -0.04, 0.05], [1, 1, 5]),
+        &device,
+    );
+    let context = model.prepare_image_context(image, None, [2, 2]);
+    let full = model.upsample_with_context(&context, features.clone(), Some(1));
+    let full_projected = project_nchw(full, projection.clone(), mean.clone());
+    let low_projected = project_nchw(features.clone(), projection, mean);
+    let fast_projected =
+        model.upsample_values_with_context(&context, features, low_projected, Some(1));
+
+    assert_close(&values(full_projected), &values(fast_projected), 1.0e-4);
+}
+
+#[test]
 fn sparse_anyup_matches_dense_forward_on_selected_high_res_tokens() {
     let device = Default::default();
     let config = AnyUpConfig::tiny_for_tests();
@@ -541,6 +575,23 @@ fn values3(tensor: Tensor<B, 3>) -> Vec<f32> {
 
 fn values2(tensor: Tensor<B, 2>) -> Vec<f32> {
     tensor.to_data().to_vec::<f32>().expect("tensor values")
+}
+
+fn project_nchw(
+    tensor: Tensor<B, 4>,
+    projection: Tensor<B, 2>,
+    mean: Tensor<B, 3>,
+) -> Tensor<B, 4> {
+    let [batch, channels, height, width] = tensor.shape().dims::<4>();
+    let centered = tensor
+        .permute([0, 2, 3, 1])
+        .reshape([batch, height * width, channels])
+        - mean.repeat_dim(0, batch).repeat_dim(1, height * width);
+    centered
+        .reshape([batch * height * width, channels])
+        .matmul(projection)
+        .reshape([batch, height, width, 3])
+        .permute([0, 3, 1, 2])
 }
 
 fn gather_dense_output(tensor: Tensor<B, 4>, indices: Tensor<B, 2, Int>) -> Tensor<B, 3> {

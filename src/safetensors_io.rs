@@ -945,5 +945,11 @@ pub fn checkpoint_tensor_prefixes(path: impl AsRef<Path>) -> Result<Vec<String>>
 }
 
 pub fn default_hf_snapshot_dir() -> PathBuf {
-    PathBuf::from("/home/mosure/.cache/huggingface/hub/models--facebook--vjepa2/snapshots")
+    if let Some(path) = std::env::var_os("BURN_JEPA_HF_SNAPSHOT_DIR") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache/huggingface/hub/models--facebook--vjepa2/snapshots")
 }

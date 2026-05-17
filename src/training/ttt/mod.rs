@@ -3,13 +3,16 @@ mod loss;
 mod metrics;
 mod step;
 
-use super::batch::TrainingBatchPlanner;
+use super::batch::{
+    TrainingBatchPlanner, TrainingBatchPrefetcher, cpu_batch_from_planner,
+    materialize_training_batch,
+};
 use super::config::BurnJepaTrainConfig;
 use super::model_io::{load_student_model, load_teacher_model};
 use super::report::{
-    TrainingLossSummary, TttBackpropMetrics, TttEvalReport, TttStageMetrics, TttStepMetric,
-    TttStreamStepKind, TttStreamTrainingMetrics, TttTrainingReport, samples_per_second,
-    save_training_report, save_ttt_training_report, tensor_scalar,
+    TrainingLossSummary, TttBackpropMetrics, TttDenseSampleMetrics, TttEvalReport, TttStageMetrics,
+    TttStepMetric, TttStreamStepKind, TttStreamTrainingMetrics, TttTrainingReport,
+    samples_per_second, save_training_report, save_ttt_training_report, tensor_scalar,
 };
 use crate::{JepaSampleMetadata, TttState, VJepaTttModel, dataset_from_config, video_token_grid};
 use anyhow::{Context, Result, ensure};
@@ -18,7 +21,8 @@ use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -200,6 +204,7 @@ impl<B: Backend> StreamStateTracker<B> {
             state_decay: config.training.stream.state_decay,
             state_l2_weight: config.training.stream.state_l2_weight,
             update_l2_weight: config.training.stream.update_l2_weight,
+            state_regularization_width: config.training.stream.state_regularization_width,
             active_streams: self.streams.len(),
             max_active_streams: self.max_active_streams.max(self.streams.len()),
             packed_batches: self.packed_batches,
@@ -227,31 +232,41 @@ fn add_stream_regularization<B: Backend>(
     }
     let mut total = loss;
     if config.training.stream.state_l2_weight > 0.0
-        && let Some(penalty) = state_l2_penalty(after)
+        && let Some(penalty) =
+            state_l2_penalty(after, config.training.stream.state_regularization_width)
     {
         total = total + penalty.mul_scalar(config.training.stream.state_l2_weight);
     }
     if config.training.stream.update_l2_weight > 0.0
-        && let Some(penalty) = state_update_l2_penalty(before, after)
+        && let Some(penalty) = state_update_l2_penalty(
+            before,
+            after,
+            config.training.stream.state_regularization_width,
+        )
     {
         total = total + penalty.mul_scalar(config.training.stream.update_l2_weight);
     }
     total
 }
 
-fn state_l2_penalty<B: Backend>(state: &TttState<B>) -> Option<Tensor<B, 1>> {
+fn state_l2_penalty<B: Backend>(state: &TttState<B>, width: usize) -> Option<Tensor<B, 1>> {
     mean_penalty(
         state
             .layers
             .iter()
             .filter_map(|layer| layer.fast_weight.as_ref())
-            .map(|weight| weight.clone().powf_scalar(2.0).mean()),
+            .map(|weight| {
+                regularization_view(weight.clone(), width)
+                    .powf_scalar(2.0)
+                    .mean()
+            }),
     )
 }
 
 fn state_update_l2_penalty<B: Backend>(
     before: &TttState<B>,
     after: &TttState<B>,
+    width: usize,
 ) -> Option<Tensor<B, 1>> {
     mean_penalty(
         before
@@ -264,9 +279,19 @@ fn state_update_l2_penalty<B: Backend>(
                     Some(before) => after.clone() - before.clone(),
                     None => after.clone(),
                 };
-                Some(delta.powf_scalar(2.0).mean())
+                Some(regularization_view(delta, width).powf_scalar(2.0).mean())
             }),
     )
+}
+
+fn regularization_view<B: Backend>(tensor: Tensor<B, 3>, width: usize) -> Tensor<B, 3> {
+    if width == 0 {
+        return tensor;
+    }
+    let [_, rows, cols] = tensor.shape().dims::<3>();
+    tensor
+        .slice_dim(1, 0..width.min(rows).max(1))
+        .slice_dim(2, 0..width.min(cols).max(1))
 }
 
 fn mean_penalty<B: Backend>(penalties: impl Iterator<Item = Tensor<B, 1>>) -> Option<Tensor<B, 1>> {
@@ -309,6 +334,18 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     let dataset = dataset_from_config(&config.dataset, true)?;
     validate_stream_dataset(config, dataset.as_ref())?;
     let batch_planner = TrainingBatchPlanner::new(dataset.as_ref(), config.training.batching)?;
+    let batch_prefetcher = if config.training.prefetch_batches {
+        let prefetcher = TrainingBatchPrefetcher::new(
+            config.dataset.clone(),
+            model.config().clone(),
+            config.training.batching,
+            config.training.batch_size,
+        )?;
+        prefetcher.request(0)?;
+        Some(prefetcher)
+    } else {
+        None
+    };
     let memory = metrics::ttt_memory_metrics(config, model.config());
     model.set_backprop_mode(crate::TttBackpropMode::FinalFeature);
     let pre_train_eval = if config.training.eval_steps > 0 {
@@ -326,6 +363,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     let mut mask_metrics = None;
     let mut train_stage = TttStageMetrics::default();
     let mut teacher_cache = BTreeMap::<String, step::TeacherTokenTargets<B>>::new();
+    let mut teacher_cache_order = VecDeque::<String>::new();
     let mut observed_dense_tokens = None;
     let mut final_grad_metrics = None;
     let rollout = step::rollout_kind(config);
@@ -333,6 +371,8 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     let capture_layers = config.ttt.capture_layers(model.config());
     let mut stream_state = StreamStateTracker::<B>::default();
     let mut train_samples = 0usize;
+    let mut dense_sample_steps = 0usize;
+    let mut sparse_sample_steps = 0usize;
 
     for step_index in 0..config.training.max_steps {
         let supervision = config
@@ -344,14 +384,34 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                 config.ttt.backprop_mode
             }
         });
-        let batch = batch_planner.load_batch::<B>(
-            dataset.as_ref(),
-            &config.dataset,
-            model.config(),
-            device,
-            step_index * config.training.batch_size,
-            config.training.batch_size,
-        )?;
+        let batch_start_index = step_index * config.training.batch_size;
+        let batch = if let Some(prefetcher) = &batch_prefetcher {
+            let wait_start = Instant::now();
+            let cpu_batch = prefetcher.recv()?;
+            train_stage.prefetch_wait_ms += wait_start.elapsed().as_millis();
+            if step_index + 1 < config.training.max_steps {
+                prefetcher.request((step_index + 1) * config.training.batch_size)?;
+            }
+            let transfer_start = Instant::now();
+            let batch = materialize_training_batch::<B>(cpu_batch, device);
+            train_stage.host_to_device_ms += transfer_start.elapsed().as_millis();
+            batch
+        } else {
+            let data_start = Instant::now();
+            let cpu_batch = cpu_batch_from_planner(
+                &batch_planner,
+                dataset.as_ref(),
+                &config.dataset,
+                model.config(),
+                batch_start_index,
+                config.training.batch_size,
+            )?;
+            train_stage.data_ms += data_start.elapsed().as_millis();
+            let transfer_start = Instant::now();
+            let batch = materialize_training_batch::<B>(cpu_batch, device);
+            train_stage.host_to_device_ms += transfer_start.elapsed().as_millis();
+            batch
+        };
         observed_dense_tokens.get_or_insert_with(|| {
             let [_, _, frames, height, width] = batch.student.shape().dims::<5>();
             video_token_grid(model.config(), frames, height, width)
@@ -360,9 +420,29 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         });
         let batch_size = batch.student.shape().dims::<5>()[0];
         train_samples += batch_size;
-        let masks = timed(&mut train_stage.mask_ms, || {
-            step::resolve_masks(config, &batch.student, model.config(), &batch.metadata)
-        })?;
+        let dense_sample_step = config.training.dense_samples.uses_dense_step(step_index);
+        let step_rollout = if dense_sample_step {
+            step::TttRolloutKind::Dense
+        } else {
+            rollout
+        };
+        if step_rollout == step::TttRolloutKind::Dense {
+            dense_sample_steps += 1;
+        } else {
+            sparse_sample_steps += 1;
+        }
+        let step_patchify = if dense_sample_step {
+            step::TttPatchifyKind::DensePatchEmbed
+        } else {
+            patchify
+        };
+        let masks = if dense_sample_step {
+            None
+        } else {
+            timed(&mut train_stage.mask_ms, || {
+                step::resolve_masks(config, &batch.student, model.config(), &batch.metadata)
+            })?
+        };
         if mask_metrics.is_none()
             && let Some(masks) = &masks
         {
@@ -371,8 +451,10 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                 &masks.target,
             ));
         }
+        let state_start = Instant::now();
         let mut carried_state =
             stream_state.begin_step(&model, config, step_index, batch_size, &batch.metadata)?;
+        train_stage.stream_state_ms += state_start.elapsed().as_millis();
         let previous_state = carried_state.clone();
         let stream_step_kind = stream_state.current_kind();
         let stream_reset_interval = stream_state.current_reset_interval();
@@ -383,7 +465,9 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             step_index,
             &capture_layers,
             config.training.cache_teacher_tokens,
+            config.training.teacher_cache_max_entries,
             &mut teacher_cache,
+            &mut teacher_cache_order,
             &mut train_stage,
         )?;
         let student = timed(&mut train_stage.student_forward_ms, || {
@@ -393,8 +477,8 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                     batch.student,
                     teacher_tokens.final_tokens.clone(),
                     masks.as_ref(),
-                    rollout,
-                    patchify,
+                    step_rollout,
+                    step_patchify,
                     &mut carried_state,
                 )
             } else {
@@ -403,8 +487,8 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                     batch.student,
                     teacher_tokens.final_tokens.clone(),
                     masks.as_ref(),
-                    rollout,
-                    patchify,
+                    step_rollout,
+                    step_patchify,
                 )
             }
         })?;
@@ -422,7 +506,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                 &student,
                 &teacher_tokens,
                 masks.as_ref(),
-                rollout,
+                step_rollout,
                 batch_size,
                 device,
                 supervision,
@@ -435,7 +519,9 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             config.training.save_steps > 0 && step_number % config.training.save_steps == 0;
         let read_loss = progress.should_read_step(step_number, config) || save_partial;
         if read_loss {
+            let read_start = Instant::now();
             let final_loss = tensor_scalar(loss.clone().detach())?;
+            train_stage.loss_read_ms += read_start.elapsed().as_millis();
             progress.record(
                 step_number,
                 final_loss,
@@ -461,12 +547,15 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             model,
             grads,
         );
+        let state_start = Instant::now();
         stream_state.finish_step(carried_state, config);
+        train_stage.stream_state_ms += state_start.elapsed().as_millis();
         let optimizer_ms = optim_start.elapsed().as_millis();
         train_stage.optimizer_ms += optimizer_ms;
         train_stage.backward_optim_ms += optimizer_ms;
 
         if save_partial {
+            let report_start = Instant::now();
             save_training_report(
                 &config.model.output_dir,
                 "ttt-report.partial.json",
@@ -480,6 +569,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                 start.elapsed().as_millis(),
                 None,
             )?;
+            train_stage.report_ms += report_start.elapsed().as_millis();
         }
     }
 
@@ -576,6 +666,13 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         memory,
         mask: mask_metrics,
         rollout: rollout_metrics,
+        dense_samples: TttDenseSampleMetrics {
+            enabled: config.training.dense_samples.enabled,
+            warmup_steps: config.training.dense_samples.warmup_steps,
+            interval_steps: config.training.dense_samples.interval_steps,
+            dense_steps: dense_sample_steps,
+            sparse_steps: sparse_sample_steps,
+        },
         backprop: TttBackpropMetrics {
             mode: config.ttt.backprop_mode,
             truncate_blocks: config.ttt.backprop_truncate_blocks,
@@ -626,8 +723,10 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         model_path,
         report_path: config.model.output_dir.join("ttt-report.json"),
     };
+    let report_start = Instant::now();
     report.report_path =
         save_ttt_training_report(&config.model.output_dir, "ttt-report.json", &report)?;
+    report.train_stage.report_ms += report_start.elapsed().as_millis();
     drop(model);
     B::sync(device).context("sync TTT training backend")?;
     B::memory_cleanup(device);
@@ -750,15 +849,19 @@ pub(super) fn teacher_tokens_for_batch<B: step::TttSparsePatchifyTrainingBackend
     fallback_index: usize,
     capture_layers: &[usize],
     enabled: bool,
+    max_entries: usize,
     cache: &mut BTreeMap<String, step::TeacherTokenTargets<B>>,
+    cache_order: &mut VecDeque<String>,
     stage: &mut TttStageMetrics,
 ) -> Result<step::TeacherTokenTargets<B>> {
-    if !enabled {
+    if !enabled || max_entries == 0 {
         return timed(&mut stage.teacher_forward_ms, || {
             Ok(step::teacher_targets(teacher, video, capture_layers))
         });
     }
+    let key_start = Instant::now();
     let key = teacher_cache_key(metadata, fallback_index, capture_layers);
+    stage.teacher_cache_key_ms += key_start.elapsed().as_millis();
     if let Some(tokens) = cache.get(&key) {
         stage.teacher_cache_hits += 1;
         return Ok(tokens.clone());
@@ -767,6 +870,15 @@ pub(super) fn teacher_tokens_for_batch<B: step::TttSparsePatchifyTrainingBackend
     let tokens = timed(&mut stage.teacher_forward_ms, || {
         Ok(step::teacher_targets(teacher, video, capture_layers))
     })?;
+    while cache.len() >= max_entries {
+        let Some(oldest) = cache_order.pop_front() else {
+            break;
+        };
+        if cache.remove(&oldest).is_some() {
+            stage.teacher_cache_evictions += 1;
+        }
+    }
+    cache_order.push_back(key.clone());
     cache.insert(key, tokens.clone());
     Ok(tokens)
 }
@@ -776,22 +888,30 @@ fn teacher_cache_key(
     fallback_index: usize,
     capture_layers: &[usize],
 ) -> String {
-    let has_identity = metadata.iter().any(|row| {
-        row.clip_id.is_some()
-            || row.source.is_some()
-            || row.start_frame.is_some()
-            || row.precomputed_context_indices.is_some()
-            || row.precomputed_target_indices.is_some()
-    });
-    if has_identity {
-        format!(
-            "layers={capture_layers:?}:{}",
-            serde_json::to_string(metadata)
-                .unwrap_or_else(|_| format!("fallback:{fallback_index}"))
-        )
-    } else {
-        format!("layers={capture_layers:?}:fallback:{fallback_index}")
+    let mut key = format!("layers={capture_layers:?}");
+    if metadata.is_empty() {
+        let _ = write!(key, ":fallback={fallback_index}");
+        return key;
     }
+    for (row_index, row) in metadata.iter().enumerate() {
+        let has_identity =
+            row.clip_id.is_some() || row.source.is_some() || row.start_frame.is_some();
+        if !has_identity {
+            let _ = write!(key, ":row{row_index}:fallback={fallback_index}");
+            continue;
+        }
+        let _ = write!(
+            key,
+            ":row{row_index}:clip={}:domain={}:source={}:start={}",
+            row.clip_id.as_deref().unwrap_or(""),
+            row.domain.as_deref().unwrap_or(""),
+            row.source.as_deref().unwrap_or(""),
+            row.start_frame
+                .map(|start| start.to_string())
+                .unwrap_or_default()
+        );
+    }
+    key
 }
 
 fn validate_stream_dataset(

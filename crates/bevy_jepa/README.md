@@ -4,10 +4,16 @@ Bevy viewer for the `burn_jepa` sparse feature pipeline. It uses the same
 `bevy_burn` device-sharing pattern as `bevy_burn_autogaze`, so Burn WebGPU
 tensors can be uploaded directly into Bevy textures.
 
+The Bevy crate is intentionally a thin app wrapper. Shared live-pipeline policy
+such as `FeatureFrameViewerConfig`, patch-diff thresholding, dense fallback,
+bucketed sparse encode masks, PCA update cadence, and shape prewarm masks lives
+in `burn_jepa`; `bevy_jepa` owns camera/static input, Bevy scheduling, UI, and
+texture upload only.
+
 ```bash
 cargo run -p bevy_jepa
 cargo run -p bevy_jepa -- --source static --image-path /path/to/frame.png
-cargo run -p bevy_jepa -- --source synthetic-local-motion --mask-source patch-diff --image-size 512
+cargo run -p bevy_jepa -- --source synthetic-local-motion --mask-source patch-diff
 cargo run -p bevy_jepa -- --source synthetic-local-motion --mask-source patch-diff --image-size 256
 cargo run -p bevy_jepa -- --source camera --anyup-weights /path/to/anyup_multi_backbone.pth --anyup-attention-mode upstream-masked
 cargo run -p bevy_jepa -- --encoder-source tiny-test --source synthetic-local-motion
@@ -16,25 +22,51 @@ cargo run -p bevy_jepa -- --encoder-source tiny-test --source synthetic-local-mo
 The default source is the camera. Synthetic/local-motion input is only used when
 `--source synthetic-local-motion` is selected explicitly; camera mode waits for a
 real camera frame instead of feeding generated warmup imagery into the pipeline.
-The default JEPA encoder source is the trained encoder-only TTT V-JEPA 2.1
-checkpoint at
-`target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk`; override
-it with `--ttt-model` or `BURN_JEPA_TTT_MODEL`. Use
-`--encoder-source tiny-test` only for local wiring smoke tests, and
-`--encoder-source base-checkpoint` when you intentionally want the frozen base
-V-JEPA 2.1 encoder without TTT state.
+The default JEPA encoder source is trained encoder-only TTT V-JEPA 2.1, loaded
+from a sharded `.bpk` package when `--model-manifest`,
+`BURN_JEPA_MODEL_MANIFEST`, or `target/burn-jepa-web/model/manifest.json` is
+available. A legacy local `.mpk` is only used when explicitly passed with
+`--ttt-model` or `BURN_JEPA_TTT_MODEL`. Use `--encoder-source tiny-test` only
+for local wiring smoke tests, and `--encoder-source base-checkpoint` when you
+intentionally want the frozen base V-JEPA 2.1 encoder without TTT state.
+Base-checkpoint mode defaults to
+`~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384`; use
+`--jepa-checkpoint-dir` and `--jepa-config` when the official checkpoint lives
+elsewhere.
 The default sparse mask source is patch-diff because it is image-driven and does
 not require loading a separate AutoGaze model. Patch-diff is adaptive by
 default: every patch whose score is at or above the threshold is updated,
 `--min-context-density` is only a fallback floor for near-static frames, and
 `--bootstrap-context-density` controls the first frame cache fill.
 `--patch-diff-quality Q` mirrors `bevy_burn_autogaze` by setting the patch-diff
-threshold to `1 - Q`; the no-arg default is quality `0.85`, threshold `0.15`.
-The quality value only changes the threshold; it does not impose a fixed 85%
-token density.
-The pipeline image size is at least 256x256, defaults to 256x256 sparse
+threshold to `1 - Q`; the no-arg default is quality `0.97`, threshold `0.03`.
+The quality value only changes the threshold; it does not impose a fixed 97%
+token density. The camera RGBA path removes uniform global RGB/luma shifts
+before scoring and also includes relative-luma/chroma terms, so the threshold is
+less tied to the scene's average brightness.
+When patch-diff activates much of the token grid, the mask is promoted to a
+dense ordered mask so the JEPA feature cache can use its dense update path
+instead of paying sparse gather/scatter overhead for a high-density sparse
+write. The default `--patch-diff-dense-fallback-density 0.60` keeps low- and
+medium-density adaptive motion sparse and routes high-motion frames through the
+dense ordered path. The latest 512px WGPU viewer stability sweep showed that
+exact sparse widths are steady once warm, but live high-density jitter can still
+trigger first-use shape/autotune stalls. Before running full per-patch scoring,
+the camera RGBA path samples the patch grid and takes this dense path early when
+the sampled frame is already above the cutoff.
+The viewer defaults to shape-stable bucketed sparse encode with exact cache
+writes (`bucketed-context`): threshold-selected patches still define the
+low-res cache overwrite mask, while the encoder context is widened into stable
+GPU buckets controlled by `--sparse-mask-bucket-tokens 256`. This never drops
+threshold-selected patches, but it adds real extra context tokens, so use
+`--sparse-encode-mode exact` when an experiment needs encode tokens to match the
+displayed write mask exactly.
+`--prewarm-shape-buckets` is enabled by default to move bucket specializations
+to startup; use `--no-prewarm-shape-buckets` to disable it.
+The pipeline image size is at least 256x256, defaults to 512x512 sparse
 encoding, and is rounded up to a multiple of the 16px V-JEPA patch size. The
-default token grid is 16x16; `--image-size 512` uses the larger 32x32-grid path.
+default token grid is 32x32; `--image-size 256` uses the smaller 16x16-grid
+path.
 
 The app renders four stage panels:
 
@@ -43,12 +75,16 @@ The app renders four stage panels:
 - low-resolution JEPA token-cache PCA
 - high-resolution AnyUp PCA
 
-Without `--anyup-weights`, the viewer uses the tiny untrained AnyUp test module
-so the high-resolution panel validates pipeline wiring rather than pretrained
-feature quality. Use an upstream checkpoint plus `--anyup-attention-mode
-upstream-masked` for exact parity with upstream Python's default AnyUp path, or
-`efficient-local` for the portable NATTEN-style path used by the real-time
-pipeline.
+The viewer preprocesses camera/static frames with the same ImageNet
+mean/std normalization expected by V-JEPA and upstream AnyUp. If
+`target/burn-anyup-checkpoints/anyup_multi_backbone.pth` exists, the viewer
+uses it automatically when `--anyup-weights` is omitted. Without an explicit or
+auto-discovered checkpoint, the viewer uses the tiny untrained AnyUp test module
+and logs that the high-resolution panel is only a wiring diagnostic, not a
+meaningful pretrained feature visualization. Use an upstream checkpoint plus
+`--anyup-attention-mode upstream-masked` for exact parity with upstream Python's
+default AnyUp path, or `efficient-local` for the portable NATTEN-style path used
+by the real-time pipeline.
 
 `--mask-source autogaze` is reserved for a real model-backed AutoGaze node. The
 viewer now fails clearly instead of synthesizing an AutoGaze-looking moving
@@ -56,10 +92,11 @@ center prior, so any "autogaze" output must come from `burn_autogaze` rather
 than from generated test motion.
 
 The PCA basis update is decoupled from display emission. By default the viewer
-updates the rolling low-resolution PCA basis every 4 frames using a 4-frame
-sample window and multi-iteration updates, so stable features across time define
-the color space without spending several seconds on the cold-start identity
-basis. PCA display uses the V-JEPA 2.1 dense-feature visualization
+updates the rolling low-resolution PCA basis every processed low-res frame after
+a two-frame warmup, using a 16-frame sample window. Stable features across time
+define the color space without spending several seconds on the cold-start
+identity basis, while the rolling window smooths color drift. PCA display uses
+the V-JEPA 2.1 dense-feature visualization
 protocol: the first three PCA components of observed patch features are mapped
 to RGB with rolling, device-resident normalization so colors remain semantically
 stable across sparse updates.
@@ -72,17 +109,74 @@ AnyUp -> PCA pipeline then runs on the square crop. The wasm page
 uses `navigator.mediaDevices.getUserMedia` and forwards frames through the
 exported `frame_input(...)` function; `?source=static` uses generated or
 `?image-url=...` frames without requesting a webcam.
+Model loading prefers a sharded `burn_jepa` `.bpk` package manifest. Exported
+packages store floating-point records as f16 for deployment size, and the
+native/wasm loaders upcast those records into the active backend dtype. Native
+runs check `--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`,
+`target/burn-jepa-web/model/manifest.json`, then an auto-downloaded cache under
+`~/.burn_jepa/models/burn_jepa` before accepting a legacy explicit
+`--ttt-model ...mpk` override. The native cache downloads from the same default
+URL wasm uses, `https://aberration.technology/model/burn_jepa/manifest.json`;
+use `--model-base-url`, `--model-cache-dir`, or `--no-model-download` to control
+that path. Wasm fetches the same remote manifest by default; use
+`?model-base=http://127.0.0.1:8091` for a local directory containing
+`manifest.json`, or `?model-manifest=...` for a specific manifest URL.
+`?load-model=false` selects the tiny test encoder and skips all model shard
+fetches. `?preload-only=true` checks shard fetching without starting the Bevy
+app. Model shards are not included in the GitHub Pages artifact.
+
+```bash
+cargo run --bin burn-jepa -- export-bpk \
+  --config ../../configs/deploy/vjepa21-base-bpk-export.toml \
+  --output ../../target/burn-jepa-web/model/vjepa2_1_vit_base_384.bpk \
+  --shard-mib 20 \
+  --model-base-url https://aberration.technology/model/burn_jepa \
+  --deploy-dir ../../target/burn-jepa-cdn-upload \
+  --overwrite-deploy
+python3 -m http.server 8091 -d ../../target/burn-jepa-web/model
+npm run build:wasm
+npm run serve
+# open http://127.0.0.1:8080/?model-base=http://127.0.0.1:8091&source=static
+# native auto-cache: cargo run -p bevy_jepa -- --model-base-url http://127.0.0.1:8091
+# native explicit: cargo run -p bevy_jepa -- --model-manifest ../../target/burn-jepa-web/model/manifest.json
+```
+
+For a small local package/inference smoke:
+
+```bash
+cargo run --no-default-features --features ndarray --bin burn-jepa -- export-bpk \
+  --config ../../configs/wasm/tiny-bpk-export.toml \
+  --output ../../target/burn-jepa-wasm-model/jepa.bpk \
+  --shard-mib 1 \
+  --overwrite-shards \
+  --deploy-dir ../../target/burn-jepa-wasm-model-upload \
+  --overwrite-deploy \
+  --allow-tiny-model
+cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm
+mkdir -p ../../target/burn-jepa-wasm-api/out
+wasm-bindgen --target web --out-dir ../../target/burn-jepa-wasm-api/out \
+  --out-name burn_jepa ../../target/wasm32-unknown-unknown/release/burn_jepa.wasm
+npm run test:wasm-api
+BURN_JEPA_WASM_MODEL_MANIFEST_URL=https://aberration.technology/model/burn_jepa/manifest.json npm run test:wasm-api
+```
 
 The Bevy schedule keeps input preview separate from stage processing. Camera
-frames update the input panel as soon as they arrive; JEPA/AnyUp/PCA work runs
-on Bevy's async compute pool with one active stage task and one latest pending
-stage frame. If the stage worker is still busy, a newer input frame overwrites
-the pending stage frame instead of letting the queue grow. The overlay reports
-input, low-res, and high-res FPS separately, plus in-flight, dropped, and
-overwritten stage-frame counts. `--high-res-pca-every N` keeps low-res token
-cache PCA available every processed stage frame while emitting the slower AnyUp
-high-res PCA panel at a lower rate. The default is `8`; set it to `1` for
-full-rate high-res AnyUp or `0` to disable high-res AnyUp/PCA emission.
+frames update the input panel as soon as they arrive; JEPA/cache/PCA work runs
+on Bevy's async compute pool with one active low-res stage task and one latest
+pending stage frame. If the low-res stage worker is still busy, a newer input
+frame overwrites the pending stage frame instead of letting the queue grow. The
+overlay reports input, low-res, and high-res FPS separately, plus in-flight,
+dropped, and overwritten stage-frame counts. `--high-res-pca-every N` keeps
+low-res token-cache PCA available every processed stage frame. Positive values
+send completed low-res cache snapshots to a separate AnyUp worker with its own
+latest-frame overwrite slot. The default `--high-res-pca-every 0` means AnyUp is
+opt-in, so it cannot stall the camera -> mask -> JEPA -> low-res cache path.
+The low-res PCA basis is adaptive by default: `--pca-update-every 1` updates the
+rolling Oja basis after a two-frame warmup while sampling from a 16-frame
+device-resident window. This keeps the color space responsive without fitting
+PCA from a single frame. Use `--pca-sample-window-frames`,
+`--pca-min-sample-frames`, and `--pca-update-iterations` to trade color
+stability against adaptation speed and update cost.
 
 For camera input, preview frames stay as center-cropped RGBA until they are
 actually admitted into the sparse JEPA stage. The pending slot therefore does
@@ -96,16 +190,28 @@ by that stage rather than the newest camera preview frame.
 Patch-diff defaults to threshold-gated selection with dynamic density. If only a
 few JEPA patches cross the threshold, only those patches are updated except for
 the independent `--min-context-density` floor; if the whole frame changes, the
-mask can expand to the full token grid. `--context-density` is retained for
-legacy fixed-budget patch-diff configs, but the Bevy adaptive threshold path
-does not top-k cap tokens that pass the threshold.
+mask can expand to the full token grid. Near-full masks are intentionally
+promoted to the dense ordered path because high-density sparse shape churn and
+scatter can be slower than dense assignment on GPU backends. The default cutoff
+is `0.60`; use
+`--patch-diff-dense-fallback-density 1.0` to promote only exactly full masks, or
+lower it after measuring a backend where sparse shape churn is worse than dense
+full-grid inference. A sampled high-motion precheck uses the same cutoff to
+skip full patch-diff scoring when the frame is already clearly near-dense.
+`--context-density` is retained for legacy fixed-budget patch-diff configs, but
+the Bevy adaptive threshold path does not top-k cap tokens that pass the
+threshold.
 
-`--encode-path auto` is the default. With the `sparse-patchify-wgpu` feature and
-the V-JEPA or trained TTT encoder, auto routes image encoding through the
-flex-gmm sparse patchify path so masked patches are skipped before the encoder.
-Use `--encode-path dense-patch` to force the portable dense-patch-embed plus
-sparse-token path, or `--encode-path sparse-patchify` when you want the app to
-fail clearly if sparse patchify is unavailable for the selected build.
+`--encode-path auto` is the default. Native `bevy_jepa` keeps the dense-patch
+path as the default startup lane because WGPU sparse-patchify kernels have a
+large cold compile cost. Bucketed-context sparse encode is the default; use
+`--sparse-encode-mode exact` when stable token-width buckets are not worth the
+extra real context tokens. Build with
+`--features sparse-patchify-wgpu` to opt into flex-gmm sparse patchify; auto then
+routes non-dense masks through sparse patchify while dense ordered masks stay on
+the dense path. Use `--encode-path dense-patch` to force the portable
+dense-patch-embed plus sparse-token path, or `--encode-path sparse-patchify` when
+you want the app to force sparse patchify for diagnostics.
 
 ## Benchmarks
 

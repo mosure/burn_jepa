@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use anyhow::{Context, Result, bail, ensure};
 use burn::backend::NdArray;
 use burn::tensor::{Tensor, TensorData};

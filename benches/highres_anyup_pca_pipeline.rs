@@ -1,12 +1,12 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_jepa::{
-    AnyUp, AnyUpConfig, FeaturePcaConfig, FeaturePcaDisplayMode, FeaturePcaProjector,
-    FeaturePcaUpdateConfig, InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig,
-    SparseJepaAnyUpPcaFrameId, SparseJepaAnyUpPcaFrameInput, SparseJepaAnyUpPcaMeasurementConfig,
-    SparseJepaAnyUpPcaPipeline, SparseJepaAnyUpPcaPipelineConfig, SparseJepaAnyUpPcaStream,
-    SparseJepaAnyUpPcaStreamConfig, SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig,
-    jepa_feature_tokens_to_nchw,
+    AnyUp, AnyUpConfig, FeatureFrameRequest, FeaturePcaConfig, FeaturePcaDisplayMode,
+    FeaturePcaProjector, FeaturePcaUpdateConfig, InterframeJepaFeatureMemory,
+    InterframeJepaFeatureMemoryConfig, SparseJepaAnyUpPcaFrameId, SparseJepaAnyUpPcaFrameInput,
+    SparseJepaAnyUpPcaMeasurementConfig, SparseJepaAnyUpPcaPipeline,
+    SparseJepaAnyUpPcaPipelineConfig, SparseJepaAnyUpPcaStream, SparseJepaAnyUpPcaStreamConfig,
+    SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig, jepa_feature_tokens_to_nchw,
 };
 #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
 use burn_jepa::{SparseMaskBatch, SparsePatchifyBatchPlan};
@@ -479,6 +479,71 @@ fn bench_tiny_e2e_pipeline_step<B, MakeDevice>(
     group.finish();
 }
 
+fn bench_tiny_jepa_cache_density_sweep<B, MakeDevice>(
+    c: &mut Criterion,
+    backend_name: &str,
+    make_device: MakeDevice,
+) where
+    B: Backend,
+    MakeDevice: Fn() -> B::Device + Copy,
+{
+    let mut group = c.benchmark_group(format!("highres_jepa_cache_density_sweep_{backend_name}"));
+    for image_hw in [256usize, 512] {
+        for density in [0.50f32, 0.75, 0.85, 0.90, 0.95, 0.98, 1.0] {
+            group.throughput(Throughput::Elements((image_hw * image_hw) as u64));
+            group.bench_function(format!("tiny{image_hw}_density_{density:.2}"), |bench| {
+                bench.iter_batched(
+                    || {
+                        let device = make_device();
+                        let mut model_config = VJepaConfig::tiny_for_tests();
+                        model_config.image_size = image_hw;
+                        model_config.num_frames = 2;
+                        model_config.tubelet_size = 2;
+                        let jepa = VJepa2_1Model::<B>::new(&model_config, &device);
+                        let anyup =
+                            AnyUp::<B>::new(AnyUpConfig::tiny_for_tests(), &device).expect("anyup");
+                        let pipeline = SparseJepaAnyUpPcaPipeline::<B>::new(
+                            jepa,
+                            anyup,
+                            &model_config,
+                            SparseJepaAnyUpPcaPipelineConfig {
+                                pca_update: FeaturePcaUpdateConfig::disabled(),
+                                measurement: SparseJepaAnyUpPcaMeasurementConfig::disabled(),
+                                ..SparseJepaAnyUpPcaPipelineConfig::default()
+                            },
+                            1,
+                            [model_config.image_size, model_config.image_size],
+                            &device,
+                        )
+                        .expect("pipeline");
+                        let image = Tensor::<B, 4>::ones(
+                            [1, 3, model_config.image_size, model_config.image_size],
+                            &device,
+                        );
+                        let keep = ((pipeline.grid().len() as f32) * density).ceil() as usize;
+                        let mask = SparseTokenMask::evenly_spaced(pipeline.grid().len(), keep);
+                        (device, pipeline, image, mask)
+                    },
+                    |(device, mut pipeline, image, mask)| {
+                        let output = pipeline
+                            .step_image_with_mask_nodes_measured(
+                                black_box(image),
+                                black_box(&mask),
+                                FeatureFrameRequest::none(),
+                            )
+                            .expect("JEPA cache density sweep step");
+                        B::sync(&device).expect("sync JEPA cache density backend");
+                        black_box(output.output.token_cache.features);
+                        black_box(output.metrics);
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 #[cfg(feature = "sparse-patchify-wgpu")]
 fn bench_tiny_e2e_pipeline_step_sparse_patchify_wgpu(c: &mut Criterion) {
     type B = burn_flex_gmm::wgpu::DefaultWgpuBackend;
@@ -786,6 +851,7 @@ where
     bench_pca_basis_update::<B, _>(c, backend_name, make_device);
     bench_anyup_from_token_cache::<B, _>(c, backend_name, make_device);
     bench_sparse_update_to_anyup_pca::<B, _>(c, backend_name, make_device);
+    bench_tiny_jepa_cache_density_sweep::<B, _>(c, backend_name, make_device);
     bench_tiny_e2e_pipeline_step::<B, _>(c, backend_name, make_device);
     bench_inflight_stream_batches::<B, _>(c, backend_name, make_device);
     bench_inflight_stream_cached_masks::<B, _>(c, backend_name, make_device);
@@ -793,7 +859,7 @@ where
 
 #[cfg(feature = "ndarray")]
 fn highres_pipeline_ndarray(c: &mut Criterion) {
-    bench_backend::<burn::backend::NdArray<f32>, _>(c, "ndarray", || Default::default());
+    bench_backend::<burn::backend::NdArray<f32>, _>(c, "ndarray", Default::default);
 }
 
 #[cfg(not(feature = "ndarray"))]
@@ -801,7 +867,7 @@ fn highres_pipeline_ndarray(_c: &mut Criterion) {}
 
 #[cfg(feature = "flex")]
 fn highres_pipeline_flex(c: &mut Criterion) {
-    bench_backend::<burn::backend::Flex<f32, i32>, _>(c, "flex", || Default::default());
+    bench_backend::<burn::backend::Flex<f32, i32>, _>(c, "flex", Default::default);
 }
 
 #[cfg(not(feature = "flex"))]
@@ -825,7 +891,7 @@ fn highres_pipeline_cuda(c: &mut Criterion) {
         eprintln!("skipping highres_pipeline_cuda: {reason}");
         return;
     }
-    bench_backend::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", || Default::default());
+    bench_backend::<burn::backend::Cuda<f32, i32>, _>(c, "cuda", Default::default);
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -833,7 +899,7 @@ fn highres_pipeline_cuda(_c: &mut Criterion) {}
 
 #[cfg(any(feature = "wgpu", feature = "webgpu"))]
 fn highres_pipeline_wgpu(c: &mut Criterion) {
-    bench_backend::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", || Default::default());
+    bench_backend::<burn::backend::Wgpu<f32, i32>, _>(c, "wgpu", Default::default);
 }
 
 #[cfg(not(any(feature = "wgpu", feature = "webgpu")))]

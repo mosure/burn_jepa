@@ -68,8 +68,8 @@ jobs:
           test -e /dev/nvidiactl || test -e /dev/nvidia0
           nvidia-smi -L
 
-      - name: compile cuda feature set
-        run: cargo check --no-default-features --features cuda
+      - name: compile cuda sparse patchify feature set
+        run: cargo check --no-default-features --features cuda,sparse-patchify-cuda
 
       - name: run e2e cuda benchmark
         env:

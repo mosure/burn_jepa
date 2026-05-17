@@ -81,6 +81,65 @@ impl SparseTokenMask {
         }
     }
 
+    pub fn is_dense_ordered(&self) -> bool {
+        self.indices.len() == self.dense_len
+            && self
+                .indices
+                .iter()
+                .copied()
+                .enumerate()
+                .all(|(position, index)| position == index)
+    }
+
+    pub fn padded_to_len(&self, target_len: usize) -> Self {
+        if target_len <= self.indices.len() {
+            return self.clone();
+        }
+        if target_len >= self.dense_len {
+            return Self::all(self.dense_len);
+        }
+
+        let mut keep = vec![false; self.dense_len];
+        let mut indices = self.indices.clone();
+        for &index in &indices {
+            keep[index] = true;
+        }
+        for index in Self::evenly_spaced_indices(self.dense_len, target_len) {
+            if !keep[index] {
+                keep[index] = true;
+                indices.push(index);
+                if indices.len() >= target_len {
+                    break;
+                }
+            }
+        }
+        if indices.len() < target_len {
+            for (index, present) in keep.iter_mut().enumerate() {
+                if !*present {
+                    *present = true;
+                    indices.push(index);
+                    if indices.len() >= target_len {
+                        break;
+                    }
+                }
+            }
+        }
+        Self::new(indices, self.dense_len).expect("padded mask is valid")
+    }
+
+    pub fn padded_to_multiple(&self, multiple: usize) -> Self {
+        if multiple <= 1 || self.indices.len() >= self.dense_len {
+            return self.clone();
+        }
+        let target_len = self
+            .indices
+            .len()
+            .div_ceil(multiple)
+            .saturating_mul(multiple)
+            .min(self.dense_len);
+        self.padded_to_len(target_len)
+    }
+
     pub fn complement(&self) -> Self {
         let mut keep = vec![false; self.dense_len];
         for &index in &self.indices {
@@ -275,6 +334,30 @@ impl<B: Backend> SparseMaskBatch<B> {
 
     pub fn is_uniform(&self) -> bool {
         matches!(self, Self::Uniform { .. })
+    }
+
+    pub fn is_dense_ordered(&self) -> bool {
+        let dense_len = self.dense_len();
+        match self {
+            Self::Uniform { mask, .. } => {
+                mask.len() == dense_len
+                    && mask
+                        .indices()
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .all(|(position, index)| position == index)
+            }
+            Self::FixedWidth { rows, .. } => rows.iter().all(|row| {
+                row.len() == dense_len
+                    && row
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .all(|(position, index)| position == index)
+            }),
+            Self::Ragged { .. } => false,
+        }
     }
 
     pub fn is_ragged(&self) -> bool {
@@ -482,6 +565,27 @@ mod tests {
         let mask = SparseTokenMask::new(vec![3, 1, 1], 5).expect("mask");
         assert_eq!(mask.indices(), &[1, 3]);
         assert_eq!(mask.complement().indices(), &[0, 2, 4]);
+    }
+
+    #[test]
+    fn padded_mask_keeps_existing_tokens_and_rounds_to_bucket() {
+        let mask = SparseTokenMask::new(vec![7, 1, 3], 10).expect("mask");
+        let padded = mask.padded_to_multiple(4);
+
+        assert_eq!(padded.len(), 4);
+        for index in [1, 3, 7] {
+            assert!(padded.indices().contains(&index));
+        }
+        assert!(!padded.is_dense_ordered());
+    }
+
+    #[test]
+    fn padded_mask_promotes_to_dense_when_bucket_reaches_dense_len() {
+        let mask = SparseTokenMask::new(vec![0, 2, 4, 6, 8], 10).expect("mask");
+        let padded = mask.padded_to_multiple(16);
+
+        assert_eq!(padded.indices(), SparseTokenMask::all(10).indices());
+        assert!(padded.is_dense_ordered());
     }
 
     #[test]

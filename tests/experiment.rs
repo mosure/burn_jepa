@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use burn_jepa::{
     ExperimentConfig, ExperimentMaskPolicy, ExperimentModelVariant, JepaDatasetKind,
     JepaSampleKind, TttLayerPlacement, prepare_experiment_data, run_experiment,
@@ -120,6 +122,9 @@ fn production_autogaze_data_config_uses_clip_prefix_domains() {
     );
     assert_eq!(config.data.window_frames, 16);
     assert_eq!(config.data.window_stride, 8);
+    assert!(config.base.dataset.image_size >= 256);
+    assert!(config.data.train_manifest.to_string_lossy().contains("256"));
+    assert!(config.data.eval_manifest.to_string_lossy().contains("256"));
 }
 
 #[test]

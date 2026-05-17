@@ -1,20 +1,20 @@
 [model]
 checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
-ttt_checkpoint_path = "target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk"
+ttt_checkpoint_path = "target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
-output_dir = "target/burn-jepa-production-final/stage2-unfrozen-low-lr"
+output_dir = "target/burn-jepa-production-final-256/stage2-unfrozen-low-lr"
 save_model = true
 
 [dataset]
 kind = "manifest"
 sample_kind = "video"
-train_manifest = "target/burn-jepa-production-final/data/train-real-autogaze.jsonl"
-eval_manifest = "target/burn-jepa-production-final/data/eval-real-autogaze.jsonl"
+train_manifest = "target/burn-jepa-production-final-256/data/train-real-autogaze.jsonl"
+eval_manifest = "target/burn-jepa-production-final-256/data/eval-real-autogaze.jsonl"
 frames = 16
 stride = 1
-image_size = 224
+image_size = 256
 synthetic_len = 1
 
 [ttt]
@@ -49,7 +49,9 @@ eval_batch_size = 16
 eval_full_grid = false
 eval_utilization_diagnostics = true
 eval_temporal_diagnostics = true
-cache_teacher_tokens = true
+cache_teacher_tokens = false
+teacher_cache_max_entries = 0
+prefetch_batches = true
 save_steps = 256
 
 [training.lr_schedule]

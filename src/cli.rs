@@ -20,7 +20,7 @@ use crate::{
 };
 #[cfg(feature = "dispatch")]
 use crate::{JepaDispatchBackend, TrainingLoopConfig};
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use burn::tensor::backend::AutodiffBackend;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -68,9 +68,88 @@ pub enum BurnJepaCommand {
         #[arg(long)]
         steps: Option<usize>,
         #[arg(long)]
+        batch_size: Option<usize>,
+        #[arg(long)]
         eval_steps: Option<usize>,
         #[arg(long)]
         eval_batch_size: Option<usize>,
+    },
+    ExportBpk {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        shard_mib: u64,
+        #[arg(long, default_value_t = false)]
+        overwrite_shards: bool,
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
+        model_base_url: String,
+        #[arg(
+            long,
+            help = "Optional clean CDN/upload directory containing manifest.json, parts manifest, and shard files only."
+        )]
+        deploy_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        overwrite_deploy: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Permit exporting the tiny test model when no checkpoint/config is configured."
+        )]
+        allow_tiny_model: bool,
+    },
+    CacheModel {
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
+        model_base_url: String,
+        #[arg(long)]
+        manifest_url: Option<String>,
+        #[arg(
+            long,
+            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa."
+        )]
+        cache_dir: Option<PathBuf>,
+    },
+    VerifyBpk {
+        #[arg(
+            long,
+            help = "Local burn_jepa package manifest. If omitted, cache/download from --model-base-url."
+        )]
+        manifest: Option<PathBuf>,
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
+        model_base_url: String,
+        #[arg(long)]
+        manifest_url: Option<String>,
+        #[arg(
+            long,
+            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa."
+        )]
+        cache_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Optional original V-JEPA checkpoint directory to compare against."
+        )]
+        checkpoint_dir: Option<PathBuf>,
+        #[arg(long)]
+        weights_name: Option<String>,
+        #[arg(long, default_value_t = 32)]
+        image_size: usize,
+        #[arg(long, default_value_t = 4)]
+        frames: usize,
+        #[arg(long, default_value_t = 0.25)]
+        max_abs_tol: f32,
+        #[arg(long, default_value_t = 0.05)]
+        mean_abs_tol: f32,
+    },
+    BundleBpkDeploy {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
     },
     PrintConfig,
     PrintExperimentConfig,
@@ -142,6 +221,7 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
         BurnJepaCommand::BenchTtt {
             config,
             steps,
+            batch_size,
             eval_steps,
             eval_batch_size,
         } => {
@@ -151,6 +231,9 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
                 config.training.lr_schedule =
                     config.training.lr_schedule.clamped_to_max_steps(steps);
             }
+            if let Some(batch_size) = batch_size {
+                config.training.batch_size = batch_size.max(1);
+            }
             if let Some(eval_steps) = eval_steps {
                 config.training.eval_steps = eval_steps;
             }
@@ -159,6 +242,75 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             }
             config.model.save_model = false;
             let report = dispatch_ttt(&config)?;
+            print_json(&report)
+        }
+        BurnJepaCommand::ExportBpk {
+            config,
+            model,
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            allow_tiny_model,
+        } => dispatch_export_bpk(
+            config,
+            model,
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            allow_tiny_model,
+        ),
+        BurnJepaCommand::CacheModel {
+            model_base_url,
+            manifest_url,
+            cache_dir,
+        } => {
+            let config = crate::BurnJepaModelBootstrapConfig {
+                cache_root: cache_dir,
+                model_base_url,
+                manifest_url,
+            };
+            let report =
+                crate::resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress(
+                    &config,
+                    |message| eprintln!("{message}"),
+                )?;
+            print_json(&report)
+        }
+        BurnJepaCommand::VerifyBpk {
+            manifest,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            checkpoint_dir,
+            weights_name,
+            image_size,
+            frames,
+            max_abs_tol,
+            mean_abs_tol,
+        } => dispatch_verify_bpk(
+            manifest,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            checkpoint_dir,
+            weights_name,
+            image_size,
+            frames,
+            max_abs_tol,
+            mean_abs_tol,
+        ),
+        BurnJepaCommand::BundleBpkDeploy {
+            manifest,
+            output,
+            overwrite,
+        } => {
+            let report = crate::write_burn_jepa_model_deploy_bundle(manifest, output, overwrite)?;
             print_json(&report)
         }
         BurnJepaCommand::PrintConfig => {
@@ -171,6 +323,598 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             println!("{}", config.to_toml_string()?);
             Ok(())
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_verify_bpk(
+    manifest: Option<PathBuf>,
+    model_base_url: String,
+    manifest_url: Option<String>,
+    cache_dir: Option<PathBuf>,
+    checkpoint_dir: Option<PathBuf>,
+    weights_name: Option<String>,
+    image_size: usize,
+    frames: usize,
+    max_abs_tol: f32,
+    mean_abs_tol: f32,
+) -> Result<()> {
+    #[cfg(feature = "ndarray")]
+    {
+        verify_bpk_ndarray(
+            manifest,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            checkpoint_dir,
+            weights_name,
+            image_size,
+            frames,
+            max_abs_tol,
+            mean_abs_tol,
+        )
+    }
+    #[cfg(not(feature = "ndarray"))]
+    {
+        let _ = (
+            manifest,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            checkpoint_dir,
+            weights_name,
+            image_size,
+            frames,
+            max_abs_tol,
+            mean_abs_tol,
+        );
+        bail!("verify-bpk requires the ndarray feature so native numerical checks can run on CPU")
+    }
+}
+
+#[cfg(feature = "ndarray")]
+#[derive(Debug, Serialize)]
+struct BpkVerifyReport {
+    manifest_path: PathBuf,
+    parts_manifest_path: PathBuf,
+    part_count: usize,
+    total_bytes: u64,
+    model_kind: crate::BurnJepaPackageModelKind,
+    record_dtype: Option<String>,
+    burnpack_dtype_counts: std::collections::BTreeMap<String, usize>,
+    runtime_dtype_counts: std::collections::BTreeMap<String, usize>,
+    apply_applied: usize,
+    apply_missing: usize,
+    apply_skipped: usize,
+    apply_unused: usize,
+    apply_errors: usize,
+    output_shape: Vec<usize>,
+    grid: [usize; 3],
+    sample_count: usize,
+    sample_mean: f32,
+    sample_min: f32,
+    sample_max: f32,
+    checkpoint_parity: Option<BpkCheckpointParityReport>,
+    load_path: &'static str,
+}
+
+#[cfg(feature = "ndarray")]
+#[derive(Debug, Serialize)]
+struct BpkCheckpointParityReport {
+    checkpoint_dir: PathBuf,
+    checkpoint_applied: usize,
+    checkpoint_missing: usize,
+    checkpoint_skipped: usize,
+    checkpoint_errors: usize,
+    max_abs: f32,
+    mean_abs: f32,
+    rmse: f32,
+    cosine: f32,
+    within_tolerance: bool,
+}
+
+#[cfg(feature = "ndarray")]
+enum NativeBpkModel {
+    Base(crate::VJepa2_1Model<burn::backend::NdArray<f32>>),
+    Ttt(crate::VJepaTttModel<burn::backend::NdArray<f32>>),
+}
+
+#[cfg(feature = "ndarray")]
+#[allow(clippy::too_many_arguments)]
+fn verify_bpk_ndarray(
+    manifest_path: Option<PathBuf>,
+    model_base_url: String,
+    manifest_url: Option<String>,
+    cache_dir: Option<PathBuf>,
+    checkpoint_dir: Option<PathBuf>,
+    weights_name: Option<String>,
+    image_size: usize,
+    frames: usize,
+    max_abs_tol: f32,
+    mean_abs_tol: f32,
+) -> Result<()> {
+    ensure!(image_size > 0, "--image-size must be nonzero");
+    ensure!(frames > 0, "--frames must be nonzero");
+
+    type B = burn::backend::NdArray<f32>;
+
+    let package = if let Some(manifest_path) = manifest_path {
+        let manifest_path = manifest_path;
+        let manifest_json = std::fs::read_to_string(&manifest_path)?;
+        let manifest = crate::BurnJepaPipelinePackageManifest::from_json_str(&manifest_json)?;
+        let parts_manifest_path =
+            crate::resolve_package_manifest_entry_path(&manifest_path, &manifest.parts_manifest)?;
+        let parts_manifest = crate::read_parts_manifest(&parts_manifest_path)?;
+        let part_paths = parts_manifest
+            .parts
+            .iter()
+            .map(|part| crate::resolve_part_entry_path(&parts_manifest_path, &part.path))
+            .collect::<Result<Vec<_>>>()?;
+        Some(crate::BurnJepaModelPackageFiles {
+            cache_root: manifest_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
+            manifest_path,
+            parts_manifest_path,
+            part_paths,
+            total_bytes: parts_manifest.total_bytes,
+            model_base_url: manifest.model_base_url,
+        })
+    } else {
+        let config = crate::BurnJepaModelBootstrapConfig {
+            cache_root: cache_dir,
+            model_base_url,
+            manifest_url,
+        };
+        Some(
+            crate::resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress(
+                &config,
+                |message| eprintln!("{message}"),
+            )?,
+        )
+    }
+    .expect("package files");
+
+    let manifest_json = std::fs::read_to_string(&package.manifest_path)?;
+    let manifest = crate::BurnJepaPipelinePackageManifest::from_json_str(&manifest_json)?;
+    let parts = package
+        .part_paths
+        .iter()
+        .map(std::fs::read)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let device = Default::default();
+    let (model, apply_result, runtime_dtype_counts) = match manifest.model_kind {
+        crate::BurnJepaPackageModelKind::Base => {
+            let (model, result) =
+                crate::load_vjepa_burnpack_parts::<B>(&manifest.jepa_config, &parts, &device)?;
+            let dtype_counts = crate::module_dtype_counts::<B, _>(&model);
+            (NativeBpkModel::Base(model), result, dtype_counts)
+        }
+        crate::BurnJepaPackageModelKind::Ttt => {
+            let ttt_config = manifest
+                .ttt_config
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("TTT package manifest is missing ttt_config"))?;
+            let (model, result) = crate::load_ttt_burnpack_parts::<B>(
+                &manifest.jepa_config,
+                ttt_config,
+                &parts,
+                &device,
+            )?;
+            let dtype_counts = crate::module_dtype_counts::<B, _>(&model);
+            (NativeBpkModel::Ttt(model), result, dtype_counts)
+        }
+    };
+    ensure!(
+        apply_result.errors.is_empty(),
+        "burnpack apply reported errors: {:?}",
+        apply_result.errors
+    );
+    ensure!(
+        runtime_dtype_counts.get("F16").copied().unwrap_or(0) == 0,
+        "runtime model still contains F16 tensors after load: {:?}",
+        runtime_dtype_counts
+    );
+
+    let video = verification_video::<B>(image_size, frames, &device)?;
+    let output = encode_native_bpk_model(&model, video)?;
+    let [batch, tokens, dim] = output.tokens.shape().dims::<3>();
+    let values = output
+        .tokens
+        .clone()
+        .into_data()
+        .to_vec::<f32>()
+        .map_err(|err| anyhow::anyhow!("read BPK output values: {err:?}"))?;
+    let (sample_min, sample_max, sample_mean) = summarize_f32(&values);
+
+    let checkpoint_parity = if let Some(checkpoint_dir) = checkpoint_dir {
+        ensure!(
+            manifest.model_kind == crate::BurnJepaPackageModelKind::Base,
+            "checkpoint parity currently expects a base V-JEPA package"
+        );
+        let mut options = crate::VJepaLoadOptions::default();
+        if let Some(weights_name) = weights_name {
+            options.weights_name = weights_name;
+        }
+        let (checkpoint_model, _config, checkpoint_report) =
+            options.load_model::<B>(&checkpoint_dir, &device)?;
+        ensure!(
+            checkpoint_report.errors.is_empty(),
+            "checkpoint import reported errors: {:?}",
+            checkpoint_report.errors
+        );
+        let checkpoint_output = checkpoint_model
+            .encode_video(verification_video::<B>(image_size, frames, &device)?, None);
+        let checkpoint_values = checkpoint_output
+            .tokens
+            .into_data()
+            .to_vec::<f32>()
+            .map_err(|err| anyhow::anyhow!("read checkpoint output values: {err:?}"))?;
+        ensure!(
+            checkpoint_values.len() == values.len(),
+            "checkpoint/BPK output length mismatch: {} vs {}",
+            checkpoint_values.len(),
+            values.len()
+        );
+        let metrics = compare_f32(&values, &checkpoint_values);
+        let within_tolerance = metrics.max_abs <= max_abs_tol && metrics.mean_abs <= mean_abs_tol;
+        ensure!(
+            within_tolerance,
+            "BPK checkpoint parity exceeded tolerance: max_abs={} mean_abs={} tolerances=({}, {})",
+            metrics.max_abs,
+            metrics.mean_abs,
+            max_abs_tol,
+            mean_abs_tol
+        );
+        Some(BpkCheckpointParityReport {
+            checkpoint_dir,
+            checkpoint_applied: checkpoint_report.applied.len(),
+            checkpoint_missing: checkpoint_report.missing.len(),
+            checkpoint_skipped: checkpoint_report.skipped.len(),
+            checkpoint_errors: checkpoint_report.errors.len(),
+            max_abs: metrics.max_abs,
+            mean_abs: metrics.mean_abs,
+            rmse: metrics.rmse,
+            cosine: metrics.cosine,
+            within_tolerance,
+        })
+    } else {
+        None
+    };
+
+    let burnpack_dtype_counts = crate::burnpack_parts_dtype_counts(&package.parts_manifest_path)?;
+    ensure!(
+        burnpack_dtype_counts.get("F16").copied().unwrap_or(0) > 0
+            && burnpack_dtype_counts.get("F32").copied().unwrap_or(0) == 0,
+        "deployment burnpack parts are not f16-only: {:?}",
+        burnpack_dtype_counts
+    );
+
+    print_json(&BpkVerifyReport {
+        manifest_path: package.manifest_path,
+        parts_manifest_path: package.parts_manifest_path,
+        part_count: package.part_paths.len(),
+        total_bytes: package.total_bytes,
+        model_kind: manifest.model_kind,
+        record_dtype: manifest.record_dtype,
+        burnpack_dtype_counts,
+        runtime_dtype_counts,
+        apply_applied: apply_result.applied.len(),
+        apply_missing: apply_result.missing.len(),
+        apply_skipped: apply_result.skipped.len(),
+        apply_unused: apply_result.unused.len(),
+        apply_errors: apply_result.errors.len(),
+        output_shape: vec![batch, tokens, dim],
+        grid: [output.grid.depth, output.grid.height, output.grid.width],
+        sample_count: values.len(),
+        sample_mean,
+        sample_min,
+        sample_max,
+        checkpoint_parity,
+        load_path: "burn_store::BurnpackStore + ModuleSnapshot::load_from clean init",
+    })
+}
+
+#[cfg(feature = "ndarray")]
+fn encode_native_bpk_model(
+    model: &NativeBpkModel,
+    video: burn::tensor::Tensor<burn::backend::NdArray<f32>, 5>,
+) -> Result<crate::VJepaEncoderOutput<burn::backend::NdArray<f32>>> {
+    match model {
+        NativeBpkModel::Base(model) => Ok(model.encode_video(video, None)),
+        NativeBpkModel::Ttt(model) => model.encode_video(video, None),
+    }
+}
+
+#[cfg(feature = "ndarray")]
+fn verification_video<B: burn::tensor::backend::Backend>(
+    image_size: usize,
+    frames: usize,
+    device: &B::Device,
+) -> Result<burn::tensor::Tensor<B, 5>> {
+    let shape = crate::VJepaRgbaVideoShape::new(1, frames, image_size, image_size);
+    let mut rgba = vec![0u8; shape.num_bytes()];
+    for index in (0..rgba.len()).step_by(4) {
+        let pixel = index / 4;
+        let frame = pixel / (image_size * image_size);
+        let spatial = pixel % (image_size * image_size);
+        let y = spatial / image_size;
+        let x = spatial % image_size;
+        rgba[index] = ((x * 255 / image_size.max(1)) ^ (frame * 13)) as u8;
+        rgba[index + 1] = ((y * 255 / image_size.max(1)) ^ (frame * 29)) as u8;
+        rgba[index + 2] = ((x + y + frame * 17) % 256) as u8;
+        rgba[index + 3] = 255;
+    }
+    crate::rgba_video_to_tensor::<B>(&rgba, shape, device)
+}
+
+#[cfg(feature = "ndarray")]
+#[derive(Clone, Copy, Debug)]
+struct CompareF32Metrics {
+    max_abs: f32,
+    mean_abs: f32,
+    rmse: f32,
+    cosine: f32,
+}
+
+#[cfg(feature = "ndarray")]
+fn compare_f32(a: &[f32], b: &[f32]) -> CompareF32Metrics {
+    let mut max_abs = 0.0f32;
+    let mut sum_abs = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (&a, &b) in a.iter().zip(b) {
+        let diff = (a - b).abs();
+        max_abs = max_abs.max(diff);
+        sum_abs += diff as f64;
+        sum_sq += (diff as f64) * (diff as f64);
+        dot += (a as f64) * (b as f64);
+        norm_a += (a as f64) * (a as f64);
+        norm_b += (b as f64) * (b as f64);
+    }
+    let len = a.len().max(1) as f64;
+    let denom = (norm_a.sqrt() * norm_b.sqrt()).max(f64::EPSILON);
+    CompareF32Metrics {
+        max_abs,
+        mean_abs: (sum_abs / len) as f32,
+        rmse: (sum_sq / len).sqrt() as f32,
+        cosine: (dot / denom) as f32,
+    }
+}
+
+#[cfg(feature = "ndarray")]
+fn summarize_f32(values: &[f32]) -> (f32, f32, f32) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    for &value in values {
+        min = min.min(value);
+        max = max.max(value);
+        sum += value as f64;
+    }
+    (min, max, (sum / values.len() as f64) as f32)
+}
+
+fn dispatch_export_bpk(
+    config: PathBuf,
+    model: Option<PathBuf>,
+    output: PathBuf,
+    shard_mib: u64,
+    overwrite_shards: bool,
+    model_base_url: String,
+    deploy_dir: Option<PathBuf>,
+    overwrite_deploy: bool,
+    allow_tiny_model: bool,
+) -> Result<()> {
+    #[cfg(feature = "ndarray")]
+    {
+        export_bpk_ndarray(
+            config,
+            model,
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            allow_tiny_model,
+        )
+    }
+    #[cfg(not(feature = "ndarray"))]
+    {
+        let _ = (
+            config,
+            model,
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            allow_tiny_model,
+        );
+        bail!("export-bpk requires the ndarray feature so checkpoint import can run on CPU")
+    }
+}
+
+#[cfg(feature = "ndarray")]
+fn export_bpk_ndarray(
+    config_path: PathBuf,
+    model_path: Option<PathBuf>,
+    output: PathBuf,
+    shard_mib: u64,
+    overwrite_shards: bool,
+    model_base_url: String,
+    deploy_dir: Option<PathBuf>,
+    overwrite_deploy: bool,
+    allow_tiny_model: bool,
+) -> Result<()> {
+    use burn::module::Module;
+    use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
+
+    let config = BurnJepaTrainConfig::from_toml_file(config_path)?;
+    if !allow_tiny_model
+        && config.model.checkpoint_dir.is_none()
+        && config.model.config_path.is_none()
+    {
+        bail!(
+            "export-bpk would export the tiny test V-JEPA model because the config has no model.checkpoint_dir or model.config_path; pass --allow-tiny-model only for smoke artifacts"
+        );
+    }
+    let device = Default::default();
+    let model_config = if let Some(path) = &config.model.config_path {
+        crate::VJepaConfig::from_json_file(path)?
+    } else if let Some(checkpoint_dir) = &config.model.checkpoint_dir {
+        crate::load_config_from_hf_dir(
+            checkpoint_dir,
+            &crate::VJepaLoadOptions::default().config_name,
+        )?
+    } else {
+        crate::VJepaConfig::tiny_for_tests()
+    };
+    let output = output.with_extension("bpk");
+    let mut checkpoint_load_report = None;
+    let mut checkpoint_source = None;
+    let package_manifest =
+        if let Some(model_path) = model_path.or(config.model.ttt_checkpoint_path.clone()) {
+            let base = if let Some(checkpoint_dir) = &config.model.checkpoint_dir {
+                let mut options = crate::VJepaLoadOptions::default();
+                if let Some(weights_name) = &config.model.weights_name {
+                    options.weights_name = weights_name.clone();
+                }
+                let (model, _config, report) =
+                    options.load_model::<burn::backend::NdArray<f32>>(checkpoint_dir, &device)?;
+                ensure_export_load_report_ok(&report)?;
+                checkpoint_load_report = Some(report);
+                checkpoint_source = Some(checkpoint_dir.clone());
+                model
+            } else {
+                crate::VJepa2_1Model::<burn::backend::NdArray<f32>>::new(&model_config, &device)
+            };
+            use anyhow::Context as _;
+            let ttt = crate::VJepaTttModel::from_model(base, config.ttt.clone(), &device)?
+                .load_file(
+                    model_path.clone(),
+                    &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
+                    &device,
+                )
+                .with_context(|| format!("load TTT model {}", model_path.display()))?;
+            crate::save_ttt_burnpack(&ttt.no_grad(), &output)?;
+            crate::BurnJepaPipelinePackageManifest {
+                model_kind: crate::BurnJepaPackageModelKind::Ttt,
+                record_dtype: Some("f16".to_string()),
+                jepa_config: model_config,
+                ttt_config: Some(config.ttt.clone()),
+                model_base_url,
+                ..crate::BurnJepaPipelinePackageManifest::default()
+            }
+            .with_burnpack_paths(&output)
+        } else {
+            let base = if let Some(checkpoint_dir) = &config.model.checkpoint_dir {
+                let mut options = crate::VJepaLoadOptions::default();
+                if let Some(weights_name) = &config.model.weights_name {
+                    options.weights_name = weights_name.clone();
+                }
+                let (model, _config, report) =
+                    options.load_model::<burn::backend::NdArray<f32>>(checkpoint_dir, &device)?;
+                ensure_export_load_report_ok(&report)?;
+                checkpoint_load_report = Some(report);
+                checkpoint_source = Some(checkpoint_dir.clone());
+                model
+            } else {
+                crate::VJepa2_1Model::<burn::backend::NdArray<f32>>::new(&model_config, &device)
+            };
+            crate::save_vjepa_burnpack(&base.no_grad(), &output)?;
+            crate::BurnJepaPipelinePackageManifest {
+                model_kind: crate::BurnJepaPackageModelKind::Base,
+                record_dtype: Some("f16".to_string()),
+                jepa_config: model_config,
+                ttt_config: None,
+                model_base_url,
+                ..crate::BurnJepaPipelinePackageManifest::default()
+            }
+            .with_burnpack_paths(&output)
+        };
+    let burnpack_dtype_counts = crate::burnpack_dtype_counts(&output)?;
+    ensure_export_burnpack_is_f16(&burnpack_dtype_counts)?;
+    let max_part_bytes = shard_mib
+        .max(1)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--shard-mib overflow"))?;
+    let parts = crate::write_burnpack_parts_for_browser(&output, max_part_bytes, overwrite_shards)?;
+    let manifest_path = output
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("manifest.json");
+    crate::write_pipeline_package_manifest(&manifest_path, &package_manifest)?;
+    let deploy_bundle = deploy_dir
+        .map(|dir| {
+            crate::write_burn_jepa_model_deploy_bundle(&manifest_path, dir, overwrite_deploy)
+        })
+        .transpose()?;
+    print_json(&serde_json::json!({
+        "burnpack": output,
+        "package_manifest": manifest_path,
+        "parts_manifest": parts.manifest_path,
+        "parts": parts.part_paths,
+        "total_bytes": parts.total_bytes,
+        "record_dtype": package_manifest.record_dtype.clone(),
+        "burnpack_dtype_counts": burnpack_dtype_counts,
+        "model_base_url": package_manifest.model_base_url.clone(),
+        "checkpoint_source": checkpoint_source,
+        "checkpoint_load_report": export_load_report_json(checkpoint_load_report.as_ref()),
+        "deploy_bundle": deploy_bundle,
+    }))
+}
+
+#[cfg(feature = "ndarray")]
+fn ensure_export_burnpack_is_f16(
+    dtype_counts: &std::collections::BTreeMap<String, usize>,
+) -> Result<()> {
+    if dtype_counts.get("F16").copied().unwrap_or(0) == 0 {
+        bail!("exported burnpack did not contain any F16 tensors");
+    }
+    if dtype_counts.get("F32").copied().unwrap_or(0) > 0 {
+        bail!(
+            "exported burnpack still contains F32 tensors: {:?}",
+            dtype_counts
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ndarray")]
+fn ensure_export_load_report_ok(report: &crate::LoadReport) -> Result<()> {
+    if !report.errors.is_empty() {
+        bail!(
+            "V-JEPA checkpoint import reported tensor errors: {}",
+            report.errors.join("; ")
+        );
+    }
+    if report.applied.is_empty() {
+        bail!("V-JEPA checkpoint import did not apply any tensors");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ndarray")]
+fn export_load_report_json(report: Option<&crate::LoadReport>) -> serde_json::Value {
+    match report {
+        Some(report) => serde_json::json!({
+            "applied": report.applied.len(),
+            "missing": report.missing.len(),
+            "skipped": report.skipped.len(),
+            "errors": report.errors.len(),
+            "missing_examples": report.missing.iter().take(8).collect::<Vec<_>>(),
+            "skipped_examples": report.skipped.iter().take(8).collect::<Vec<_>>(),
+        }),
+        None => serde_json::Value::Null,
     }
 }
 

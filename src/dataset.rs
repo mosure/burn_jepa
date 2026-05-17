@@ -108,6 +108,14 @@ pub struct JepaTensorBatch<B: Backend> {
     pub metadata: Vec<JepaSampleMetadata>,
 }
 
+#[derive(Debug)]
+pub struct JepaCpuTensorBatch {
+    pub student_values: Vec<f32>,
+    pub teacher_values: Option<Vec<f32>>,
+    pub shape: [usize; 5],
+    pub metadata: Vec<JepaSampleMetadata>,
+}
+
 pub trait JepaDataset {
     fn len(&self) -> usize;
     fn sample(&self, index: usize) -> Result<JepaSample>;
@@ -212,6 +220,32 @@ pub fn load_jepa_tensor_batch<B: Backend>(
     model: &VJepaConfig,
     device: &B::Device,
 ) -> Result<JepaTensorBatch<B>> {
+    let batch = load_jepa_cpu_tensor_batch(sample, dataset, model)?;
+    Ok(jepa_tensor_batch_from_cpu(batch, device))
+}
+
+pub fn jepa_tensor_batch_from_cpu<B: Backend>(
+    batch: JepaCpuTensorBatch,
+    device: &B::Device,
+) -> JepaTensorBatch<B> {
+    let student =
+        Tensor::<B, 5>::from_data(TensorData::new(batch.student_values, batch.shape), device);
+    let teacher = match batch.teacher_values {
+        Some(values) => Tensor::<B, 5>::from_data(TensorData::new(values, batch.shape), device),
+        None => student.clone(),
+    };
+    JepaTensorBatch {
+        student,
+        teacher,
+        metadata: batch.metadata,
+    }
+}
+
+pub fn load_jepa_cpu_tensor_batch(
+    sample: &JepaSample,
+    dataset: &JepaDatasetConfig,
+    model: &VJepaConfig,
+) -> Result<JepaCpuTensorBatch> {
     let frames = round_up_to_multiple(
         dataset.frames.max(model.tubelet_size.max(1)),
         model.tubelet_size.max(1),
@@ -220,38 +254,38 @@ pub fn load_jepa_tensor_batch<B: Backend>(
         dataset.image_size.max(model.patch_size.max(1)),
         model.patch_size.max(1),
     );
-    let student = match sample {
+    let (student, channels) = match sample {
         JepaSample::Image { path, .. } => {
             let paths = select_frame_paths(std::slice::from_ref(path), frames, dataset.stride);
-            load_video_from_paths(&paths, image_size, device)?
+            (load_video_values_from_paths(&paths, image_size)?, 3)
         }
         JepaSample::Video { frames: paths, .. } => {
             let paths = select_frame_paths(paths, frames, dataset.stride);
-            load_video_from_paths(&paths, image_size, device)?
+            (load_video_values_from_paths(&paths, image_size)?, 3)
         }
         JepaSample::PairedVideo { student_frames, .. } => {
             let paths = select_frame_paths(student_frames, frames, dataset.stride);
-            load_video_from_paths(&paths, image_size, device)?
+            (load_video_values_from_paths(&paths, image_size)?, 3)
         }
-        JepaSample::SyntheticVideo { index } => synthetic_video(
-            *index,
-            model.in_channels,
-            frames,
-            image_size,
-            image_size,
-            device,
-        ),
+        JepaSample::SyntheticVideo { index } => {
+            let channels = model.in_channels.max(1);
+            (
+                synthetic_video_values(*index, channels, frames, image_size, image_size),
+                channels,
+            )
+        }
     };
     let teacher = match sample {
         JepaSample::PairedVideo { teacher_frames, .. } => {
             let paths = select_frame_paths(teacher_frames, frames, dataset.stride);
-            load_video_from_paths(&paths, image_size, device)?
+            Some(load_video_values_from_paths(&paths, image_size)?)
         }
-        _ => student.clone(),
+        _ => None,
     };
-    Ok(JepaTensorBatch {
-        student,
-        teacher,
+    Ok(JepaCpuTensorBatch {
+        student_values: student,
+        teacher_values: teacher,
+        shape: [1, channels, frames, image_size, image_size],
         metadata: vec![sample.metadata().cloned().unwrap_or_default()],
     })
 }
@@ -264,6 +298,29 @@ pub fn synthetic_video<B: Backend>(
     width: usize,
     device: &B::Device,
 ) -> Tensor<B, 5> {
+    let values = synthetic_video_values(index, channels, frames, height, width);
+    Tensor::<B, 5>::from_data(
+        TensorData::new(
+            values,
+            [
+                1,
+                channels.max(1),
+                frames.max(1),
+                height.max(1),
+                width.max(1),
+            ],
+        ),
+        device,
+    )
+}
+
+fn synthetic_video_values(
+    index: usize,
+    channels: usize,
+    frames: usize,
+    height: usize,
+    width: usize,
+) -> Vec<f32> {
     let channels = channels.max(1);
     let frames = frames.max(1);
     let height = height.max(1);
@@ -279,10 +336,7 @@ pub fn synthetic_video<B: Backend>(
             }
         }
     }
-    Tensor::<B, 5>::from_data(
-        TensorData::new(values, [1, channels, frames, height, width]),
-        device,
-    )
+    values
 }
 
 fn row_to_sample(
@@ -409,11 +463,7 @@ fn round_up_to_multiple(value: usize, multiple: usize) -> usize {
     value.div_ceil(multiple) * multiple
 }
 
-fn load_video_from_paths<B: Backend>(
-    paths: &[PathBuf],
-    image_size: usize,
-    device: &B::Device,
-) -> Result<Tensor<B, 5>> {
+fn load_video_values_from_paths(paths: &[PathBuf], image_size: usize) -> Result<Vec<f32>> {
     ensure!(
         !paths.is_empty(),
         "video sample must contain at least one frame"
@@ -437,8 +487,5 @@ fn load_video_from_paths<B: Backend>(
             }
         }
     }
-    Ok(Tensor::<B, 5>::from_data(
-        TensorData::new(values, [1, 3, paths.len(), image_size, image_size]),
-        device,
-    ))
+    Ok(values)
 }

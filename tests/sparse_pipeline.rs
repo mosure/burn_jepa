@@ -112,7 +112,7 @@ fn patch_diff_packet(threshold: f32) -> (VJepaConfig, burn_jepa::SparseJepaPacke
     let device = Default::default();
     let config = VJepaConfig::tiny_for_tests();
     let pipeline = VJepaPipeline::<B>::random(config.clone(), &device);
-    let mut values = vec![0.0; 1 * 3 * 4 * 32 * 32];
+    let mut values = vec![0.0; 3 * 4 * 32 * 32];
     for channel in 0..3 {
         for y in 16..32 {
             for x in 16..32 {

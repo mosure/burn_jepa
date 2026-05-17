@@ -100,7 +100,7 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-stream-eval-fast-cuda.toml \
-  --model target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk \
+  --model target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk \
   --steps 16 --batch-size 2 --no-full-grid
 ```
 
@@ -111,7 +111,7 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-final-eval-cuda.toml \
-  --model target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk \
+  --model target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk \
   --steps 11 --batch-size 1 --no-full-grid
 ```
 
@@ -131,7 +131,7 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-final-eval-cuda.toml \
-  --model target/burn-jepa-production-final/stage2-unfrozen-low-lr/ttt-model.mpk \
+  --model target/burn-jepa-production-final-256/stage2-unfrozen-low-lr/ttt-model.mpk \
   --steps 11 --batch-size 16 --no-full-grid
 ```
 

@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::{Tensor, TensorData};
@@ -126,6 +128,7 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
     .expect("parse stage2 production config");
 
     assert_eq!(stage1.ttt.layers, vec![3, 7, 11]);
+    assert!(stage1.dataset.image_size >= 256);
     assert!(stage1.ttt.predictor_layers.is_empty());
     assert!(stage1.ttt.freeze_pretrained);
     assert_eq!(
@@ -154,13 +157,19 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
         stream.ttt.supervision,
         burn_jepa::TttSupervisionMode::FinalTeacher
     );
-    assert_eq!(stream.training.batch_size, 2);
+    assert_eq!(stream.training.batch_size, 4);
+    assert!(stream.training.prefetch_batches);
+    assert!(!stream.training.cache_teacher_tokens);
+    assert_eq!(stream.training.teacher_cache_max_entries, 0);
+    assert_eq!(stream.training.stream.state_regularization_width, 64);
+    assert!(stream.dataset.image_size >= 256);
     assert_eq!(
         stream.training.batching,
         burn_jepa::TrainingBatchingMode::PackedStreams
     );
 
     assert!(stream_eval.training.stream.enabled);
+    assert!(stream_eval.dataset.image_size >= 256);
     assert_eq!(stream_eval.training.effective_eval_batch_size(), 4);
     assert_eq!(
         stream_eval.training.batching,
@@ -170,6 +179,7 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
     assert!(!stream_eval.training.stream.curriculum.enabled);
 
     assert_eq!(stage2.ttt.layers, vec![3, 7, 11]);
+    assert!(stage2.dataset.image_size >= 256);
     assert!(stage2.ttt.predictor_layers.is_empty());
     assert!(!stage2.ttt.freeze_pretrained);
     assert_eq!(
@@ -249,6 +259,7 @@ fn ttt_stream_training_config_round_trips_and_validates() {
     config.training.stream.state_decay = 0.95;
     config.training.stream.state_l2_weight = 1.0e-6;
     config.training.stream.update_l2_weight = 2.0e-6;
+    config.training.stream.state_regularization_width = 64;
     config.training.stream.reset_interval_steps = 4;
     config.training.stream.curriculum.enabled = true;
     config
@@ -266,6 +277,7 @@ fn ttt_stream_training_config_round_trips_and_validates() {
     assert!(toml.contains("state_decay = 0.95"));
     assert!(toml.contains("state_l2_weight = "));
     assert!(toml.contains("update_l2_weight = "));
+    assert!(toml.contains("state_regularization_width = 64"));
     assert!(toml.contains("reset_interval_steps = 4"));
 
     let parsed: BurnJepaTrainConfig = toml::from_str(&toml).expect("parse stream config");
@@ -291,6 +303,7 @@ fn ttt_stream_training_config_round_trips_and_validates() {
     assert_eq!(parsed.training.stream.reset_interval_for_step(7), 4);
     assert_eq!(parsed.training.stream.state_l2_weight, 1.0e-6);
     assert_eq!(parsed.training.stream.update_l2_weight, 2.0e-6);
+    assert_eq!(parsed.training.stream.state_regularization_width, 64);
 
     let mut packed = parsed;
     packed.training.batch_size = 2;
@@ -1066,6 +1079,7 @@ fn ttt_stream_training_packs_independent_manifest_streams() {
     config.dataset.synthetic_len = 4;
     config.training.max_steps = 2;
     config.training.batch_size = 2;
+    config.training.prefetch_batches = true;
     config.training.eval_steps = 0;
     config.training.learning_rate = 5.0e-3;
     config.training.batching = burn_jepa::TrainingBatchingMode::PackedStreams;
@@ -1092,6 +1106,7 @@ fn ttt_stream_training_packs_independent_manifest_streams() {
     assert_eq!(report.stream.mixed_optimizer_steps, Some(0));
     assert_eq!(report.stream.detached_steps, 4);
     assert_eq!(report.stream.decayed_steps, 4);
+    assert_eq!(report.train_stage.data_ms, 0);
     assert_eq!(
         report.loss_trace[0].stream_step,
         Some(TttStreamStepKind::Reset)
@@ -1436,6 +1451,36 @@ fn ttt_sparse_rollout_training_smoke_uses_target_mask() {
     assert!(report.teacher_forced_eval_loss.is_none());
     assert!(report.teacher_forcing_cosine_gap.is_none());
     assert!(report.eval_full_loss.is_some_and(f64::is_finite));
+}
+
+#[test]
+fn ttt_sparse_training_can_interleave_dense_full_token_samples() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    config.model.save_model = false;
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-dense-sample-mix");
+    config.training.max_steps = 4;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 0;
+    config.training.learning_rate = 1.0e-3;
+    config.training.sparse_rollout = TttSparseRolloutMode::ContextMask;
+    config.training.mask = Some(burn_jepa::TrainingMaskConfig::PrecomputedMasks {
+        context_indices: vec![0, 2, 5, 7],
+        target_indices: vec![1, 3],
+    });
+    config.training.dense_samples.enabled = true;
+    config.training.dense_samples.interval_steps = 2;
+    config.dataset.synthetic_len = 1;
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("dense sample mix");
+
+    assert_eq!(report.steps, 4);
+    assert_eq!(report.dense_samples.dense_steps, 2);
+    assert_eq!(report.dense_samples.sparse_steps, 2);
+    assert_eq!(report.rollout.mode, TttRolloutReportMode::SparseContext);
+    assert!(report.mask.is_some());
+    assert!(report.final_loss.is_finite());
 }
 
 #[test]

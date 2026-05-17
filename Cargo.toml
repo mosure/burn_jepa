@@ -84,17 +84,22 @@ burn-cubecl = { version = "0.21.0", default-features = false, features = ["fusio
 burn-cuda = { version = "0.21.0", default-features = false, features = ["fusion", "std"], optional = true }
 burn-fusion = { version = "0.21.0", default-features = false, optional = true }
 burn-ir = { version = "0.21.0", default-features = false, optional = true }
-burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
+burn-store = { version = "0.21.0", default-features = false, features = ["burnpack", "pytorch", "safetensors", "std"] }
 burn_anyup = { path = "crates/burn_anyup", version = "0.21.0", default-features = false }
 burn_autogaze = { version = "0.21.6", default-features = false, optional = true }
 burn_flex_gmm = { version = "0.21.1", default-features = false, optional = true }
+ciborium = "0.2"
 clap = { version = "4.6", features = ["derive"] }
 half = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 safetensors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 toml = "0.9"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = "2.12"
 
 [[bin]]
 name = "burn-jepa"
@@ -127,7 +132,7 @@ features = ["fusion", "std", "webgpu"]
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"
 optional = true
-features = ["console"]
+features = ["Window", "Performance", "Response", "console"]
 
 [dev-dependencies]
 criterion = "0.8.2"

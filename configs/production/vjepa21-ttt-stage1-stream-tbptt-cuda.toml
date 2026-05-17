@@ -3,17 +3,17 @@ checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
-output_dir = "target/burn-jepa-production-final/stage1-stream-tbptt"
+output_dir = "target/burn-jepa-production-final-256/stage1-stream-tbptt"
 save_model = true
 
 [dataset]
 kind = "manifest"
 sample_kind = "video"
-train_manifest = "target/burn-jepa-production-final/data/train-real-autogaze.jsonl"
-eval_manifest = "target/burn-jepa-production-final/data/eval-real-autogaze.jsonl"
+train_manifest = "target/burn-jepa-production-final-256/data/train-real-autogaze.jsonl"
+eval_manifest = "target/burn-jepa-production-final-256/data/eval-real-autogaze.jsonl"
 frames = 16
 stride = 1
-image_size = 224
+image_size = 256
 synthetic_len = 1
 
 [ttt]
@@ -34,7 +34,7 @@ freeze_pretrained = true
 
 [training]
 backend = "cuda"
-batch_size = 2
+batch_size = 4
 max_steps = 1024
 learning_rate = 0.0000025
 weight_decay = 0.0
@@ -48,7 +48,9 @@ eval_batch_size = 2
 eval_full_grid = false
 eval_utilization_diagnostics = false
 eval_temporal_diagnostics = false
-cache_teacher_tokens = true
+cache_teacher_tokens = false
+teacher_cache_max_entries = 0
+prefetch_batches = true
 save_steps = 256
 
 [training.stream]
@@ -60,6 +62,7 @@ reset_interval_steps = 4
 state_decay = 0.97
 state_l2_weight = 0.000001
 update_l2_weight = 0.00001
+state_regularization_width = 64
 
 [training.stream.curriculum]
 enabled = true

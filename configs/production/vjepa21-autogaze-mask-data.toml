@@ -1,5 +1,5 @@
 name = "vjepa21-production-autogaze-mask-data"
-output_dir = "target/burn-jepa-production-final/data-prep"
+output_dir = "target/burn-jepa-production-final-256/data-prep"
 require_real_checkpoint = true
 require_real_dataset = true
 seeds = [0]
@@ -18,17 +18,17 @@ checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
-output_dir = "target/burn-jepa-production-final/trial"
+output_dir = "target/burn-jepa-production-final-256/trial"
 save_model = false
 
 [base.dataset]
 kind = "manifest"
 sample_kind = "video"
-train_manifest = "target/burn-jepa-production-final/data/train-real-autogaze.jsonl"
-eval_manifest = "target/burn-jepa-production-final/data/eval-real-autogaze.jsonl"
+train_manifest = "target/burn-jepa-production-final-256/data/train-real-autogaze.jsonl"
+eval_manifest = "target/burn-jepa-production-final-256/data/eval-real-autogaze.jsonl"
 frames = 16
 stride = 1
-image_size = 224
+image_size = 256
 synthetic_len = 1
 
 [base.ttt]
@@ -63,7 +63,9 @@ eval_batch_size = 16
 eval_full_grid = false
 eval_utilization_diagnostics = false
 eval_temporal_diagnostics = false
-cache_teacher_tokens = true
+cache_teacher_tokens = false
+teacher_cache_max_entries = 0
+prefetch_batches = true
 save_steps = 0
 
 [base.training.lr_schedule]
@@ -78,9 +80,9 @@ predictor_loss_weight = 0.0
 
 [data]
 input = "target/burn-jepa-production-ttt-large/data/frames"
-output_dir = "target/burn-jepa-production-final/data"
-train_manifest = "target/burn-jepa-production-final/data/train-real-autogaze.jsonl"
-eval_manifest = "target/burn-jepa-production-final/data/eval-real-autogaze.jsonl"
+output_dir = "target/burn-jepa-production-final-256/data"
+train_manifest = "target/burn-jepa-production-final-256/data/train-real-autogaze.jsonl"
+eval_manifest = "target/burn-jepa-production-final-256/data/eval-real-autogaze.jsonl"
 domain_from_clip_prefix = true
 eval_ratio = 0.2
 window_frames = 16
