@@ -258,6 +258,54 @@ fn semantic_pca_display_uses_rolling_projected_feature_statistics() {
 }
 
 #[test]
+fn semantic_pca_display_first_update_avoids_mono_washout() {
+    let device = Default::default();
+    let mut projector = FeaturePcaProjector::<B>::identity(
+        4,
+        FeaturePcaConfig {
+            display_mode: FeaturePcaDisplayMode::SemanticRgb,
+            display_momentum: 0.2,
+            online_learning_rate: 0.0,
+            mean_momentum: 1.0,
+            ..FeaturePcaConfig::default()
+        },
+        &device,
+    )
+    .expect("semantic projector");
+    let tokens = Tensor::<B, 3>::from_data(
+        TensorData::new(
+            vec![
+                -0.020, 0.010, 0.000, 0.0, //
+                -0.010, 0.005, 0.015, 0.0, //
+                0.010, -0.005, -0.015, 0.0, //
+                0.020, -0.010, 0.000, 0.0,
+            ],
+            [1, 4, 4],
+        ),
+        &device,
+    );
+
+    projector
+        .update_rolling_tokens(tokens.clone())
+        .expect("first semantic PCA update");
+    let display = values3(
+        projector
+            .project_tokens_display(tokens)
+            .expect("semantic display"),
+    );
+    let colors = token_rgb_colors(&display, 1, 4);
+    let max_distance = colors
+        .iter()
+        .flat_map(|left| colors.iter().map(|right| rgb_distance(left, right)))
+        .fold(0.0f32, f32::max);
+
+    assert!(
+        max_distance > 0.10,
+        "first semantic PCA display update should initialize contrast from data, got colors {colors:?}"
+    );
+}
+
+#[test]
 fn pca_update_scheduler_updates_on_configured_cadence() {
     let mut scheduler = FeaturePcaUpdateScheduler::new(FeaturePcaUpdateConfig {
         mode: FeaturePcaUpdateMode::RollingOja,

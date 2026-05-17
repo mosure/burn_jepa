@@ -48,8 +48,9 @@
       const status = document.querySelector("#status");
       const video = document.querySelector("#webcam");
       const params = new URLSearchParams(window.location.search);
-      const defaultModelManifest =
-        "https://aberration.technology/model/burn_jepa/manifest.json";
+      const defaultModelRoot =
+        "https://aberration.technology/model/burn_jepa";
+      const defaultModelProfile = "vjepa2_1_ttt";
       window.__jepaFrameStats = {
         count: 0,
         firstFrameMs: null,
@@ -121,7 +122,10 @@
           params.has("model-manifest") ||
           params.has("model-manifest-url") ||
           params.has("model-base") ||
-          params.has("model-base-url")
+          params.has("model-base-url") ||
+          params.has("model-profile") ||
+          params.has("model-name") ||
+          params.has("model-type")
         );
       }
 
@@ -165,7 +169,33 @@
         if (base) {
           return joinUrl(base, "manifest.json");
         }
-        return defaultModelManifest;
+        return joinUrl(joinUrl(defaultModelRoot, modelProfile()), "manifest.json");
+      }
+
+      function modelProfile() {
+        const raw =
+          params.get("model-profile") ||
+          params.get("model-name") ||
+          params.get("model-type") ||
+          defaultModelProfile;
+        switch (raw.trim().toLowerCase()) {
+          case "base":
+          case "vjepa-base":
+          case "vjepa21-base":
+          case "vjepa2.1-base":
+          case "vjepa2_1_base":
+            return "vjepa2_1_base";
+          case "ttt":
+          case "trained-ttt":
+          case "production-ttt":
+          case "vjepa-ttt":
+          case "vjepa21-ttt":
+          case "vjepa2.1-ttt":
+          case "vjepa2_1_ttt":
+            return "vjepa2_1_ttt";
+          default:
+            throw new Error(`unsupported model-profile ${raw}`);
+        }
       }
 
       function resolvePartsManifestUrl(manifestUrl, manifest) {

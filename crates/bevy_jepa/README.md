@@ -24,11 +24,13 @@ The default source is the camera. Synthetic/local-motion input is only used when
 real camera frame instead of feeding generated warmup imagery into the pipeline.
 The default JEPA encoder source is trained encoder-only TTT V-JEPA 2.1, loaded
 from a sharded `.bpk` package when `--model-manifest`,
-`BURN_JEPA_MODEL_MANIFEST`, or `target/burn-jepa-web/model/manifest.json` is
-available. A legacy local `.mpk` is only used when explicitly passed with
-`--ttt-model` or `BURN_JEPA_TTT_MODEL`. Use `--encoder-source tiny-test` only
-for local wiring smoke tests, and `--encoder-source base-checkpoint` when you
-intentionally want the frozen base V-JEPA 2.1 encoder without TTT state.
+`BURN_JEPA_MODEL_MANIFEST`, or
+`target/burn-jepa-web/model/vjepa2_1_ttt/manifest.json` is available. A legacy
+local `.mpk` is only used when explicitly passed with `--ttt-model` or
+`BURN_JEPA_TTT_MODEL`. Use `--model-profile vjepa2_1_base` to switch to the
+base f16 CDN package, `--encoder-source tiny-test` only for local wiring smoke
+tests, and `--encoder-source base-checkpoint` when you intentionally want the
+frozen base V-JEPA 2.1 encoder without TTT state.
 Base-checkpoint mode defaults to
 `~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384`; use
 `--jepa-checkpoint-dir` and `--jepa-config` when the official checkpoint lives
@@ -68,12 +70,17 @@ encoding, and is rounded up to a multiple of the 16px V-JEPA patch size. The
 default token grid is 32x32; `--image-size 256` uses the smaller 16x16-grid
 path.
 
-The app renders four stage panels:
+The default view renders three stage panels:
 
 - input frame
 - sparse token mask
 - low-resolution JEPA token-cache PCA
-- high-resolution AnyUp PCA
+
+High-resolution AnyUp PCA is hidden when `--high-res-pca-every 0` (the
+default) and appears as a fourth panel when AnyUp is enabled. Open the compact
+`controls` submenu, or press `C`, to switch TTT/base model packages, 256/512
+input size, AnyUp cadence, patch-diff threshold, and bounded refresh modes
+without crowding the default viewer.
 
 The viewer preprocesses camera/static frames with the same ImageNet
 mean/std normalization expected by V-JEPA and upstream AnyUp. If
@@ -109,16 +116,25 @@ AnyUp -> PCA pipeline then runs on the square crop. The wasm page
 uses `navigator.mediaDevices.getUserMedia` and forwards frames through the
 exported `frame_input(...)` function; `?source=static` uses generated or
 `?image-url=...` frames without requesting a webcam.
+Patch-diff mask refresh is enabled by default for the live cache: slow
+subthreshold changes accumulate, old token positions are age-refreshed, and a
+small deterministic blue-noise refresh probes quiet regions. The extra writes
+are capped by unused context budget, so high-motion threshold hits still win.
+Use `--no-patch-diff-refresh` for legacy instantaneous masks.
 Model loading prefers a sharded `burn_jepa` `.bpk` package manifest. Exported
 packages store floating-point records as f16 for deployment size, and the
 native/wasm loaders upcast those records into the active backend dtype. Native
 runs check `--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`,
-`target/burn-jepa-web/model/manifest.json`, then an auto-downloaded cache under
-`~/.burn_jepa/models/burn_jepa` before accepting a legacy explicit
-`--ttt-model ...mpk` override. The native cache downloads from the same default
-URL wasm uses, `https://aberration.technology/model/burn_jepa/manifest.json`;
-use `--model-base-url`, `--model-cache-dir`, or `--no-model-download` to control
-that path. Wasm fetches the same remote manifest by default; use
+`target/burn-jepa-web/model/{model_profile}/manifest.json`, then an
+auto-downloaded cache under `~/.burn_jepa/models/burn_jepa/{model_profile}`
+before accepting a legacy explicit `--ttt-model ...mpk` override. The native
+cache downloads from the same profile route wasm uses. The default is
+`https://aberration.technology/model/burn_jepa/vjepa2_1_ttt/manifest.json`;
+`--model-profile vjepa2_1_base` or `?model-profile=vjepa2_1_base` switches to
+`https://aberration.technology/model/burn_jepa/vjepa2_1_base/manifest.json`.
+Use `--model-base-url`, `--model-cache-dir`, or `--no-model-download` to control
+that path; `BURN_JEPA_MODEL_PROFILE` / `BURN_JEPA_MODEL_NAME` select the native
+auto-cache profile. Wasm accepts `?model-profile=vjepa2_1_base`,
 `?model-base=http://127.0.0.1:8091` for a local directory containing
 `manifest.json`, or `?model-manifest=...` for a specific manifest URL.
 `?load-model=false` selects the tiny test encoder and skips all model shard
@@ -128,17 +144,26 @@ app. Model shards are not included in the GitHub Pages artifact.
 ```bash
 cargo run --bin burn-jepa -- export-bpk \
   --config ../../configs/deploy/vjepa21-base-bpk-export.toml \
-  --output ../../target/burn-jepa-web/model/vjepa2_1_vit_base_384.bpk \
+  --output ../../target/burn-jepa-web/model/vjepa2_1_base/jepa.bpk \
   --shard-mib 20 \
-  --model-base-url https://aberration.technology/model/burn_jepa \
-  --deploy-dir ../../target/burn-jepa-cdn-upload \
+  --model-profile vjepa2_1_base \
+  --deploy-dir ../../target/burn-jepa-cdn-upload/vjepa2_1_base \
+  --overwrite-shards \
+  --overwrite-deploy
+cargo run --bin burn-jepa -- export-bpk \
+  --config ../../configs/deploy/vjepa21-ttt-bpk-export.toml \
+  --output ../../target/burn-jepa-web/model/vjepa2_1_ttt/jepa_ttt.bpk \
+  --shard-mib 20 \
+  --model-profile vjepa2_1_ttt \
+  --deploy-dir ../../target/burn-jepa-cdn-upload/vjepa2_1_ttt \
+  --overwrite-shards \
   --overwrite-deploy
 python3 -m http.server 8091 -d ../../target/burn-jepa-web/model
 npm run build:wasm
 npm run serve
-# open http://127.0.0.1:8080/?model-base=http://127.0.0.1:8091&source=static
-# native auto-cache: cargo run -p bevy_jepa -- --model-base-url http://127.0.0.1:8091
-# native explicit: cargo run -p bevy_jepa -- --model-manifest ../../target/burn-jepa-web/model/manifest.json
+# open http://127.0.0.1:8080/?model-base=http://127.0.0.1:8091/vjepa2_1_ttt&source=static
+# native auto-cache: cargo run -p bevy_jepa -- --model-base-url http://127.0.0.1:8091/vjepa2_1_ttt
+# native explicit: cargo run -p bevy_jepa -- --model-manifest ../../target/burn-jepa-web/model/vjepa2_1_ttt/manifest.json
 ```
 
 For a small local package/inference smoke:
@@ -157,7 +182,7 @@ mkdir -p ../../target/burn-jepa-wasm-api/out
 wasm-bindgen --target web --out-dir ../../target/burn-jepa-wasm-api/out \
   --out-name burn_jepa ../../target/wasm32-unknown-unknown/release/burn_jepa.wasm
 npm run test:wasm-api
-BURN_JEPA_WASM_MODEL_MANIFEST_URL=https://aberration.technology/model/burn_jepa/manifest.json npm run test:wasm-api
+BURN_JEPA_WASM_MODEL_MANIFEST_URL=https://aberration.technology/model/burn_jepa/vjepa2_1_ttt/manifest.json npm run test:wasm-api
 ```
 
 The Bevy schedule keeps input preview separate from stage processing. Camera

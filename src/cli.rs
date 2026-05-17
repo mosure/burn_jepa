@@ -20,7 +20,9 @@ use crate::{
 };
 #[cfg(feature = "dispatch")]
 use crate::{JepaDispatchBackend, TrainingLoopConfig};
-use anyhow::{Result, bail, ensure};
+#[cfg(feature = "ndarray")]
+use anyhow::ensure;
+use anyhow::{Result, bail};
 use burn::tensor::backend::AutodiffBackend;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -85,6 +87,12 @@ pub enum BurnJepaCommand {
         shard_mib: u64,
         #[arg(long, default_value_t = false)]
         overwrite_shards: bool,
+        #[arg(
+            long,
+            visible_alias = "model-name",
+            help = "CDN/cache profile route. Defaults to base for base exports and TTT for TTT exports."
+        )]
+        model_profile: Option<crate::BurnJepaModelProfile>,
         #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
         model_base_url: String,
         #[arg(
@@ -102,13 +110,15 @@ pub enum BurnJepaCommand {
         allow_tiny_model: bool,
     },
     CacheModel {
+        #[arg(long, visible_alias = "model-name", default_value_t = crate::BurnJepaModelProfile::default())]
+        model_profile: crate::BurnJepaModelProfile,
         #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
         model_base_url: String,
         #[arg(long)]
         manifest_url: Option<String>,
         #[arg(
             long,
-            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa."
+            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa/{model_profile}."
         )]
         cache_dir: Option<PathBuf>,
     },
@@ -118,13 +128,15 @@ pub enum BurnJepaCommand {
             help = "Local burn_jepa package manifest. If omitted, cache/download from --model-base-url."
         )]
         manifest: Option<PathBuf>,
+        #[arg(long, visible_alias = "model-name", default_value_t = crate::BurnJepaModelProfile::default())]
+        model_profile: crate::BurnJepaModelProfile,
         #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
         model_base_url: String,
         #[arg(long)]
         manifest_url: Option<String>,
         #[arg(
             long,
-            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa."
+            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa/{model_profile}."
         )]
         cache_dir: Option<PathBuf>,
         #[arg(
@@ -250,6 +262,7 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             output,
             shard_mib,
             overwrite_shards,
+            model_profile,
             model_base_url,
             deploy_dir,
             overwrite_deploy,
@@ -260,18 +273,22 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             output,
             shard_mib,
             overwrite_shards,
+            model_profile,
             model_base_url,
             deploy_dir,
             overwrite_deploy,
             allow_tiny_model,
         ),
         BurnJepaCommand::CacheModel {
+            model_profile,
             model_base_url,
             manifest_url,
             cache_dir,
         } => {
+            let model_base_url = resolve_model_profile_base_url(model_profile, model_base_url);
             let config = crate::BurnJepaModelBootstrapConfig {
                 cache_root: cache_dir,
+                model_profile,
                 model_base_url,
                 manifest_url,
             };
@@ -284,6 +301,7 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
         }
         BurnJepaCommand::VerifyBpk {
             manifest,
+            model_profile,
             model_base_url,
             manifest_url,
             cache_dir,
@@ -295,6 +313,7 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             mean_abs_tol,
         } => dispatch_verify_bpk(
             manifest,
+            model_profile,
             model_base_url,
             manifest_url,
             cache_dir,
@@ -326,9 +345,21 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
     }
 }
 
+fn resolve_model_profile_base_url(
+    model_profile: crate::BurnJepaModelProfile,
+    model_base_url: String,
+) -> String {
+    if model_base_url == crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL {
+        crate::burn_jepa_model_profile_base_url(model_profile)
+    } else {
+        model_base_url
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_verify_bpk(
     manifest: Option<PathBuf>,
+    model_profile: crate::BurnJepaModelProfile,
     model_base_url: String,
     manifest_url: Option<String>,
     cache_dir: Option<PathBuf>,
@@ -343,6 +374,7 @@ fn dispatch_verify_bpk(
     {
         verify_bpk_ndarray(
             manifest,
+            model_profile,
             model_base_url,
             manifest_url,
             cache_dir,
@@ -358,6 +390,7 @@ fn dispatch_verify_bpk(
     {
         let _ = (
             manifest,
+            model_profile,
             model_base_url,
             manifest_url,
             cache_dir,
@@ -423,6 +456,7 @@ enum NativeBpkModel {
 #[allow(clippy::too_many_arguments)]
 fn verify_bpk_ndarray(
     manifest_path: Option<PathBuf>,
+    model_profile: crate::BurnJepaModelProfile,
     model_base_url: String,
     manifest_url: Option<String>,
     cache_dir: Option<PathBuf>,
@@ -462,8 +496,10 @@ fn verify_bpk_ndarray(
             model_base_url: manifest.model_base_url,
         })
     } else {
+        let model_base_url = resolve_model_profile_base_url(model_profile, model_base_url);
         let config = crate::BurnJepaModelBootstrapConfig {
             cache_root: cache_dir,
+            model_profile,
             model_base_url,
             manifest_url,
         };
@@ -707,6 +743,7 @@ fn dispatch_export_bpk(
     output: PathBuf,
     shard_mib: u64,
     overwrite_shards: bool,
+    model_profile: Option<crate::BurnJepaModelProfile>,
     model_base_url: String,
     deploy_dir: Option<PathBuf>,
     overwrite_deploy: bool,
@@ -720,6 +757,7 @@ fn dispatch_export_bpk(
             output,
             shard_mib,
             overwrite_shards,
+            model_profile,
             model_base_url,
             deploy_dir,
             overwrite_deploy,
@@ -734,6 +772,7 @@ fn dispatch_export_bpk(
             output,
             shard_mib,
             overwrite_shards,
+            model_profile,
             model_base_url,
             deploy_dir,
             overwrite_deploy,
@@ -750,6 +789,7 @@ fn export_bpk_ndarray(
     output: PathBuf,
     shard_mib: u64,
     overwrite_shards: bool,
+    model_profile: Option<crate::BurnJepaModelProfile>,
     model_base_url: String,
     deploy_dir: Option<PathBuf>,
     overwrite_deploy: bool,
@@ -781,66 +821,86 @@ fn export_bpk_ndarray(
     let output = output.with_extension("bpk");
     let mut checkpoint_load_report = None;
     let mut checkpoint_source = None;
-    let package_manifest =
-        if let Some(model_path) = model_path.or(config.model.ttt_checkpoint_path.clone()) {
-            let base = if let Some(checkpoint_dir) = &config.model.checkpoint_dir {
-                let mut options = crate::VJepaLoadOptions::default();
-                if let Some(weights_name) = &config.model.weights_name {
-                    options.weights_name = weights_name.clone();
-                }
-                let (model, _config, report) =
-                    options.load_model::<burn::backend::NdArray<f32>>(checkpoint_dir, &device)?;
-                ensure_export_load_report_ok(&report)?;
-                checkpoint_load_report = Some(report);
-                checkpoint_source = Some(checkpoint_dir.clone());
-                model
-            } else {
-                crate::VJepa2_1Model::<burn::backend::NdArray<f32>>::new(&model_config, &device)
-            };
-            use anyhow::Context as _;
-            let ttt = crate::VJepaTttModel::from_model(base, config.ttt.clone(), &device)?
-                .load_file(
-                    model_path.clone(),
-                    &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
-                    &device,
-                )
-                .with_context(|| format!("load TTT model {}", model_path.display()))?;
-            crate::save_ttt_burnpack(&ttt.no_grad(), &output)?;
-            crate::BurnJepaPipelinePackageManifest {
-                model_kind: crate::BurnJepaPackageModelKind::Ttt,
-                record_dtype: Some("f16".to_string()),
-                jepa_config: model_config,
-                ttt_config: Some(config.ttt.clone()),
-                model_base_url,
-                ..crate::BurnJepaPipelinePackageManifest::default()
-            }
-            .with_burnpack_paths(&output)
+    let ttt_model_path = model_path.or(config.model.ttt_checkpoint_path.clone());
+    let package_model_kind = if ttt_model_path.is_some() {
+        crate::BurnJepaPackageModelKind::Ttt
+    } else {
+        crate::BurnJepaPackageModelKind::Base
+    };
+    let model_profile = model_profile.unwrap_or_else(|| {
+        if ttt_model_path.is_some() {
+            crate::BurnJepaModelProfile::Vjepa21Ttt
         } else {
-            let base = if let Some(checkpoint_dir) = &config.model.checkpoint_dir {
-                let mut options = crate::VJepaLoadOptions::default();
-                if let Some(weights_name) = &config.model.weights_name {
-                    options.weights_name = weights_name.clone();
-                }
-                let (model, _config, report) =
-                    options.load_model::<burn::backend::NdArray<f32>>(checkpoint_dir, &device)?;
-                ensure_export_load_report_ok(&report)?;
-                checkpoint_load_report = Some(report);
-                checkpoint_source = Some(checkpoint_dir.clone());
-                model
-            } else {
-                crate::VJepa2_1Model::<burn::backend::NdArray<f32>>::new(&model_config, &device)
-            };
-            crate::save_vjepa_burnpack(&base.no_grad(), &output)?;
-            crate::BurnJepaPipelinePackageManifest {
-                model_kind: crate::BurnJepaPackageModelKind::Base,
-                record_dtype: Some("f16".to_string()),
-                jepa_config: model_config,
-                ttt_config: None,
-                model_base_url,
-                ..crate::BurnJepaPipelinePackageManifest::default()
+            crate::BurnJepaModelProfile::Vjepa21Base
+        }
+    });
+    ensure!(
+        model_profile.model_kind() == package_model_kind,
+        "--model-profile {} maps to a {} package, but this export config produces a {} package",
+        model_profile,
+        model_profile.model_kind().as_str(),
+        package_model_kind.as_str()
+    );
+    let model_base_url = resolve_model_profile_base_url(model_profile, model_base_url);
+    let package_manifest = if let Some(model_path) = ttt_model_path {
+        let base = if let Some(checkpoint_dir) = &config.model.checkpoint_dir {
+            let mut options = crate::VJepaLoadOptions::default();
+            if let Some(weights_name) = &config.model.weights_name {
+                options.weights_name = weights_name.clone();
             }
-            .with_burnpack_paths(&output)
+            let (model, _config, report) =
+                options.load_model::<burn::backend::NdArray<f32>>(checkpoint_dir, &device)?;
+            ensure_export_load_report_ok(&report)?;
+            checkpoint_load_report = Some(report);
+            checkpoint_source = Some(checkpoint_dir.clone());
+            model
+        } else {
+            crate::VJepa2_1Model::<burn::backend::NdArray<f32>>::new(&model_config, &device)
         };
+        use anyhow::Context as _;
+        let ttt = crate::VJepaTttModel::from_model(base, config.ttt.clone(), &device)?
+            .load_file(
+                model_path.clone(),
+                &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
+                &device,
+            )
+            .with_context(|| format!("load TTT model {}", model_path.display()))?;
+        crate::save_ttt_burnpack(&ttt.no_grad(), &output)?;
+        crate::BurnJepaPipelinePackageManifest {
+            model_kind: crate::BurnJepaPackageModelKind::Ttt,
+            record_dtype: Some("f16".to_string()),
+            jepa_config: model_config,
+            ttt_config: Some(config.ttt.clone()),
+            model_base_url,
+            ..crate::BurnJepaPipelinePackageManifest::default()
+        }
+        .with_burnpack_paths(&output)
+    } else {
+        let base = if let Some(checkpoint_dir) = &config.model.checkpoint_dir {
+            let mut options = crate::VJepaLoadOptions::default();
+            if let Some(weights_name) = &config.model.weights_name {
+                options.weights_name = weights_name.clone();
+            }
+            let (model, _config, report) =
+                options.load_model::<burn::backend::NdArray<f32>>(checkpoint_dir, &device)?;
+            ensure_export_load_report_ok(&report)?;
+            checkpoint_load_report = Some(report);
+            checkpoint_source = Some(checkpoint_dir.clone());
+            model
+        } else {
+            crate::VJepa2_1Model::<burn::backend::NdArray<f32>>::new(&model_config, &device)
+        };
+        crate::save_vjepa_burnpack(&base.no_grad(), &output)?;
+        crate::BurnJepaPipelinePackageManifest {
+            model_kind: crate::BurnJepaPackageModelKind::Base,
+            record_dtype: Some("f16".to_string()),
+            jepa_config: model_config,
+            ttt_config: None,
+            model_base_url,
+            ..crate::BurnJepaPipelinePackageManifest::default()
+        }
+        .with_burnpack_paths(&output)
+    };
     let burnpack_dtype_counts = crate::burnpack_dtype_counts(&output)?;
     ensure_export_burnpack_is_f16(&burnpack_dtype_counts)?;
     let max_part_bytes = shard_mib
@@ -867,6 +927,7 @@ fn export_bpk_ndarray(
         "record_dtype": package_manifest.record_dtype.clone(),
         "burnpack_dtype_counts": burnpack_dtype_counts,
         "model_base_url": package_manifest.model_base_url.clone(),
+        "model_profile": model_profile.as_str(),
         "checkpoint_source": checkpoint_source,
         "checkpoint_load_report": export_load_report_json(checkpoint_load_report.as_ref()),
         "deploy_bundle": deploy_bundle,

@@ -1,5 +1,8 @@
 use bevy::app::AppExit;
-use bevy_jepa::{BevyJepaConfig, BevyJepaEncoderSource, BevyJepaFrameSource, run_app};
+use bevy_jepa::{
+    BevyJepaConfig, BevyJepaEncoderSource, BevyJepaFrameSource, BevyJepaModelPackageProfile,
+    run_app,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_jepa::{
@@ -7,7 +10,11 @@ use bevy_jepa::{
     DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CAMERA_FPS,
     DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, DEFAULT_CONTEXT_DENSITY,
     DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE, DEFAULT_MIN_CONTEXT_DENSITY,
-    DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY, DEFAULT_PATCH_DIFF_THRESHOLD,
+    DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES, DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
+    DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
+    DEFAULT_PATCH_DIFF_REFRESH_ENABLED, DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY,
+    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY,
+    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER, DEFAULT_PATCH_DIFF_THRESHOLD,
     DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES, DEFAULT_PCA_UPDATE_EVERY,
     DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
     DEFAULT_SPARSE_MASK_BUCKET_TOKENS, DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH,
@@ -16,7 +23,10 @@ use bevy_jepa::{
 #[cfg(not(target_arch = "wasm32"))]
 use burn_jepa::DEFAULT_BURN_JEPA_MODEL_BASE_URL;
 #[cfg(not(target_arch = "wasm32"))]
-use burn_jepa::{AnyUpAttentionMode, FeatureFrameViewerConfig, patch_diff_threshold_from_quality};
+use burn_jepa::{
+    AnyUpAttentionMode, FeatureFrameViewerConfig, PatchDiffRefreshConfig,
+    patch_diff_threshold_from_quality,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use clap::{ArgAction, Parser};
@@ -33,7 +43,7 @@ struct Cli {
     encode_path: BevyJepaEncodePath,
     #[arg(
         long,
-        help = "Local burn_jepa package manifest.json. If omitted, the viewer checks BURN_JEPA_MODEL_MANIFEST, target/burn-jepa-web/model/manifest.json, then the auto-downloaded cache before falling back to an explicit --ttt-model."
+        help = "Local burn_jepa package manifest.json. If omitted, the viewer checks BURN_JEPA_MODEL_MANIFEST, target/burn-jepa-web/model/{model_profile}/manifest.json, then the auto-downloaded cache before falling back to an explicit --ttt-model."
     )]
     model_manifest: Option<PathBuf>,
     #[arg(
@@ -41,6 +51,8 @@ struct Cli {
         help = "Exact local cache directory for auto-downloaded burn_jepa model shards."
     )]
     model_cache_dir: Option<PathBuf>,
+    #[arg(long, visible_alias = "model-name", default_value_t = BevyJepaModelPackageProfile::default())]
+    model_profile: BevyJepaModelPackageProfile,
     #[arg(long, default_value = DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
     model_base_url: String,
     #[arg(long, action = ArgAction::SetTrue, help = "Disable native model package auto-download/cache lookup.")]
@@ -82,6 +94,31 @@ struct Cli {
     patch_diff_quality: Option<f32>,
     #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY)]
     patch_diff_dense_fallback_density: f32,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        default_value_t = DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
+        help = "Enable bounded age/subthreshold/blue-noise patch-diff refresh tokens."
+    )]
+    patch_diff_refresh: bool,
+    #[arg(long = "no-patch-diff-refresh", action = ArgAction::SetTrue, hide = true)]
+    no_patch_diff_refresh: bool,
+    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY)]
+    patch_diff_subthreshold_decay: f32,
+    #[arg(long, default_value_t = 1.0)]
+    patch_diff_subthreshold_gain: f32,
+    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER)]
+    patch_diff_subthreshold_trigger: f32,
+    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY)]
+    patch_diff_subthreshold_max_density: f32,
+    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES)]
+    patch_diff_age_refresh_interval_frames: u64,
+    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY)]
+    patch_diff_age_refresh_max_density: f32,
+    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY)]
+    patch_diff_blue_noise_refresh_density: f32,
+    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY)]
+    patch_diff_refresh_max_density: f32,
     #[arg(
         long,
         default_value_t = BevyJepaSparseEncodeMode::BucketedContext,
@@ -144,11 +181,13 @@ struct Cli {
 #[cfg(not(target_arch = "wasm32"))]
 impl From<Cli> for BevyJepaConfig {
     fn from(cli: Cli) -> Self {
+        let model_base_url = resolve_model_profile_base_url(cli.model_profile, cli.model_base_url);
         Self {
             encoder_source: cli.encoder_source,
             model_manifest_path: cli.model_manifest,
             model_cache_dir: cli.model_cache_dir,
-            model_base_url: cli.model_base_url,
+            model_profile: cli.model_profile,
+            model_base_url,
             model_auto_download: !cli.no_model_download,
             ttt_model_path: cli.ttt_model,
             jepa_checkpoint_dir: Some(cli.jepa_checkpoint_dir),
@@ -177,6 +216,22 @@ impl From<Cli> for BevyJepaConfig {
                 patch_diff_dense_fallback_density: cli
                     .patch_diff_dense_fallback_density
                     .clamp(0.0, 1.0),
+                patch_diff_refresh: PatchDiffRefreshConfig {
+                    enabled: cli.patch_diff_refresh && !cli.no_patch_diff_refresh,
+                    subthreshold_decay: cli.patch_diff_subthreshold_decay.clamp(0.0, 1.0),
+                    subthreshold_gain: cli.patch_diff_subthreshold_gain.max(0.0),
+                    subthreshold_trigger: cli.patch_diff_subthreshold_trigger.max(1.0e-6),
+                    subthreshold_max_density: cli
+                        .patch_diff_subthreshold_max_density
+                        .clamp(0.0, 1.0),
+                    age_refresh_interval_frames: cli.patch_diff_age_refresh_interval_frames,
+                    age_refresh_max_density: cli.patch_diff_age_refresh_max_density.clamp(0.0, 1.0),
+                    blue_noise_refresh_density: cli
+                        .patch_diff_blue_noise_refresh_density
+                        .clamp(0.0, 1.0),
+                    max_extra_density: cli.patch_diff_refresh_max_density.clamp(0.0, 1.0),
+                    ..PatchDiffRefreshConfig::default()
+                },
                 sparse_encode_mode: cli.sparse_encode_mode,
                 sparse_mask_bucket_tokens: cli.sparse_mask_bucket_tokens,
                 prewarm_shape_buckets: cli.prewarm_shape_buckets && !cli.no_prewarm_shape_buckets,
@@ -194,6 +249,18 @@ impl From<Cli> for BevyJepaConfig {
             camera_height: cli.camera_height,
             camera_fps: cli.camera_fps,
         }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_model_profile_base_url(
+    model_profile: BevyJepaModelPackageProfile,
+    model_base_url: String,
+) -> String {
+    if model_base_url == DEFAULT_BURN_JEPA_MODEL_BASE_URL {
+        burn_jepa::burn_jepa_model_profile_base_url(model_profile)
+    } else {
+        model_base_url
     }
 }
 
@@ -254,6 +321,10 @@ mod tests {
         assert!(default_config.model_manifest_path.is_none());
         assert!(default_config.ttt_model_path.is_none());
         assert!(default_config.model_auto_download);
+        assert_eq!(
+            default_config.model_profile,
+            BevyJepaModelPackageProfile::Vjepa21Ttt
+        );
 
         let config = BevyJepaConfig::from(Cli::parse_from([
             "bevy_jepa",
@@ -283,6 +354,14 @@ mod tests {
         );
         assert_eq!(config.model_base_url, "http://127.0.0.1:8091");
         assert!(!config.model_auto_download);
+
+        let base_config =
+            BevyJepaConfig::from(Cli::parse_from(["bevy_jepa", "--model-profile", "base"]));
+        assert_eq!(
+            base_config.model_profile,
+            BevyJepaModelPackageProfile::Vjepa21Base
+        );
+        assert!(base_config.model_base_url.ends_with("/vjepa2_1_base"));
     }
 
     #[test]
@@ -362,6 +441,20 @@ fn wasm_config_from_url() -> BevyJepaConfig {
     {
         config.encoder_source = source;
     }
+    if let Some(value) = query_param("model-profile")
+        .or_else(|| query_param("model-name"))
+        .or_else(|| query_param("model"))
+        && let Ok(profile) = value.parse::<BevyJepaModelPackageProfile>()
+    {
+        config.model_profile = profile;
+        config.model_base_url = burn_jepa::burn_jepa_model_profile_base_url(profile);
+        config.model_manifest_path = None;
+        config.ttt_model_path = None;
+        config.encoder_source = match profile {
+            BevyJepaModelPackageProfile::Vjepa21Base => BevyJepaEncoderSource::BaseCheckpoint,
+            BevyJepaModelPackageProfile::Vjepa21Ttt => BevyJepaEncoderSource::TrainedTtt,
+        };
+    }
     if let Some(value) = query_param("source")
         && let Ok(source) = value.parse::<BevyJepaFrameSource>()
     {
@@ -378,6 +471,30 @@ fn wasm_config_from_url() -> BevyJepaConfig {
             config.patch_diff_threshold,
             Some(quality),
         );
+    }
+    if let Some(enabled) = param_bool("patch-diff-refresh") {
+        config.patch_diff_refresh.enabled = enabled;
+    }
+    if let Some(decay) = param_f32("patch-diff-subthreshold-decay") {
+        config.patch_diff_refresh.subthreshold_decay = decay.clamp(0.0, 1.0);
+    }
+    if let Some(trigger) = param_f32("patch-diff-subthreshold-trigger") {
+        config.patch_diff_refresh.subthreshold_trigger = trigger.max(1.0e-6);
+    }
+    if let Some(density) = param_f32("patch-diff-subthreshold-density") {
+        config.patch_diff_refresh.subthreshold_max_density = density.clamp(0.0, 1.0);
+    }
+    if let Some(frames) = param_u64("patch-diff-age-refresh-frames") {
+        config.patch_diff_refresh.age_refresh_interval_frames = frames;
+    }
+    if let Some(density) = param_f32("patch-diff-age-refresh-density") {
+        config.patch_diff_refresh.age_refresh_max_density = density.clamp(0.0, 1.0);
+    }
+    if let Some(density) = param_f32("patch-diff-blue-noise-density") {
+        config.patch_diff_refresh.blue_noise_refresh_density = density.clamp(0.0, 1.0);
+    }
+    if let Some(density) = param_f32("patch-diff-refresh-density") {
+        config.patch_diff_refresh.max_extra_density = density.clamp(0.0, 1.0);
     }
     if let Some(density) = param_f32("context-density") {
         config.context_density = density.clamp(0.0, 1.0);

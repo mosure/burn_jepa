@@ -1,10 +1,11 @@
 use crate::{
     FeaturePcaUpdateConfig, FeaturePcaUpdateMode, SparseJepaAnyUpPcaMeasurementConfig,
     SparseJepaPatchDiffSparsityConfig, SparseTokenMask, TokenGridShape, coords_to_token_index,
+    patch_diff_context_mask_from_scores,
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 /// Minimum square input resolution used by the live feature-frame viewer policy.
 pub const MIN_PIPELINE_IMAGE_SIZE: usize = 256;
@@ -26,6 +27,22 @@ pub const DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 1.0 - DEFAULT_PATCH_DIFF_QUALITY;
 pub const DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY: f32 = 0.60;
 /// Default sparse encode bucket width used to reduce GPU shape churn.
 pub const DEFAULT_SPARSE_MASK_BUCKET_TOKENS: usize = 256;
+/// Whether patch-diff refresh adds bounded drift-prevention tokens by default.
+pub const DEFAULT_PATCH_DIFF_REFRESH_ENABLED: bool = true;
+/// Default residual decay for subthreshold patch-diff evidence.
+pub const DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY: f32 = 0.92;
+/// Default normalized residual value required before a below-threshold patch is refreshed.
+pub const DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER: f32 = 1.0;
+/// Default maximum density used by subthreshold refresh tokens.
+pub const DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY: f32 = 0.04;
+/// Default stale-token interval for age-priority refresh.
+pub const DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES: u64 = 90;
+/// Default maximum density used by age-priority refresh tokens.
+pub const DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY: f32 = 0.01;
+/// Default maximum density used by deterministic blue-noise refresh tokens.
+pub const DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY: f32 = 0.005;
+/// Default total refresh density cap across all patch-diff refresh modes.
+pub const DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY: f32 = 0.05;
 /// Whether live viewers should prewarm bucketed sparse token widths.
 pub const DEFAULT_PREWARM_SHAPE_BUCKETS: bool = true;
 /// Default AnyUp query chunk size used by the portable high-resolution decode path.
@@ -163,6 +180,363 @@ impl FromStr for FeatureFrameSparseEncodeMode {
     }
 }
 
+/// Bounded drift-prevention policy for patch-diff sparse cache writes.
+///
+/// Threshold hits are always kept first. These refresh modes only fill unused
+/// context budget, so they avoid hiding real motion while still refreshing slow
+/// semantic changes that never cross the instantaneous patch-diff threshold.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PatchDiffRefreshConfig {
+    /// Enables all configured refresh modes.
+    pub enabled: bool,
+    /// Accumulate repeated below-threshold scores until they merit a refresh.
+    pub subthreshold_enabled: bool,
+    /// Per-frame decay applied to subthreshold evidence.
+    pub subthreshold_decay: f32,
+    /// Multiplier applied to normalized below-threshold scores.
+    pub subthreshold_gain: f32,
+    /// Accumulated evidence required before selecting a below-threshold token.
+    pub subthreshold_trigger: f32,
+    /// Per-frame density cap for subthreshold refresh tokens.
+    pub subthreshold_max_density: f32,
+    /// Refresh tokens that have not been overwritten for many frames.
+    pub age_refresh_enabled: bool,
+    /// Frames since last write before a token is eligible for age refresh.
+    pub age_refresh_interval_frames: u64,
+    /// Per-frame density cap for age-priority refresh tokens.
+    pub age_refresh_max_density: f32,
+    /// Enables deterministic blue-noise-like refresh probes.
+    pub blue_noise_enabled: bool,
+    /// Per-frame density cap for deterministic blue-noise refresh tokens.
+    pub blue_noise_refresh_density: f32,
+    /// Seed for deterministic blue-noise refresh ordering.
+    pub blue_noise_seed: u64,
+    /// Total per-frame density cap across all refresh modes.
+    pub max_extra_density: f32,
+}
+
+impl Default for PatchDiffRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
+            subthreshold_enabled: true,
+            subthreshold_decay: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
+            subthreshold_gain: 1.0,
+            subthreshold_trigger: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
+            subthreshold_max_density: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY,
+            age_refresh_enabled: true,
+            age_refresh_interval_frames: DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES,
+            age_refresh_max_density: DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
+            blue_noise_enabled: true,
+            blue_noise_refresh_density: DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY,
+            blue_noise_seed: 0x9e37_79b9_7f4a_7c15,
+            max_extra_density: DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY,
+        }
+    }
+}
+
+impl PatchDiffRefreshConfig {
+    /// Returns a config that preserves legacy instantaneous patch-diff behavior.
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            subthreshold_enabled: false,
+            subthreshold_decay: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
+            subthreshold_gain: 1.0,
+            subthreshold_trigger: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
+            subthreshold_max_density: 0.0,
+            age_refresh_enabled: false,
+            age_refresh_interval_frames: DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES,
+            age_refresh_max_density: 0.0,
+            blue_noise_enabled: false,
+            blue_noise_refresh_density: 0.0,
+            blue_noise_seed: 0x9e37_79b9_7f4a_7c15,
+            max_extra_density: 0.0,
+        }
+    }
+
+    /// True when any refresh mode can add tokens.
+    pub fn can_add_tokens(&self) -> bool {
+        self.enabled
+            && self.max_extra_density > 0.0
+            && ((self.subthreshold_enabled && self.subthreshold_max_density > 0.0)
+                || (self.age_refresh_enabled
+                    && self.age_refresh_interval_frames > 0
+                    && self.age_refresh_max_density > 0.0)
+                || (self.blue_noise_enabled && self.blue_noise_refresh_density > 0.0))
+    }
+}
+
+/// Stateful patch-diff refresh accumulator used by live interframe token caches.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PatchDiffRefreshState {
+    dense_len: usize,
+    frame_index: u64,
+    subthreshold_residual: Vec<f32>,
+    age_frames: Vec<u32>,
+}
+
+impl PatchDiffRefreshState {
+    /// Clears accumulated residuals and token ages.
+    pub fn reset(&mut self) {
+        self.dense_len = 0;
+        self.frame_index = 0;
+        self.subthreshold_residual.clear();
+        self.age_frames.clear();
+    }
+
+    /// Current refresh frame index, useful for diagnostics and tests.
+    pub const fn frame_index(&self) -> u64 {
+        self.frame_index
+    }
+
+    /// Returns the accumulated residual for one token.
+    pub fn subthreshold_residual(&self, index: usize) -> Option<f32> {
+        self.subthreshold_residual.get(index).copied()
+    }
+
+    /// Returns the age in frames for one token.
+    pub fn age_frames(&self, index: usize) -> Option<u32> {
+        self.age_frames.get(index).copied()
+    }
+
+    /// Records a patch-diff frame whose final cache write mask is already known.
+    pub fn observe_write_mask(&mut self, mask: &SparseTokenMask, grid: TokenGridShape) {
+        self.begin_frame(grid);
+        self.reset_selected(mask.indices());
+    }
+
+    /// Builds patch-diff masks from scores and adds bounded refresh tokens.
+    pub fn masks_from_scores(
+        &mut self,
+        scores: Vec<f32>,
+        grid: TokenGridShape,
+        sparsity: &SparseJepaPatchDiffSparsityConfig,
+        config: &FeatureFrameViewerConfig,
+    ) -> Result<FeatureFrameSparseMasks> {
+        ensure!(
+            scores.len() == grid.len(),
+            "patch-diff refresh received unexpected score length"
+        );
+        if !config.patch_diff_refresh.can_add_tokens() {
+            let mask = patch_diff_context_mask_from_scores(scores, grid, sparsity)?;
+            self.begin_frame(grid);
+            let masks = finalize_patch_diff_masks(mask, grid, config);
+            self.reset_selected(masks.write_mask.indices());
+            return Ok(masks);
+        }
+        let base_mask = patch_diff_context_mask_from_scores(scores.clone(), grid, sparsity)?;
+        self.begin_frame(grid);
+        let refreshed = self.augment_mask(
+            base_mask,
+            &scores,
+            grid,
+            sparsity,
+            &config.patch_diff_refresh,
+        )?;
+        let masks = finalize_patch_diff_masks(refreshed, grid, config);
+        self.reset_selected(masks.write_mask.indices());
+        Ok(masks)
+    }
+
+    fn begin_frame(&mut self, grid: TokenGridShape) {
+        if self.dense_len != grid.len() {
+            self.dense_len = grid.len();
+            self.frame_index = 0;
+            self.subthreshold_residual = vec![0.0; grid.len()];
+            self.age_frames = vec![0; grid.len()];
+        }
+        self.frame_index = self.frame_index.saturating_add(1);
+        for age in &mut self.age_frames {
+            *age = age.saturating_add(1);
+        }
+    }
+
+    fn reset_selected(&mut self, indices: &[usize]) {
+        for &index in indices {
+            if let Some(residual) = self.subthreshold_residual.get_mut(index) {
+                *residual = 0.0;
+            }
+            if let Some(age) = self.age_frames.get_mut(index) {
+                *age = 0;
+            }
+        }
+    }
+
+    fn augment_mask(
+        &mut self,
+        base_mask: SparseTokenMask,
+        scores: &[f32],
+        grid: TokenGridShape,
+        sparsity: &SparseJepaPatchDiffSparsityConfig,
+        config: &PatchDiffRefreshConfig,
+    ) -> Result<SparseTokenMask> {
+        if base_mask.len() >= grid.len() {
+            return Ok(base_mask);
+        }
+        let max_context = sparsity.context_tokens.max(1).min(grid.len());
+        let mut remaining = max_context.saturating_sub(base_mask.len());
+        remaining = remaining.min(density_tokens(
+            grid.len(),
+            config.max_extra_density,
+            DensityRound::Floor,
+            0.0,
+        ));
+        if remaining == 0 {
+            self.update_subthreshold_residual(scores, base_mask.indices(), sparsity, config);
+            return Ok(base_mask);
+        }
+
+        let mut selected = vec![false; grid.len()];
+        let mut indices = base_mask.indices().to_vec();
+        for &index in &indices {
+            selected[index] = true;
+        }
+        self.update_subthreshold_residual(scores, &indices, sparsity, config);
+
+        if config.subthreshold_enabled && config.subthreshold_max_density > 0.0 {
+            let budget = remaining.min(density_tokens(
+                grid.len(),
+                config.subthreshold_max_density,
+                DensityRound::Floor,
+                0.0,
+            ));
+            let added = self.add_ranked_candidates(&mut selected, &mut indices, budget, |index| {
+                let residual = self.subthreshold_residual[index];
+                (residual >= config.subthreshold_trigger.max(1.0e-6)).then_some((
+                    residual,
+                    self.refresh_rank(index, grid, config.blue_noise_seed),
+                ))
+            });
+            remaining = remaining.saturating_sub(added);
+        }
+
+        if remaining > 0
+            && config.age_refresh_enabled
+            && config.age_refresh_interval_frames > 0
+            && config.age_refresh_max_density > 0.0
+        {
+            let interval = config.age_refresh_interval_frames.min(u32::MAX as u64) as u32;
+            let budget = remaining.min(density_tokens(
+                grid.len(),
+                config.age_refresh_max_density,
+                DensityRound::Floor,
+                0.0,
+            ));
+            let added = self.add_ranked_candidates(&mut selected, &mut indices, budget, |index| {
+                let age = self.age_frames[index];
+                (age >= interval).then_some((
+                    age as f32,
+                    self.refresh_rank(index, grid, config.blue_noise_seed),
+                ))
+            });
+            remaining = remaining.saturating_sub(added);
+        }
+
+        if remaining > 0 && config.blue_noise_enabled && config.blue_noise_refresh_density > 0.0 {
+            let budget = remaining.min(density_tokens(
+                grid.len(),
+                config.blue_noise_refresh_density,
+                DensityRound::Floor,
+                0.0,
+            ));
+            self.add_ranked_candidates(&mut selected, &mut indices, budget, |index| {
+                Some((0.0, self.refresh_rank(index, grid, config.blue_noise_seed)))
+            });
+        }
+
+        SparseTokenMask::new(indices, grid.len())
+    }
+
+    fn update_subthreshold_residual(
+        &mut self,
+        scores: &[f32],
+        selected_indices: &[usize],
+        sparsity: &SparseJepaPatchDiffSparsityConfig,
+        config: &PatchDiffRefreshConfig,
+    ) {
+        let mut selected = vec![false; scores.len()];
+        for &index in selected_indices {
+            if let Some(slot) = selected.get_mut(index) {
+                *slot = true;
+            }
+        }
+        let decay = config.subthreshold_decay.clamp(0.0, 1.0);
+        let threshold = sparsity.threshold.max(1.0e-6);
+        for (index, residual) in self.subthreshold_residual.iter_mut().enumerate() {
+            if selected[index] || scores[index] >= sparsity.threshold {
+                *residual = 0.0;
+            } else {
+                let normalized = (scores[index] / threshold).clamp(0.0, 1.0);
+                *residual = *residual * decay + normalized * config.subthreshold_gain.max(0.0);
+            }
+        }
+    }
+
+    fn add_ranked_candidates<F>(
+        &self,
+        selected: &mut [bool],
+        indices: &mut Vec<usize>,
+        budget: usize,
+        mut rank: F,
+    ) -> usize
+    where
+        F: FnMut(usize) -> Option<(f32, u64)>,
+    {
+        if budget == 0 {
+            return 0;
+        }
+        let mut candidates = Vec::new();
+        for (index, present) in selected.iter().enumerate() {
+            if *present {
+                continue;
+            }
+            if let Some((priority, tie_breaker)) = rank(index) {
+                candidates.push((index, priority, tie_breaker));
+            }
+        }
+        let compare = |left: &(usize, f32, u64), right: &(usize, f32, u64)| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.0.cmp(&right.0))
+        };
+        if candidates.len() > budget {
+            candidates.select_nth_unstable_by(budget, compare);
+            candidates.truncate(budget);
+        }
+        candidates.sort_by(compare);
+        let mut added = 0usize;
+        for (index, _, _) in candidates {
+            selected[index] = true;
+            indices.push(index);
+            added += 1;
+        }
+        added
+    }
+
+    fn refresh_rank(&self, index: usize, grid: TokenGridShape, seed: u64) -> u64 {
+        let row = index / grid.width.max(1);
+        let col = index % grid.width.max(1);
+        mix64(
+            seed ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (col as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                ^ self.frame_index.wrapping_mul(0x94d0_49bb_1331_11eb),
+        )
+    }
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 /// Shared live feature-frame policy used by viewers, examples, benches, and downstream clients.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -185,6 +559,8 @@ pub struct FeatureFrameViewerConfig {
     pub sparse_encode_mode: FeatureFrameSparseEncodeMode,
     /// Token bucket width used with [`FeatureFrameSparseEncodeMode::BucketedContext`].
     pub sparse_mask_bucket_tokens: usize,
+    /// Bounded refresh policy for slow/stale patch-diff tokens.
+    pub patch_diff_refresh: PatchDiffRefreshConfig,
     /// Prewarm bucketed sparse widths during startup.
     pub prewarm_shape_buckets: bool,
     /// AnyUp query chunk size.
@@ -217,6 +593,7 @@ impl Default for FeatureFrameViewerConfig {
             patch_diff_dense_fallback_density: DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
             sparse_encode_mode: FeatureFrameSparseEncodeMode::BucketedContext,
             sparse_mask_bucket_tokens: DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
+            patch_diff_refresh: PatchDiffRefreshConfig::default(),
             prewarm_shape_buckets: DEFAULT_PREWARM_SHAPE_BUCKETS,
             anyup_q_chunk_size: DEFAULT_ANYUP_CHUNK_SIZE,
             pca_update_every: DEFAULT_PCA_UPDATE_EVERY,
@@ -319,6 +696,7 @@ impl FeatureFrameViewerConfig {
 
 #[derive(Clone, Copy)]
 enum DensityRound {
+    Floor,
     Round,
     Ceil,
 }
@@ -331,6 +709,7 @@ fn density_tokens(
 ) -> usize {
     let density = density.clamp(min_density, 1.0);
     let tokens = match round {
+        DensityRound::Floor => (dense_tokens as f32 * density).floor(),
         DensityRound::Round => (dense_tokens as f32 * density).round(),
         DensityRound::Ceil => (dense_tokens as f32 * density).ceil(),
     } as usize;
@@ -740,6 +1119,8 @@ mod tests {
             config.sparse_encode_mode,
             FeatureFrameSparseEncodeMode::BucketedContext
         );
+        assert!(config.patch_diff_refresh.enabled);
+        assert!(config.patch_diff_refresh.subthreshold_enabled);
         assert!(config.prewarm_shape_buckets);
     }
 
@@ -799,5 +1180,161 @@ mod tests {
                 .iter()
                 .all(|score| *score < DEFAULT_PATCH_DIFF_THRESHOLD)
         );
+    }
+
+    #[test]
+    fn subthreshold_patch_diff_accumulates_slow_motion() {
+        let grid = TokenGridShape::new(1, 4, 4);
+        let slow_index = coords_to_token_index(0, 2, 1, grid);
+        let config = FeatureFrameViewerConfig {
+            context_density: 0.25,
+            min_context_density: 0.0,
+            patch_diff_threshold: 0.10,
+            patch_diff_dense_fallback_density: 1.0,
+            sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
+            patch_diff_refresh: PatchDiffRefreshConfig {
+                subthreshold_decay: 1.0,
+                subthreshold_trigger: 1.0,
+                subthreshold_max_density: 0.25,
+                age_refresh_enabled: false,
+                blue_noise_enabled: false,
+                max_extra_density: 0.25,
+                ..PatchDiffRefreshConfig::default()
+            },
+            ..FeatureFrameViewerConfig::default()
+        };
+        let sparsity = patch_diff_sparsity_config(&config, grid);
+        let mut state = PatchDiffRefreshState::default();
+        let mut scores = vec![0.0f32; grid.len()];
+        scores[0] = 0.09;
+        scores[slow_index] = 0.04;
+
+        let first = state
+            .masks_from_scores(scores.clone(), grid, &sparsity, &config)
+            .expect("first mask");
+        assert!(!first.write_mask.indices().contains(&slow_index));
+
+        let second = state
+            .masks_from_scores(scores.clone(), grid, &sparsity, &config)
+            .expect("second mask");
+        assert!(!second.write_mask.indices().contains(&slow_index));
+
+        let third = state
+            .masks_from_scores(scores, grid, &sparsity, &config)
+            .expect("third mask");
+        assert!(
+            third.write_mask.indices().contains(&slow_index),
+            "repeated below-threshold motion should eventually refresh the token"
+        );
+        assert_eq!(state.subthreshold_residual(slow_index), Some(0.0));
+        assert_eq!(state.age_frames(slow_index), Some(0));
+    }
+
+    #[test]
+    fn subthreshold_refresh_fills_only_unused_context_budget() {
+        let grid = TokenGridShape::new(1, 4, 4);
+        let config = FeatureFrameViewerConfig {
+            context_density: 2.0 / 16.0,
+            min_context_density: 0.0,
+            patch_diff_threshold: 0.10,
+            patch_diff_dense_fallback_density: 1.0,
+            sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
+            patch_diff_refresh: PatchDiffRefreshConfig {
+                subthreshold_decay: 1.0,
+                subthreshold_trigger: 0.5,
+                subthreshold_max_density: 1.0,
+                age_refresh_enabled: false,
+                blue_noise_enabled: false,
+                max_extra_density: 1.0,
+                ..PatchDiffRefreshConfig::default()
+            },
+            ..FeatureFrameViewerConfig::default()
+        };
+        let sparsity = patch_diff_sparsity_config(&config, grid);
+        let mut state = PatchDiffRefreshState::default();
+        let mut scores = vec![0.06f32; grid.len()];
+        scores[0] = 0.09;
+
+        let output = state
+            .masks_from_scores(scores, grid, &sparsity, &config)
+            .expect("mask");
+
+        assert_eq!(
+            output.write_mask.len(),
+            2,
+            "refresh tokens must not exceed the configured context budget"
+        );
+    }
+
+    #[test]
+    fn age_priority_refresh_selects_stale_tokens() {
+        let grid = TokenGridShape::new(1, 4, 4);
+        let config = FeatureFrameViewerConfig {
+            context_density: 0.50,
+            min_context_density: 0.0,
+            patch_diff_threshold: 0.10,
+            patch_diff_dense_fallback_density: 1.0,
+            sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
+            patch_diff_refresh: PatchDiffRefreshConfig {
+                subthreshold_enabled: false,
+                age_refresh_interval_frames: 2,
+                age_refresh_max_density: 0.25,
+                blue_noise_enabled: false,
+                max_extra_density: 0.25,
+                ..PatchDiffRefreshConfig::default()
+            },
+            ..FeatureFrameViewerConfig::default()
+        };
+        let sparsity = patch_diff_sparsity_config(&config, grid);
+        let mut state = PatchDiffRefreshState::default();
+        let mut scores = vec![0.0f32; grid.len()];
+        scores[0] = 0.09;
+
+        let first = state
+            .masks_from_scores(scores.clone(), grid, &sparsity, &config)
+            .expect("first mask");
+        assert_eq!(first.write_mask.len(), 1);
+
+        let second = state
+            .masks_from_scores(scores, grid, &sparsity, &config)
+            .expect("second mask");
+        assert!(
+            second.write_mask.len() > first.write_mask.len(),
+            "stale age-priority refresh should add bounded cache writes"
+        );
+    }
+
+    #[test]
+    fn blue_noise_refresh_is_deterministic_for_same_state() {
+        let grid = TokenGridShape::new(1, 4, 4);
+        let config = FeatureFrameViewerConfig {
+            context_density: 0.50,
+            min_context_density: 0.0,
+            patch_diff_threshold: 0.10,
+            patch_diff_dense_fallback_density: 1.0,
+            sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
+            patch_diff_refresh: PatchDiffRefreshConfig {
+                subthreshold_enabled: false,
+                age_refresh_enabled: false,
+                blue_noise_refresh_density: 0.25,
+                max_extra_density: 0.25,
+                blue_noise_seed: 7,
+                ..PatchDiffRefreshConfig::default()
+            },
+            ..FeatureFrameViewerConfig::default()
+        };
+        let sparsity = patch_diff_sparsity_config(&config, grid);
+        let mut left = PatchDiffRefreshState::default();
+        let mut right = PatchDiffRefreshState::default();
+        let scores = vec![0.0f32; grid.len()];
+
+        let left_mask = left
+            .masks_from_scores(scores.clone(), grid, &sparsity, &config)
+            .expect("left mask");
+        let right_mask = right
+            .masks_from_scores(scores, grid, &sparsity, &config)
+            .expect("right mask");
+
+        assert_eq!(left_mask.write_mask, right_mask.write_mask);
     }
 }

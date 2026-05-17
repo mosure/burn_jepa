@@ -1,12 +1,14 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_jepa::{
-    AnyUp, AnyUpConfig, FeatureFrameRequest, FeaturePcaConfig, FeaturePcaDisplayMode,
-    FeaturePcaProjector, FeaturePcaUpdateConfig, InterframeJepaFeatureMemory,
-    InterframeJepaFeatureMemoryConfig, SparseJepaAnyUpPcaFrameId, SparseJepaAnyUpPcaFrameInput,
+    AnyUp, AnyUpConfig, FeatureFrameRequest, FeatureFrameViewerConfig, FeaturePcaConfig,
+    FeaturePcaDisplayMode, FeaturePcaProjector, FeaturePcaUpdateConfig,
+    InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig, PatchDiffRefreshConfig,
+    PatchDiffRefreshState, SparseJepaAnyUpPcaFrameId, SparseJepaAnyUpPcaFrameInput,
     SparseJepaAnyUpPcaMeasurementConfig, SparseJepaAnyUpPcaPipeline,
     SparseJepaAnyUpPcaPipelineConfig, SparseJepaAnyUpPcaStream, SparseJepaAnyUpPcaStreamConfig,
     SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig, jepa_feature_tokens_to_nchw,
+    patch_diff_sparsity_config,
 };
 #[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
 use burn_jepa::{SparseMaskBatch, SparsePatchifyBatchPlan};
@@ -86,6 +88,76 @@ const CASES: [HighResCase; 4] = [
 
 fn include_large_cases() -> bool {
     std::env::var("BURN_JEPA_HIGHRES_BENCH_LARGE").is_ok_and(|value| value != "0")
+}
+
+fn bench_patch_diff_refresh_policy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("patch_diff_refresh_policy");
+    for grid_hw in [16usize, 32] {
+        let grid = TokenGridShape::new(1, grid_hw, grid_hw);
+        group.throughput(Throughput::Elements((grid.len() * 32) as u64));
+        for (label, refresh) in [
+            ("instant_only", PatchDiffRefreshConfig::disabled()),
+            (
+                "subthreshold_av1_like",
+                PatchDiffRefreshConfig {
+                    subthreshold_decay: 0.92,
+                    subthreshold_trigger: 1.0,
+                    subthreshold_max_density: 0.08,
+                    age_refresh_enabled: false,
+                    blue_noise_enabled: false,
+                    max_extra_density: 0.08,
+                    ..PatchDiffRefreshConfig::default()
+                },
+            ),
+            (
+                "subthreshold_age_blue_noise",
+                PatchDiffRefreshConfig::default(),
+            ),
+        ] {
+            group.bench_function(format!("grid{grid_hw}_{label}"), |bench| {
+                bench.iter_batched(
+                    || {
+                        let config = FeatureFrameViewerConfig {
+                            context_density: 0.30,
+                            min_context_density: 0.0,
+                            patch_diff_threshold: 0.03,
+                            patch_diff_refresh: refresh,
+                            ..FeatureFrameViewerConfig::default()
+                        };
+                        let sparsity = patch_diff_sparsity_config(&config, grid);
+                        let state = PatchDiffRefreshState::default();
+                        let scores = vec![0.0f32; grid.len()];
+                        (config, sparsity, state, scores)
+                    },
+                    |(config, sparsity, mut state, mut scores)| {
+                        for frame in 0..32usize {
+                            for (index, score) in scores.iter_mut().enumerate() {
+                                let phase = (index + frame * 7) % 97;
+                                *score = if phase < 3 {
+                                    0.05
+                                } else if phase < 23 {
+                                    0.012
+                                } else {
+                                    0.0
+                                };
+                            }
+                            let masks = state
+                                .masks_from_scores(
+                                    black_box(scores.clone()),
+                                    grid,
+                                    &sparsity,
+                                    &config,
+                                )
+                                .expect("patch-diff refresh mask");
+                            black_box(masks.write_mask.len());
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    group.finish();
 }
 
 fn anyup_config(case: AnyUpBenchConfig) -> AnyUpConfig {
@@ -907,6 +979,7 @@ fn highres_pipeline_wgpu(_c: &mut Criterion) {}
 
 criterion_group!(
     benches,
+    bench_patch_diff_refresh_policy,
     highres_pipeline_ndarray,
     highres_pipeline_flex,
     highres_pipeline_dispatch_ndarray,

@@ -45,23 +45,31 @@ use burn_jepa::{
 };
 pub use config::{
     BevyJepaConfig, BevyJepaDisplayTransfer, BevyJepaEncodePath, BevyJepaEncoderSource,
-    BevyJepaFrameSource, BevyJepaMaskSource, BevyJepaSparseEncodeMode,
+    BevyJepaFrameSource, BevyJepaMaskSource, BevyJepaModelPackageProfile, BevyJepaSparseEncodeMode,
     DEFAULT_ANYUP_CHECKPOINT_PATH, DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY,
     DEFAULT_CAMERA_FPS, DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, DEFAULT_CONTEXT_DENSITY,
     DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE, DEFAULT_MIN_CONTEXT_DENSITY,
-    DEFAULT_MODEL_MANIFEST_PATH, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
-    DEFAULT_PATCH_DIFF_QUALITY, DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES,
-    DEFAULT_PCA_SAMPLE_WINDOW_FRAMES, DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS,
-    DEFAULT_PREWARM_SHAPE_BUCKETS, DEFAULT_SPARSE_MASK_BUCKET_TOKENS, DEFAULT_TTT_MODEL_PATH,
-    DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME,
-    FeatureFrameViewerConfig, MIN_PIPELINE_IMAGE_SIZE, PIPELINE_IMAGE_SIZE_MULTIPLE,
+    DEFAULT_MODEL_MANIFEST_PATH, DEFAULT_MODEL_PACKAGE_DIR,
+    DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES, DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
+    DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
+    DEFAULT_PATCH_DIFF_QUALITY, DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
+    DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
+    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
+    DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES,
+    DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
+    DEFAULT_SPARSE_MASK_BUCKET_TOKENS, DEFAULT_TTT_MODEL_PATH, DEFAULT_VJEPA21_CHECKPOINT_DIR,
+    DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME, FeatureFrameViewerConfig,
+    MIN_PIPELINE_IMAGE_SIZE, PIPELINE_IMAGE_SIZE_MULTIPLE, PatchDiffRefreshConfig,
+    default_model_manifest_path_for_profile,
 };
 use display::{
     HighResPanelData, InputPanelData, JepaPanelTextures, StagePanelData,
     apply_high_res_panel_to_world, apply_input_panel_to_world, apply_stage_panels_to_world,
     clear_completed_gpu_uploads,
 };
+#[cfg(test)]
 use mask::run_sparse_mask_node;
+use mask::run_sparse_mask_node_with_refresh_state;
 pub use metrics::{BevyJepaMetrics, BevyJepaStepOutput};
 use metrics::{
     MetricFrameContext, bevy_metrics_from_stage, format_metrics_line, format_metrics_waiting_line,
@@ -77,6 +85,13 @@ pub type JepaBevyDevice = burn::backend::wgpu::WgpuDevice;
 
 const UI_MARGIN_PX: f32 = 12.0;
 const METRIC_ROW_HEIGHT: f32 = 24.0;
+const CONTROL_PANEL_WIDTH_PX: f32 = 360.0;
+const CONTROL_ROW_GAP_PX: f32 = 6.0;
+const CONTROL_BUTTON_HEIGHT_PX: f32 = 28.0;
+const PATCH_DIFF_THRESHOLD_STEP: f32 = 0.01;
+const PATCH_DIFF_SUBTHRESHOLD_TRIGGER_STEP: f32 = 0.10;
+const PATCH_DIFF_BLUE_NOISE_DENSITY_STEP: f32 = 0.005;
+const PATCH_DIFF_AGE_INTERVAL_STEP: u64 = 15;
 
 #[cfg(not(target_arch = "wasm32"))]
 type ViewerInstant = std::time::Instant;
@@ -190,6 +205,11 @@ struct JepaRuntime {
 struct RuntimePipelineSignature {
     encoder_source: BevyJepaEncoderSource,
     encode_path: BevyJepaEncodePath,
+    model_manifest_path: Option<PathBuf>,
+    model_cache_dir: Option<PathBuf>,
+    model_profile: BevyJepaModelPackageProfile,
+    model_base_url: String,
+    model_auto_download: bool,
     ttt_model_path: Option<PathBuf>,
     jepa_checkpoint_dir: Option<PathBuf>,
     jepa_config_path: Option<PathBuf>,
@@ -203,7 +223,24 @@ struct RuntimePipelineSignature {
     pca_min_sample_frames: usize,
     pca_update_iterations: usize,
     sparse_encode_mode: BevyJepaSparseEncodeMode,
+    patch_diff_threshold_bits: u32,
+    context_density_bits: u32,
+    min_context_density_bits: u32,
+    bootstrap_context_density_bits: u32,
     patch_diff_dense_fallback_bits: u32,
+    patch_diff_refresh_enabled: bool,
+    patch_diff_subthreshold_enabled: bool,
+    patch_diff_subthreshold_decay_bits: u32,
+    patch_diff_subthreshold_gain_bits: u32,
+    patch_diff_subthreshold_trigger_bits: u32,
+    patch_diff_subthreshold_max_density_bits: u32,
+    patch_diff_age_refresh_enabled: bool,
+    patch_diff_age_refresh_interval_frames: u64,
+    patch_diff_age_refresh_max_density_bits: u32,
+    patch_diff_blue_noise_enabled: bool,
+    patch_diff_blue_noise_refresh_density_bits: u32,
+    patch_diff_blue_noise_seed: u64,
+    patch_diff_refresh_max_density_bits: u32,
     sparse_mask_bucket_tokens: usize,
     prewarm_shape_buckets: bool,
 }
@@ -213,6 +250,11 @@ impl RuntimePipelineSignature {
         Self {
             encoder_source: config.encoder_source,
             encode_path: config.encode_path,
+            model_manifest_path: config.model_manifest_path.clone(),
+            model_cache_dir: config.model_cache_dir.clone(),
+            model_profile: config.model_profile,
+            model_base_url: config.model_base_url.clone(),
+            model_auto_download: config.model_auto_download,
             ttt_model_path: config.ttt_model_path.clone(),
             jepa_checkpoint_dir: config.jepa_checkpoint_dir.clone(),
             jepa_config_path: config.jepa_config_path.clone(),
@@ -226,7 +268,47 @@ impl RuntimePipelineSignature {
             pca_min_sample_frames: config.pca_min_sample_frames,
             pca_update_iterations: config.pca_update_iterations,
             sparse_encode_mode: config.sparse_encode_mode,
+            patch_diff_threshold_bits: config.patch_diff_threshold.to_bits(),
+            context_density_bits: config.context_density.to_bits(),
+            min_context_density_bits: config.min_context_density.to_bits(),
+            bootstrap_context_density_bits: config.bootstrap_context_density.to_bits(),
             patch_diff_dense_fallback_bits: config.patch_diff_dense_fallback_density.to_bits(),
+            patch_diff_refresh_enabled: config.patch_diff_refresh.enabled,
+            patch_diff_subthreshold_enabled: config.patch_diff_refresh.subthreshold_enabled,
+            patch_diff_subthreshold_decay_bits: config
+                .patch_diff_refresh
+                .subthreshold_decay
+                .to_bits(),
+            patch_diff_subthreshold_gain_bits: config
+                .patch_diff_refresh
+                .subthreshold_gain
+                .to_bits(),
+            patch_diff_subthreshold_trigger_bits: config
+                .patch_diff_refresh
+                .subthreshold_trigger
+                .to_bits(),
+            patch_diff_subthreshold_max_density_bits: config
+                .patch_diff_refresh
+                .subthreshold_max_density
+                .to_bits(),
+            patch_diff_age_refresh_enabled: config.patch_diff_refresh.age_refresh_enabled,
+            patch_diff_age_refresh_interval_frames: config
+                .patch_diff_refresh
+                .age_refresh_interval_frames,
+            patch_diff_age_refresh_max_density_bits: config
+                .patch_diff_refresh
+                .age_refresh_max_density
+                .to_bits(),
+            patch_diff_blue_noise_enabled: config.patch_diff_refresh.blue_noise_enabled,
+            patch_diff_blue_noise_refresh_density_bits: config
+                .patch_diff_refresh
+                .blue_noise_refresh_density
+                .to_bits(),
+            patch_diff_blue_noise_seed: config.patch_diff_refresh.blue_noise_seed,
+            patch_diff_refresh_max_density_bits: config
+                .patch_diff_refresh
+                .max_extra_density
+                .to_bits(),
             sparse_mask_bucket_tokens: config.sparse_mask_bucket_tokens,
             prewarm_shape_buckets: config.prewarm_shape_buckets,
         }
@@ -333,6 +415,61 @@ impl BevyJepaHeadlessPipeline {
 #[derive(Component)]
 struct MetricsText;
 
+#[derive(Resource, Default)]
+struct JepaControlsState {
+    expanded: bool,
+}
+
+#[derive(Component)]
+struct ControlsPanel;
+
+#[derive(Component)]
+struct ControlsSummaryText;
+
+#[derive(Component)]
+struct HighResPanelElement;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JepaControlAction {
+    TogglePanel,
+    ModelTtt,
+    ModelBase,
+    Resolution256,
+    Resolution512,
+    AnyUpOff,
+    AnyUpEvery8,
+    AnyUpEvery1,
+    PatchRefresh,
+    SubthresholdRefresh,
+    AgeRefresh,
+    BlueNoiseRefresh,
+    ThresholdDown,
+    ThresholdUp,
+    SubthresholdTriggerDown,
+    SubthresholdTriggerUp,
+    AgeIntervalDown,
+    AgeIntervalUp,
+    BlueNoiseDensityDown,
+    BlueNoiseDensityUp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JepaControlReset {
+    None,
+    Visual,
+    Rebuild,
+}
+
+#[derive(Component)]
+struct JepaControlButton {
+    action: JepaControlAction,
+}
+
+#[derive(Component)]
+struct JepaControlButtonText {
+    action: JepaControlAction,
+}
+
 pub struct BevyJepaPlugin;
 
 impl Plugin for BevyJepaPlugin {
@@ -340,10 +477,15 @@ impl Plugin for BevyJepaPlugin {
         app.init_resource::<JepaPanelTextures>()
             .init_resource::<JepaRuntime>()
             .init_resource::<BevyJepaMetrics>()
+            .init_resource::<JepaControlsState>()
             .add_systems(Startup, setup_metrics_overlay)
+            .add_systems(Startup, setup_controls_ui)
             .add_systems(Update, setup_ui)
             .add_systems(Update, process_jepa_frame)
             .add_systems(Update, update_metrics_overlay)
+            .add_systems(Update, update_controls_ui)
+            .add_systems(Update, control_button_interactions)
+            .add_systems(Update, update_panel_layout)
             .add_systems(Update, fit_visualization_node)
             .add_systems(Update, keyboard_controls)
             .add_systems(Update, clear_completed_gpu_uploads);
@@ -644,10 +786,63 @@ impl JepaRuntime {
     fn clear_error(&mut self) {
         self.last_error = None;
     }
+
+    fn reset_visual_state(&mut self) {
+        if let Some(pipeline) = self.pipeline.as_mut()
+            && let Err(err) = pipeline.reset_visualization_state()
+        {
+            warn(&format!("bevy_jepa visual reset skipped: {err:#}"));
+        }
+        self.pending_stage = None;
+        self.pending_high_res = None;
+        self.prev_image = None;
+        self.prev_rgba = None;
+        self.prev_stage_image = None;
+        self.prev_stage_rgba = None;
+        self.last_error = None;
+    }
+
+    fn rebuild_pipeline_state(&mut self) {
+        self.active_task = None;
+        self.high_res_task = None;
+        self.pipeline = None;
+        self.model_config = None;
+        self.pipeline_signature = None;
+        self.pipeline_grid = None;
+        self.pipeline_patch_size = None;
+        self.high_res_runtime = None;
+        self.high_res_signature = None;
+        self.pending_stage = None;
+        self.pending_high_res = None;
+        self.prev_image = None;
+        self.prev_rgba = None;
+        self.prev_stage_image = None;
+        self.prev_stage_rgba = None;
+        self.frame_index = 0;
+        self.last_high_res_completion_at = None;
+        self.last_high_res_anyup_context_us = 0;
+        self.last_high_res_anyup_decode_us = 0;
+        self.last_high_res_pca_us = 0;
+        self.last_high_res_display_tensor_us = 0;
+        self.last_error = None;
+    }
+}
+
+fn high_res_panel_enabled(config: &BevyJepaConfig) -> bool {
+    config.high_res_pca_every > 0
+}
+
+fn visible_panel_count(config: &BevyJepaConfig) -> usize {
+    if high_res_panel_enabled(config) { 4 } else { 3 }
+}
+
+fn visible_panel_count_u16(config: &BevyJepaConfig) -> u16 {
+    visible_panel_count(config) as u16
 }
 
 fn setup_ui(
     mut commands: Commands,
+    config: Res<BevyJepaConfig>,
     mut texture: ResMut<JepaPanelTextures>,
     mut images: ResMut<Assets<Image>>,
     burn_device: Option<Res<BurnDevice>>,
@@ -675,7 +870,7 @@ fn setup_ui(
         height: Val::Percent(100.0),
         align_items: AlignItems::Center,
         justify_items: JustifyItems::Center,
-        grid_template_columns: RepeatedGridTrack::flex(4, 1.0),
+        grid_template_columns: RepeatedGridTrack::flex(visible_panel_count_u16(&config), 1.0),
         grid_template_rows: vec![GridTrack::px(PANEL_LABEL_ROW_HEIGHT), GridTrack::flex(1.0)],
         ..default()
     });
@@ -688,25 +883,16 @@ fn setup_ui(
         input_entity = Some(spawn_panel_image(builder, texture.input_image.clone()));
         mask_entity = Some(spawn_panel_image(builder, texture.mask_image.clone()));
         low_res_entity = Some(spawn_panel_image(builder, texture.low_res_image.clone()));
-        high_res_entity = Some(spawn_panel_image(builder, texture.high_res_image.clone()));
+        high_res_entity = Some(spawn_high_res_panel_image(
+            builder,
+            texture.high_res_image.clone(),
+            high_res_panel_enabled(&config),
+        ));
 
-        for label in ["Input", "Sparse mask", "Token PCA", "AnyUp PCA"] {
-            builder.spawn((
-                Text(label.to_string()),
-                TextFont {
-                    font_size: bevy::text::FontSize::Px(20.0),
-                    ..default()
-                },
-                TextColor(Color::WHITE),
-                Node {
-                    grid_row: GridPlacement::start(1),
-                    align_self: AlignSelf::Center,
-                    justify_self: JustifySelf::Center,
-                    padding: UiRect::horizontal(Val::Px(8.0)),
-                    ..default()
-                },
-            ));
-        }
+        spawn_panel_label(builder, "Input", false, true);
+        spawn_panel_label(builder, "Sparse mask", false, true);
+        spawn_panel_label(builder, "Token PCA", false, true);
+        spawn_panel_label(builder, "AnyUp PCA", true, high_res_panel_enabled(&config));
     });
 
     texture.input_entity = input_entity;
@@ -748,6 +934,185 @@ fn setup_metrics_overlay(mut commands: Commands) {
                 ..default()
             },
             TextSpan::new(format_metrics_waiting_line()),
+        ));
+}
+
+fn setup_controls_ui(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(UI_MARGIN_PX),
+                right: Val::Px(UI_MARGIN_PX),
+                width: Val::Px(CONTROL_PANEL_WIDTH_PX),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(CONTROL_ROW_GAP_PX),
+                align_items: AlignItems::Stretch,
+                ..default()
+            },
+            ZIndex(5),
+        ))
+        .with_children(|builder| {
+            spawn_control_button(builder, JepaControlAction::TogglePanel, "controls");
+            builder
+                .spawn((
+                    ControlsPanel,
+                    Node {
+                        display: Display::None,
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(CONTROL_ROW_GAP_PX),
+                        padding: UiRect::all(Val::Px(8.0)),
+                        border: UiRect::all(Val::Px(1.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.20)),
+                    BackgroundColor(Color::srgba(0.025, 0.028, 0.032, 0.86)),
+                ))
+                .with_children(|panel| {
+                    panel.spawn((
+                        ControlsSummaryText,
+                        Text(String::new()),
+                        TextFont {
+                            font_size: bevy::text::FontSize::Px(12.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.90, 0.92, 0.95)),
+                        Node {
+                            min_height: Val::Px(32.0),
+                            ..default()
+                        },
+                    ));
+                    spawn_control_row(
+                        panel,
+                        "model",
+                        &[
+                            (JepaControlAction::ModelTtt, "TTT"),
+                            (JepaControlAction::ModelBase, "base"),
+                        ],
+                    );
+                    spawn_control_row(
+                        panel,
+                        "resolution",
+                        &[
+                            (JepaControlAction::Resolution256, "256"),
+                            (JepaControlAction::Resolution512, "512"),
+                        ],
+                    );
+                    spawn_control_row(
+                        panel,
+                        "AnyUp",
+                        &[
+                            (JepaControlAction::AnyUpOff, "off"),
+                            (JepaControlAction::AnyUpEvery8, "1/8"),
+                            (JepaControlAction::AnyUpEvery1, "1/1"),
+                        ],
+                    );
+                    spawn_control_row(
+                        panel,
+                        "patch diff",
+                        &[
+                            (JepaControlAction::ThresholdDown, "-thr"),
+                            (JepaControlAction::ThresholdUp, "+thr"),
+                            (JepaControlAction::PatchRefresh, "refresh"),
+                        ],
+                    );
+                    spawn_control_row(
+                        panel,
+                        "refresh modes",
+                        &[
+                            (JepaControlAction::SubthresholdRefresh, "subthr"),
+                            (JepaControlAction::AgeRefresh, "age"),
+                            (JepaControlAction::BlueNoiseRefresh, "blue"),
+                        ],
+                    );
+                    spawn_control_row(
+                        panel,
+                        "subthreshold",
+                        &[
+                            (JepaControlAction::SubthresholdTriggerDown, "-trig"),
+                            (JepaControlAction::SubthresholdTriggerUp, "+trig"),
+                        ],
+                    );
+                    spawn_control_row(
+                        panel,
+                        "age frames",
+                        &[
+                            (JepaControlAction::AgeIntervalDown, "-age"),
+                            (JepaControlAction::AgeIntervalUp, "+age"),
+                        ],
+                    );
+                    spawn_control_row(
+                        panel,
+                        "blue noise",
+                        &[
+                            (JepaControlAction::BlueNoiseDensityDown, "-blue"),
+                            (JepaControlAction::BlueNoiseDensityUp, "+blue"),
+                        ],
+                    );
+                });
+        });
+}
+
+fn spawn_control_row(
+    builder: &mut ChildSpawnerCommands<'_>,
+    label: &'static str,
+    actions: &[(JepaControlAction, &'static str)],
+) {
+    builder
+        .spawn(Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(CONTROL_ROW_GAP_PX),
+            align_items: AlignItems::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text(label.to_string()),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(12.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.72, 0.75, 0.80)),
+                Node {
+                    width: Val::Px(88.0),
+                    ..default()
+                },
+            ));
+            for &(action, text) in actions {
+                spawn_control_button(row, action, text);
+            }
+        });
+}
+
+fn spawn_control_button(
+    builder: &mut ChildSpawnerCommands<'_>,
+    action: JepaControlAction,
+    text: &'static str,
+) {
+    builder
+        .spawn((
+            Button,
+            Interaction::None,
+            JepaControlButton { action },
+            Node {
+                height: Val::Px(CONTROL_BUTTON_HEIGHT_PX),
+                min_width: Val::Px(56.0),
+                padding: UiRect::horizontal(Val::Px(8.0)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.14, 0.16, 0.20)),
+        ))
+        .with_child((
+            JepaControlButtonText { action },
+            Text(text.to_string()),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(12.0),
+                ..default()
+            },
+            TextColor(Color::WHITE),
         ));
 }
 
@@ -1135,7 +1500,7 @@ fn spawn_high_res_task(
 fn spawn_admitted_jepa_task(
     config: BevyJepaConfig,
     signature: RuntimePipelineSignature,
-    pipeline: FeatureFramePipeline<JepaBevyBackend>,
+    mut pipeline: FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
     rgba: Option<&RgbaImage>,
     prev_stage_image: Option<&Tensor<JepaBevyBackend, 4>>,
@@ -1148,7 +1513,7 @@ fn spawn_admitted_jepa_task(
     camera_frame_received: bool,
     request: FeatureFrameRequest,
 ) -> Result<Task<JepaAsyncTaskOutput>> {
-    let masks = run_sparse_mask_node(
+    let masks = run_sparse_mask_node_with_refresh_state(
         &config,
         prev_stage_image,
         prev_stage_rgba,
@@ -1156,6 +1521,7 @@ fn spawn_admitted_jepa_task(
         &image,
         model_config,
         grid,
+        Some(pipeline.patch_diff_refresh_state_mut()),
     )?;
     Ok(spawn_jepa_task(
         config,
@@ -1190,7 +1556,7 @@ fn process_runtime_frame(
     let prev_rgba = runtime.prev_rgba.clone();
     let (pipeline, model_config) = runtime.ensure_pipeline(config, device)?;
     let grid = pipeline.grid();
-    let masks = run_sparse_mask_node(
+    let masks = run_sparse_mask_node_with_refresh_state(
         config,
         prev_image.as_ref(),
         prev_rgba.as_ref(),
@@ -1198,6 +1564,7 @@ fn process_runtime_frame(
         &image,
         &model_config,
         grid,
+        Some(pipeline.patch_diff_refresh_state_mut()),
     )?;
     let id = FrameId {
         stream_id: 0,
@@ -2298,16 +2665,370 @@ fn publish_wasm_metrics(metrics: &BevyJepaMetrics) {
 #[cfg(not(target_arch = "wasm32"))]
 fn publish_wasm_metrics(_metrics: &BevyJepaMetrics) {}
 
+fn control_button_interactions(
+    mut interactions: Query<
+        (&Interaction, &JepaControlButton),
+        (Changed<Interaction>, With<Button>),
+    >,
+    mut controls: ResMut<JepaControlsState>,
+    mut config: ResMut<BevyJepaConfig>,
+    mut runtime: ResMut<JepaRuntime>,
+) {
+    for (interaction, button) in &mut interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if button.action == JepaControlAction::TogglePanel {
+            controls.expanded = !controls.expanded;
+            continue;
+        }
+        match apply_control_action(&mut config, button.action) {
+            JepaControlReset::None => {}
+            JepaControlReset::Visual => runtime.reset_visual_state(),
+            JepaControlReset::Rebuild => runtime.rebuild_pipeline_state(),
+        }
+    }
+}
+
+fn update_controls_ui(
+    config: Res<BevyJepaConfig>,
+    controls: Res<JepaControlsState>,
+    mut panels: Query<&mut Node, With<ControlsPanel>>,
+    mut summaries: Query<&mut Text, With<ControlsSummaryText>>,
+    mut buttons: Query<(&JepaControlButton, &Interaction, &mut BackgroundColor), With<Button>>,
+    mut labels: Query<(&JepaControlButtonText, &mut Text)>,
+) {
+    for mut panel in &mut panels {
+        panel.display = if controls.expanded {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    let summary = controls_summary(&config);
+    for mut text in &mut summaries {
+        **text = summary.clone();
+    }
+    for (button, interaction, mut color) in &mut buttons {
+        *color = BackgroundColor(control_button_color(
+            button.action,
+            control_button_active(&config, button.action, &controls),
+            *interaction,
+        ));
+    }
+    for (label, mut text) in &mut labels {
+        **text = control_button_label(&config, label.action).to_string();
+    }
+}
+
+fn update_panel_layout(
+    config: Res<BevyJepaConfig>,
+    texture: Res<JepaPanelTextures>,
+    mut nodes: ParamSet<(
+        Query<&mut Node>,
+        Query<&mut Node, With<HighResPanelElement>>,
+    )>,
+) {
+    let visible_count = visible_panel_count(&config);
+    if let Some(root) = texture.root_entity
+        && let Ok(mut node) = nodes.p0().get_mut(root)
+    {
+        node.grid_template_columns = RepeatedGridTrack::flex(visible_count as u16, 1.0);
+    }
+    let high_res_display = if high_res_panel_enabled(&config) {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    let mut high_res_nodes = nodes.p1();
+    for mut node in &mut high_res_nodes {
+        node.display = high_res_display;
+    }
+}
+
+fn apply_control_action(
+    config: &mut BevyJepaConfig,
+    action: JepaControlAction,
+) -> JepaControlReset {
+    match action {
+        JepaControlAction::TogglePanel => JepaControlReset::None,
+        JepaControlAction::ModelTtt => {
+            set_model_profile(config, BevyJepaModelPackageProfile::Vjepa21Ttt);
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::ModelBase => {
+            set_model_profile(config, BevyJepaModelPackageProfile::Vjepa21Base);
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::Resolution256 => {
+            config.image_size = 256;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::Resolution512 => {
+            config.image_size = 512;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::AnyUpOff => {
+            config.high_res_pca_every = 0;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::AnyUpEvery8 => {
+            config.high_res_pca_every = 8;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::AnyUpEvery1 => {
+            config.high_res_pca_every = 1;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::PatchRefresh => {
+            config.patch_diff_refresh.enabled = !config.patch_diff_refresh.enabled;
+            JepaControlReset::Visual
+        }
+        JepaControlAction::SubthresholdRefresh => {
+            config.patch_diff_refresh.subthreshold_enabled =
+                !config.patch_diff_refresh.subthreshold_enabled;
+            JepaControlReset::Visual
+        }
+        JepaControlAction::AgeRefresh => {
+            config.patch_diff_refresh.age_refresh_enabled =
+                !config.patch_diff_refresh.age_refresh_enabled;
+            JepaControlReset::Visual
+        }
+        JepaControlAction::BlueNoiseRefresh => {
+            config.patch_diff_refresh.blue_noise_enabled =
+                !config.patch_diff_refresh.blue_noise_enabled;
+            JepaControlReset::Visual
+        }
+        JepaControlAction::ThresholdDown => {
+            config.patch_diff_threshold =
+                quantize_control_value(config.patch_diff_threshold - PATCH_DIFF_THRESHOLD_STEP);
+            JepaControlReset::Visual
+        }
+        JepaControlAction::ThresholdUp => {
+            config.patch_diff_threshold =
+                quantize_control_value(config.patch_diff_threshold + PATCH_DIFF_THRESHOLD_STEP);
+            JepaControlReset::Visual
+        }
+        JepaControlAction::SubthresholdTriggerDown => {
+            config.patch_diff_refresh.subthreshold_trigger =
+                (config.patch_diff_refresh.subthreshold_trigger
+                    - PATCH_DIFF_SUBTHRESHOLD_TRIGGER_STEP)
+                    .max(PATCH_DIFF_SUBTHRESHOLD_TRIGGER_STEP);
+            JepaControlReset::Visual
+        }
+        JepaControlAction::SubthresholdTriggerUp => {
+            config.patch_diff_refresh.subthreshold_trigger += PATCH_DIFF_SUBTHRESHOLD_TRIGGER_STEP;
+            JepaControlReset::Visual
+        }
+        JepaControlAction::AgeIntervalDown => {
+            config.patch_diff_refresh.age_refresh_interval_frames = config
+                .patch_diff_refresh
+                .age_refresh_interval_frames
+                .saturating_sub(PATCH_DIFF_AGE_INTERVAL_STEP)
+                .max(1);
+            JepaControlReset::Visual
+        }
+        JepaControlAction::AgeIntervalUp => {
+            config.patch_diff_refresh.age_refresh_interval_frames = config
+                .patch_diff_refresh
+                .age_refresh_interval_frames
+                .saturating_add(PATCH_DIFF_AGE_INTERVAL_STEP);
+            JepaControlReset::Visual
+        }
+        JepaControlAction::BlueNoiseDensityDown => {
+            config.patch_diff_refresh.blue_noise_refresh_density = quantize_control_value(
+                config.patch_diff_refresh.blue_noise_refresh_density
+                    - PATCH_DIFF_BLUE_NOISE_DENSITY_STEP,
+            );
+            JepaControlReset::Visual
+        }
+        JepaControlAction::BlueNoiseDensityUp => {
+            config.patch_diff_refresh.blue_noise_refresh_density = quantize_control_value(
+                config.patch_diff_refresh.blue_noise_refresh_density
+                    + PATCH_DIFF_BLUE_NOISE_DENSITY_STEP,
+            );
+            JepaControlReset::Visual
+        }
+    }
+}
+
+fn set_model_profile(config: &mut BevyJepaConfig, profile: BevyJepaModelPackageProfile) {
+    config.model_profile = profile;
+    config.model_base_url = burn_jepa::burn_jepa_model_profile_base_url(profile);
+    config.model_manifest_path = None;
+    config.ttt_model_path = None;
+    match profile {
+        BevyJepaModelPackageProfile::Vjepa21Base => {
+            config.encoder_source = BevyJepaEncoderSource::BaseCheckpoint;
+        }
+        BevyJepaModelPackageProfile::Vjepa21Ttt => {
+            config.encoder_source = BevyJepaEncoderSource::TrainedTtt;
+        }
+    }
+}
+
+fn quantize_control_value(value: f32) -> f32 {
+    ((value.clamp(0.0, 1.0) * 1000.0).round() / 1000.0).clamp(0.0, 1.0)
+}
+
+fn controls_summary(config: &BevyJepaConfig) -> String {
+    format!(
+        "{} | {}px | q {:>4.1}% / thr {:.3} | refresh {} sub {} age {} blue {} | AnyUp {}",
+        config.model_profile,
+        config.pipeline_image_size(),
+        config.patch_diff_quality() * 100.0,
+        config.patch_diff_threshold,
+        on_off(config.patch_diff_refresh.enabled),
+        on_off(config.patch_diff_refresh.subthreshold_enabled),
+        on_off(config.patch_diff_refresh.age_refresh_enabled),
+        on_off(config.patch_diff_refresh.blue_noise_enabled),
+        if config.high_res_pca_every == 0 {
+            "off".to_string()
+        } else {
+            format!("1/{}", config.high_res_pca_every)
+        }
+    )
+}
+
+fn control_button_label(config: &BevyJepaConfig, action: JepaControlAction) -> String {
+    match action {
+        JepaControlAction::TogglePanel => "controls".to_string(),
+        JepaControlAction::ThresholdDown => format!("-thr {:.3}", config.patch_diff_threshold),
+        JepaControlAction::ThresholdUp => format!("+thr {:.3}", config.patch_diff_threshold),
+        JepaControlAction::SubthresholdTriggerDown => {
+            format!(
+                "-trig {:.1}",
+                config.patch_diff_refresh.subthreshold_trigger
+            )
+        }
+        JepaControlAction::SubthresholdTriggerUp => {
+            format!(
+                "+trig {:.1}",
+                config.patch_diff_refresh.subthreshold_trigger
+            )
+        }
+        JepaControlAction::AgeIntervalDown => {
+            format!(
+                "-age {}",
+                config.patch_diff_refresh.age_refresh_interval_frames
+            )
+        }
+        JepaControlAction::AgeIntervalUp => {
+            format!(
+                "+age {}",
+                config.patch_diff_refresh.age_refresh_interval_frames
+            )
+        }
+        JepaControlAction::BlueNoiseDensityDown => {
+            format!(
+                "-blue {:.1}%",
+                config.patch_diff_refresh.blue_noise_refresh_density * 100.0
+            )
+        }
+        JepaControlAction::BlueNoiseDensityUp => {
+            format!(
+                "+blue {:.1}%",
+                config.patch_diff_refresh.blue_noise_refresh_density * 100.0
+            )
+        }
+        JepaControlAction::PatchRefresh => {
+            format!("refresh {}", on_off(config.patch_diff_refresh.enabled))
+        }
+        JepaControlAction::SubthresholdRefresh => {
+            format!(
+                "subthr {}",
+                on_off(config.patch_diff_refresh.subthreshold_enabled)
+            )
+        }
+        JepaControlAction::AgeRefresh => {
+            format!(
+                "age {}",
+                on_off(config.patch_diff_refresh.age_refresh_enabled)
+            )
+        }
+        JepaControlAction::BlueNoiseRefresh => {
+            format!(
+                "blue {}",
+                on_off(config.patch_diff_refresh.blue_noise_enabled)
+            )
+        }
+        JepaControlAction::ModelTtt => "TTT".to_string(),
+        JepaControlAction::ModelBase => "base".to_string(),
+        JepaControlAction::Resolution256 => "256".to_string(),
+        JepaControlAction::Resolution512 => "512".to_string(),
+        JepaControlAction::AnyUpOff => "off".to_string(),
+        JepaControlAction::AnyUpEvery8 => "1/8".to_string(),
+        JepaControlAction::AnyUpEvery1 => "1/1".to_string(),
+    }
+}
+
+fn control_button_active(
+    config: &BevyJepaConfig,
+    action: JepaControlAction,
+    controls: &JepaControlsState,
+) -> bool {
+    match action {
+        JepaControlAction::TogglePanel => controls.expanded,
+        JepaControlAction::ModelTtt => {
+            config.model_profile == BevyJepaModelPackageProfile::Vjepa21Ttt
+                && config.encoder_source == BevyJepaEncoderSource::TrainedTtt
+        }
+        JepaControlAction::ModelBase => {
+            config.model_profile == BevyJepaModelPackageProfile::Vjepa21Base
+                || config.encoder_source == BevyJepaEncoderSource::BaseCheckpoint
+        }
+        JepaControlAction::Resolution256 => config.pipeline_image_size() == 256,
+        JepaControlAction::Resolution512 => config.pipeline_image_size() == 512,
+        JepaControlAction::AnyUpOff => config.high_res_pca_every == 0,
+        JepaControlAction::AnyUpEvery8 => config.high_res_pca_every == 8,
+        JepaControlAction::AnyUpEvery1 => config.high_res_pca_every == 1,
+        JepaControlAction::PatchRefresh => config.patch_diff_refresh.enabled,
+        JepaControlAction::SubthresholdRefresh => config.patch_diff_refresh.subthreshold_enabled,
+        JepaControlAction::AgeRefresh => config.patch_diff_refresh.age_refresh_enabled,
+        JepaControlAction::BlueNoiseRefresh => config.patch_diff_refresh.blue_noise_enabled,
+        _ => false,
+    }
+}
+
+fn control_button_color(
+    action: JepaControlAction,
+    active: bool,
+    interaction: Interaction,
+) -> Color {
+    if interaction == Interaction::Pressed {
+        return Color::srgb(0.20, 0.30, 0.42);
+    }
+    if active {
+        return Color::srgb(0.13, 0.30, 0.22);
+    }
+    if interaction == Interaction::Hovered {
+        return Color::srgb(0.20, 0.23, 0.28);
+    }
+    if action == JepaControlAction::TogglePanel {
+        Color::srgb(0.16, 0.18, 0.23)
+    } else {
+        Color::srgb(0.11, 0.13, 0.17)
+    }
+}
+
+const fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
+}
+
 fn keyboard_controls(
     mut config: ResMut<BevyJepaConfig>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut runtime: ResMut<JepaRuntime>,
+    mut controls: ResMut<JepaControlsState>,
 ) {
+    if keyboard.just_pressed(KeyCode::KeyC) {
+        controls.expanded = !controls.expanded;
+    }
     if keyboard.just_pressed(KeyCode::Space) {
         let next = config.mask_source.next();
         if next != config.mask_source {
             config.mask_source = next;
-            runtime.prev_image = None;
+            runtime.reset_visual_state();
         }
     }
 }
@@ -2334,7 +3055,8 @@ fn fit_visualization_node(
     };
     let available_width = window.resolution.width().max(1.0);
     let available_height = (window.resolution.height().max(1.0) - reserved_top).max(1.0);
-    let source_aspect = (texture.width.max(1) as f32 / texture.height.max(1) as f32) * 4.0;
+    let source_aspect = (texture.width.max(1) as f32 / texture.height.max(1) as f32)
+        * visible_panel_count(&config) as f32;
     let available_image_height = (available_height - PANEL_LABEL_ROW_HEIGHT).max(1.0);
     let window_aspect = available_width / available_image_height;
     let (display_width, display_height) = if window_aspect > source_aspect {
@@ -2363,6 +3085,63 @@ fn spawn_panel_image(builder: &mut ChildSpawnerCommands<'_>, image: Handle<Image
             },
         ))
         .id()
+}
+
+fn spawn_high_res_panel_image(
+    builder: &mut ChildSpawnerCommands<'_>,
+    image: Handle<Image>,
+    visible: bool,
+) -> Entity {
+    let display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    builder
+        .spawn((
+            HighResPanelElement,
+            ImageNode::new(image).with_mode(NodeImageMode::Stretch),
+            Node {
+                display,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                grid_row: GridPlacement::start(2),
+                ..default()
+            },
+        ))
+        .id()
+}
+
+fn spawn_panel_label(
+    builder: &mut ChildSpawnerCommands<'_>,
+    label: &'static str,
+    high_res: bool,
+    visible: bool,
+) {
+    let display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    let mut entity = builder.spawn((
+        Text(label.to_string()),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(20.0),
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Node {
+            display,
+            grid_row: GridPlacement::start(1),
+            align_self: AlignSelf::Center,
+            justify_self: JustifySelf::Center,
+            padding: UiRect::horizontal(Val::Px(8.0)),
+            ..default()
+        },
+    ));
+    if high_res {
+        entity.insert(HighResPanelElement);
+    }
 }
 
 fn empty_panel_image(width: u32, height: u32) -> Image {

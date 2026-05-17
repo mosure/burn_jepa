@@ -270,6 +270,7 @@ pub struct FeaturePcaProjector<B: Backend> {
     mean: Tensor<B, 3>,
     display_center: Tensor<B, 3>,
     display_spread: Tensor<B, 3>,
+    display_stats_initialized: bool,
 }
 
 impl<B: Backend> FeaturePcaProjector<B> {
@@ -292,6 +293,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
             mean: Tensor::<B, 3>::zeros([1, 1, feature_dim], device),
             display_center: Tensor::<B, 3>::zeros([1, 1, config.output_channels], device),
             display_spread: Tensor::<B, 3>::ones([1, 1, config.output_channels], device),
+            display_stats_initialized: false,
             config,
             feature_dim,
         })
@@ -320,6 +322,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
         Ok(Self {
             display_center: Tensor::<B, 3>::zeros([1, 1, output_channels], &components.device()),
             display_spread: Tensor::<B, 3>::ones([1, 1, output_channels], &components.device()),
+            display_stats_initialized: false,
             config,
             feature_dim,
             components,
@@ -633,16 +636,22 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .sqrt()
             .add_scalar(self.config.display_std_floor);
 
-        self.display_center = self
-            .display_center
-            .clone()
-            .mul_scalar(1.0 - self.config.display_momentum)
-            + center.mul_scalar(self.config.display_momentum);
-        self.display_spread = self
-            .display_spread
-            .clone()
-            .mul_scalar(1.0 - self.config.display_momentum)
-            + spread.mul_scalar(self.config.display_momentum);
+        if self.display_stats_initialized {
+            self.display_center = self
+                .display_center
+                .clone()
+                .mul_scalar(1.0 - self.config.display_momentum)
+                + center.mul_scalar(self.config.display_momentum);
+            self.display_spread = self
+                .display_spread
+                .clone()
+                .mul_scalar(1.0 - self.config.display_momentum)
+                + spread.mul_scalar(self.config.display_momentum);
+        } else {
+            self.display_center = center;
+            self.display_spread = spread;
+            self.display_stats_initialized = true;
+        }
         Ok(())
     }
 

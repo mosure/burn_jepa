@@ -13,11 +13,9 @@ use burn_jepa::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_jepa::{
-    BurnJepaModelBootstrapConfig, DEFAULT_BURN_JEPA_MODEL_BASE_URL, TttBackpropMode,
-    TttEncoderConfig, TttLayerPlacement, TttMemoryUpdateSource, TttSupervisionMode,
-    VJepaLoadOptions, VJepaTttModel, load_config_from_hf_dir,
-    resolve_or_bootstrap_burn_jepa_model_package,
-    resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress,
+    BurnJepaModelBootstrapConfig, TttBackpropMode, TttEncoderConfig, TttLayerPlacement,
+    TttMemoryUpdateSource, TttSupervisionMode, VJepaLoadOptions, VJepaTttModel,
+    load_config_from_hf_dir, resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress,
 };
 use burn_jepa::{
     BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, load_ttt_burnpack_parts,
@@ -306,31 +304,33 @@ pub(super) fn effective_model_manifest_path(config: &BevyJepaConfig) -> Result<O
         }
     }
 
-    for path in [PathBuf::from(crate::DEFAULT_MODEL_MANIFEST_PATH)] {
+    let mut local_manifest_paths = vec![crate::default_model_manifest_path_for_profile(
+        config.model_profile,
+    )];
+    if config.model_profile == burn_jepa::BurnJepaModelProfile::default() {
+        local_manifest_paths.push(PathBuf::from("target/burn-jepa-web/model/manifest.json"));
+    }
+    for path in local_manifest_paths {
         let path = resolve_repo_relative_path(path);
         if path.exists() {
             return Ok(Some(path));
         }
     }
     if config.model_auto_download && env_model_download_enabled() {
-        let package = if config.model_cache_dir.is_none()
-            && config.model_base_url == DEFAULT_BURN_JEPA_MODEL_BASE_URL
-        {
-            resolve_or_bootstrap_burn_jepa_model_package()
-        } else {
-            let bootstrap = BurnJepaModelBootstrapConfig {
-                cache_root: config
-                    .model_cache_dir
-                    .clone()
-                    .map(resolve_repo_relative_path),
-                model_base_url: config.model_base_url.clone(),
-                manifest_url: env::var("BURN_JEPA_MODEL_MANIFEST_URL").ok(),
-            };
-            resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress(
-                &bootstrap,
-                |message| log(&format!("bevy_jepa: {message}")),
-            )
-        }?;
+        let bootstrap = BurnJepaModelBootstrapConfig {
+            cache_root: config
+                .model_cache_dir
+                .clone()
+                .map(resolve_repo_relative_path),
+            model_profile: config.model_profile,
+            model_base_url: config.model_base_url.clone(),
+            manifest_url: env::var("BURN_JEPA_MODEL_MANIFEST_URL").ok(),
+        }
+        .with_env_overrides();
+        let package = resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress(
+            &bootstrap,
+            |message| log(&format!("bevy_jepa: {message}")),
+        )?;
         return Ok(Some(package.manifest_path));
     }
     Ok(None)

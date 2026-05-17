@@ -1,11 +1,10 @@
 use anyhow::{Result, bail};
 use burn::tensor::Tensor;
 use burn_jepa::{
-    FeatureFrameSparseMasks, SparseTokenMask, TokenGridShape, VJepaConfig, center_prior_mask,
-    finalize_patch_diff_masks, patch_diff_can_use_dense_fast_path,
-    patch_diff_context_mask_from_scores, patch_diff_context_mask_from_video,
-    patch_diff_sampled_dense_fast_path_from_rgba, patch_diff_scores_from_rgba,
-    patch_diff_sparsity_config,
+    FeatureFrameSparseMasks, PatchDiffRefreshState, SparseTokenMask, TokenGridShape, VJepaConfig,
+    center_prior_mask, finalize_patch_diff_masks, patch_diff_can_use_dense_fast_path,
+    patch_diff_context_mask_from_video, patch_diff_sampled_dense_fast_path_from_rgba,
+    patch_diff_scores_from_rgba, patch_diff_sparsity_config,
 };
 use image::RgbaImage;
 
@@ -13,6 +12,7 @@ use crate::{BevyJepaConfig, BevyJepaMaskSource, JepaBevyBackend};
 
 pub(super) type SparseMaskNodeOutput = FeatureFrameSparseMasks;
 
+#[cfg(test)]
 pub(super) fn run_sparse_mask_node(
     config: &BevyJepaConfig,
     prev_image: Option<&Tensor<JepaBevyBackend, 4>>,
@@ -21,6 +21,28 @@ pub(super) fn run_sparse_mask_node(
     image: &Tensor<JepaBevyBackend, 4>,
     model_config: &VJepaConfig,
     grid: TokenGridShape,
+) -> Result<SparseMaskNodeOutput> {
+    run_sparse_mask_node_with_refresh_state(
+        config,
+        prev_image,
+        prev_rgba,
+        rgba,
+        image,
+        model_config,
+        grid,
+        None,
+    )
+}
+
+pub(super) fn run_sparse_mask_node_with_refresh_state(
+    config: &BevyJepaConfig,
+    prev_image: Option<&Tensor<JepaBevyBackend, 4>>,
+    prev_rgba: Option<&RgbaImage>,
+    rgba: Option<&RgbaImage>,
+    image: &Tensor<JepaBevyBackend, 4>,
+    model_config: &VJepaConfig,
+    grid: TokenGridShape,
+    refresh_state: Option<&mut PatchDiffRefreshState>,
 ) -> Result<SparseMaskNodeOutput> {
     match config.mask_source {
         BevyJepaMaskSource::Autogaze => bail!(
@@ -36,6 +58,7 @@ pub(super) fn run_sparse_mask_node(
             model_config,
             grid,
             config,
+            refresh_state,
         ),
     }
 }
@@ -48,13 +71,23 @@ fn patch_diff_mask(
     model_config: &VJepaConfig,
     grid: TokenGridShape,
     config: &BevyJepaConfig,
+    refresh_state: Option<&mut PatchDiffRefreshState>,
 ) -> Result<SparseMaskNodeOutput> {
     let Some(prev_image) = prev_image else {
         let mask = center_prior_mask(grid, config.bootstrap_context_tokens(grid.len()))?;
-        return Ok(finalize_patch_diff_masks(mask, grid, config));
+        let masks = finalize_patch_diff_masks(mask, grid, config);
+        observe_patch_diff_write(refresh_state, &masks, grid);
+        return Ok(masks);
     };
     if let (Some(prev_rgba), Some(rgba)) = (prev_rgba, rgba) {
-        return patch_diff_mask_from_rgba(prev_rgba, rgba, model_config, grid, config);
+        return patch_diff_mask_from_rgba(
+            prev_rgba,
+            rgba,
+            model_config,
+            grid,
+            config,
+            refresh_state,
+        );
     }
     let video = Tensor::cat(
         vec![
@@ -77,12 +110,14 @@ fn patch_diff_mask(
     );
     let sparsity = patch_diff_sparsity_config(config, grid);
     if patch_diff_can_use_dense_fast_path(&sparsity, grid) {
-        return Ok(FeatureFrameSparseMasks::same(SparseTokenMask::all(
-            grid.len(),
-        )));
+        let masks = FeatureFrameSparseMasks::same(SparseTokenMask::all(grid.len()));
+        observe_patch_diff_write(refresh_state, &masks, grid);
+        return Ok(masks);
     }
     let mask = patch_diff_context_mask_from_video(&video, model_config, grid, &sparsity)?;
-    Ok(finalize_patch_diff_masks(mask, grid, config))
+    let masks = finalize_patch_diff_masks(mask, grid, config);
+    observe_patch_diff_write(refresh_state, &masks, grid);
+    Ok(masks)
 }
 
 fn patch_diff_mask_from_rgba(
@@ -91,6 +126,7 @@ fn patch_diff_mask_from_rgba(
     model_config: &VJepaConfig,
     grid: TokenGridShape,
     config: &BevyJepaConfig,
+    refresh_state: Option<&mut PatchDiffRefreshState>,
 ) -> Result<SparseMaskNodeOutput> {
     anyhow::ensure!(
         grid.depth == 1,
@@ -111,9 +147,9 @@ fn patch_diff_mask_from_rgba(
     let current = current.as_raw();
     let sparsity = patch_diff_sparsity_config(config, grid);
     if patch_diff_can_use_dense_fast_path(&sparsity, grid) {
-        return Ok(FeatureFrameSparseMasks::same(SparseTokenMask::all(
-            grid.len(),
-        )));
+        let masks = FeatureFrameSparseMasks::same(SparseTokenMask::all(grid.len()));
+        observe_patch_diff_write(refresh_state, &masks, grid);
+        return Ok(masks);
     }
     if patch_diff_sampled_dense_fast_path_from_rgba(
         prev,
@@ -124,11 +160,25 @@ fn patch_diff_mask_from_rgba(
         &sparsity,
         config.patch_diff_dense_fallback_density,
     ) {
-        return Ok(FeatureFrameSparseMasks::same(SparseTokenMask::all(
-            grid.len(),
-        )));
+        let masks = FeatureFrameSparseMasks::same(SparseTokenMask::all(grid.len()));
+        observe_patch_diff_write(refresh_state, &masks, grid);
+        return Ok(masks);
     }
     let scores = patch_diff_scores_from_rgba(prev, current, width, patch_size, grid)?;
-    let mask = patch_diff_context_mask_from_scores(scores, grid, &sparsity)?;
-    Ok(finalize_patch_diff_masks(mask, grid, config))
+    if let Some(refresh_state) = refresh_state {
+        refresh_state.masks_from_scores(scores, grid, &sparsity, config)
+    } else {
+        let mask = burn_jepa::patch_diff_context_mask_from_scores(scores, grid, &sparsity)?;
+        Ok(finalize_patch_diff_masks(mask, grid, config))
+    }
+}
+
+fn observe_patch_diff_write(
+    refresh_state: Option<&mut PatchDiffRefreshState>,
+    masks: &FeatureFrameSparseMasks,
+    grid: TokenGridShape,
+) {
+    if let Some(refresh_state) = refresh_state {
+        refresh_state.observe_write_mask(&masks.write_mask, grid);
+    }
 }

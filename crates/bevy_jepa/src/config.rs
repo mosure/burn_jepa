@@ -6,33 +6,48 @@ use std::{
 };
 
 use bevy::prelude::Resource;
-use burn_jepa::{AnyUpAttentionMode, FeatureFrameEncodeRoute, FeatureFrameSparseEncodeMode};
+use burn_jepa::{
+    AnyUpAttentionMode, BurnJepaModelProfile, FeatureFrameEncodeRoute, FeatureFrameSparseEncodeMode,
+};
 use serde::{Deserialize, Serialize};
 
 pub use burn_jepa::{
     DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CONTEXT_DENSITY,
     DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE, DEFAULT_MIN_CONTEXT_DENSITY,
-    DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY, DEFAULT_PATCH_DIFF_QUALITY,
+    DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES, DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
+    DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
+    DEFAULT_PATCH_DIFF_QUALITY, DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
+    DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
+    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
     DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES,
     DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
     DEFAULT_SPARSE_MASK_BUCKET_TOKENS, FeatureFrameViewerConfig, MIN_PIPELINE_IMAGE_SIZE,
-    PIPELINE_IMAGE_SIZE_MULTIPLE,
+    PIPELINE_IMAGE_SIZE_MULTIPLE, PatchDiffRefreshConfig,
 };
 pub const DEFAULT_ANYUP_CHECKPOINT_PATH: &str =
     "target/burn-anyup-checkpoints/anyup_multi_backbone.pth";
 pub const DEFAULT_CAMERA_WIDTH: u32 = 640;
 pub const DEFAULT_CAMERA_HEIGHT: u32 = 360;
 pub const DEFAULT_CAMERA_FPS: u32 = 30;
-pub const DEFAULT_MODEL_MANIFEST_PATH: &str = "target/burn-jepa-web/model/manifest.json";
+pub const DEFAULT_MODEL_PACKAGE_DIR: &str = "target/burn-jepa-web/model";
+pub const DEFAULT_MODEL_MANIFEST_PATH: &str =
+    "target/burn-jepa-web/model/vjepa2_1_ttt/manifest.json";
 pub const DEFAULT_TTT_MODEL_PATH: &str =
-    "target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk";
+    "target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk";
 pub const DEFAULT_VJEPA21_CHECKPOINT_DIR: &str = "~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384";
 pub const DEFAULT_VJEPA21_CONFIG_PATH: &str =
     "~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json";
 pub const DEFAULT_VJEPA21_WEIGHTS_NAME: &str = "model.pt";
 
 pub type BevyJepaEncodePath = FeatureFrameEncodeRoute;
+pub type BevyJepaModelPackageProfile = BurnJepaModelProfile;
 pub type BevyJepaSparseEncodeMode = FeatureFrameSparseEncodeMode;
+
+pub fn default_model_manifest_path_for_profile(profile: BevyJepaModelPackageProfile) -> PathBuf {
+    PathBuf::from(DEFAULT_MODEL_PACKAGE_DIR)
+        .join(profile.as_str())
+        .join("manifest.json")
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +255,7 @@ pub struct BevyJepaConfig {
     pub encoder_source: BevyJepaEncoderSource,
     pub model_manifest_path: Option<PathBuf>,
     pub model_cache_dir: Option<PathBuf>,
+    pub model_profile: BevyJepaModelPackageProfile,
     pub model_base_url: String,
     pub model_auto_download: bool,
     pub ttt_model_path: Option<PathBuf>,
@@ -266,7 +282,10 @@ impl Default for BevyJepaConfig {
             encoder_source: BevyJepaEncoderSource::TrainedTtt,
             model_manifest_path: None,
             model_cache_dir: None,
-            model_base_url: burn_jepa::DEFAULT_BURN_JEPA_MODEL_BASE_URL.to_string(),
+            model_profile: BevyJepaModelPackageProfile::default(),
+            model_base_url: burn_jepa::burn_jepa_model_profile_base_url(
+                BevyJepaModelPackageProfile::default(),
+            ),
             model_auto_download: true,
             ttt_model_path: None,
             jepa_checkpoint_dir: Some(PathBuf::from(DEFAULT_VJEPA21_CHECKPOINT_DIR)),

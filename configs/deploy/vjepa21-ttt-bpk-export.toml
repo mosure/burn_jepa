@@ -1,0 +1,29 @@
+[model]
+checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
+teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
+ttt_checkpoint_path = "target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk"
+config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
+weights_name = "model.pt"
+output_dir = "target/burn-jepa-web/model/vjepa2_1_ttt"
+save_model = false
+
+[ttt]
+layer_placement = "explicit"
+layers = [3, 7, 11]
+predictor_layers = []
+chunk_tokens = 196
+ttt_lr = 0.003
+use_projection = true
+conv_kernel = 3
+memory_update = "self_hidden"
+supervision = "final_teacher"
+hybrid_final_steps = 1
+rollout_blocks = 2
+backprop_mode = "final_feature"
+backprop_truncate_blocks = 1
+freeze_pretrained = true
+
+[training]
+backend = "nd_array"
+max_steps = 1
+batch_size = 1

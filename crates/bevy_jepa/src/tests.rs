@@ -1,8 +1,8 @@
 use super::*;
 use burn_jepa::{
     AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest,
-    FeatureFrameJepaEncoder, FeatureFrameJepaEncoderKind, TttEncoderConfig, VJepa2_1Model,
-    VJepaTttModel, coords_to_token_index, write_burnpack_parts_for_browser,
+    FeatureFrameJepaEncoder, FeatureFrameJepaEncoderKind, PatchDiffRefreshState, TttEncoderConfig,
+    VJepa2_1Model, VJepaTttModel, coords_to_token_index, write_burnpack_parts_for_browser,
     write_pipeline_package_manifest,
 };
 
@@ -57,13 +57,21 @@ fn default_mask_source_is_patch_diff() {
         BevyJepaConfig::default().mask_source,
         BevyJepaMaskSource::PatchDiff
     );
-    assert!(DEFAULT_MODEL_MANIFEST_PATH.ends_with("manifest.json"));
-    assert!(DEFAULT_TTT_MODEL_PATH.contains("burn-jepa-production-final-256"));
+    assert!(DEFAULT_MODEL_MANIFEST_PATH.ends_with("vjepa2_1_ttt/manifest.json"));
+    assert_eq!(
+        default_model_manifest_path_for_profile(BevyJepaModelPackageProfile::Vjepa21Base),
+        std::path::PathBuf::from("target/burn-jepa-web/model/vjepa2_1_base/manifest.json")
+    );
+    assert!(DEFAULT_TTT_MODEL_PATH.contains("burn-jepa-production-final"));
     assert!(BevyJepaConfig::default().model_manifest_path.is_none());
     assert!(BevyJepaConfig::default().model_cache_dir.is_none());
     assert_eq!(
+        BevyJepaConfig::default().model_profile,
+        BevyJepaModelPackageProfile::Vjepa21Ttt
+    );
+    assert_eq!(
         BevyJepaConfig::default().model_base_url,
-        burn_jepa::DEFAULT_BURN_JEPA_MODEL_BASE_URL
+        burn_jepa::burn_jepa_model_profile_base_url(BevyJepaModelPackageProfile::Vjepa21Ttt)
     );
     assert!(BevyJepaConfig::default().model_auto_download);
     assert!(BevyJepaConfig::default().ttt_model_path.is_none());
@@ -144,6 +152,116 @@ fn default_mask_source_is_patch_diff() {
         BevyJepaMaskSource::PatchDiff.next(),
         BevyJepaMaskSource::PatchDiff
     );
+}
+
+#[test]
+fn anyup_panel_visibility_follows_high_res_cadence() {
+    let mut config = BevyJepaConfig::default();
+    config.high_res_pca_every = 0;
+    assert!(!high_res_panel_enabled(&config));
+    assert_eq!(visible_panel_count(&config), 3);
+
+    config.high_res_pca_every = 8;
+    assert!(high_res_panel_enabled(&config));
+    assert_eq!(visible_panel_count(&config), 4);
+}
+
+#[test]
+fn control_actions_switch_model_profiles_and_resolution() {
+    let mut config = BevyJepaConfig::default();
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::ModelBase),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.encoder_source, BevyJepaEncoderSource::BaseCheckpoint);
+    assert_eq!(
+        config.model_profile,
+        BevyJepaModelPackageProfile::Vjepa21Base
+    );
+    assert!(config.model_manifest_path.is_none());
+    assert!(config.ttt_model_path.is_none());
+    assert!(config.model_base_url.ends_with("/vjepa2_1_base"));
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::ModelTtt),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.encoder_source, BevyJepaEncoderSource::TrainedTtt);
+    assert_eq!(
+        config.model_profile,
+        BevyJepaModelPackageProfile::Vjepa21Ttt
+    );
+    assert!(config.model_base_url.ends_with("/vjepa2_1_ttt"));
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::Resolution256),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.pipeline_image_size(), 256);
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::Resolution512),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.pipeline_image_size(), 512);
+}
+
+#[test]
+fn control_actions_update_patch_diff_refresh_without_model_rebuild() {
+    let mut config = BevyJepaConfig::default();
+    let threshold = config.patch_diff_threshold;
+    let subthreshold = config.patch_diff_refresh.subthreshold_enabled;
+    let age = config.patch_diff_refresh.age_refresh_enabled;
+    let blue = config.patch_diff_refresh.blue_noise_enabled;
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::ThresholdUp),
+        JepaControlReset::Visual
+    );
+    assert!(config.patch_diff_threshold > threshold);
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::ThresholdDown),
+        JepaControlReset::Visual
+    );
+    assert!((config.patch_diff_threshold - threshold).abs() <= 1.0e-6);
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::SubthresholdRefresh),
+        JepaControlReset::Visual
+    );
+    assert_eq!(
+        config.patch_diff_refresh.subthreshold_enabled,
+        !subthreshold
+    );
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::AgeRefresh),
+        JepaControlReset::Visual
+    );
+    assert_eq!(config.patch_diff_refresh.age_refresh_enabled, !age);
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::BlueNoiseRefresh),
+        JepaControlReset::Visual
+    );
+    assert_eq!(config.patch_diff_refresh.blue_noise_enabled, !blue);
+}
+
+#[test]
+fn control_actions_toggle_anyup_panel_cadence() {
+    let mut config = BevyJepaConfig::default();
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::AnyUpEvery8),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.high_res_pca_every, 8);
+    assert_eq!(visible_panel_count(&config), 4);
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::AnyUpOff),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.high_res_pca_every, 0);
+    assert_eq!(visible_panel_count(&config), 3);
 }
 
 #[test]
@@ -570,6 +688,83 @@ fn low_res_display_resize_preserves_patch_grid_colors() {
 }
 
 #[test]
+fn low_res_pca_panel_uses_multiple_rgb_colors_after_default_warmup() {
+    let device = JepaBevyDevice::default();
+    let image_size = 32;
+    let config = BevyJepaConfig {
+        source: BevyJepaFrameSource::SyntheticLocalMotion,
+        display_transfer: BevyJepaDisplayTransfer::Cpu,
+        ..tiny_viewer_config()
+    };
+    let model_config = tiny_viewer_model_config(image_size);
+    let jepa = VJepa2_1Model::<JepaBevyBackend>::new(&model_config, &device);
+    let mut anyup_config = AnyUpConfig::tiny_for_tests();
+    anyup_config.input_dim = 3;
+    let anyup = AnyUp::<JepaBevyBackend>::new(anyup_config, &device).expect("AnyUp");
+    let mut pipeline = FeatureFramePipeline::<JepaBevyBackend>::new(
+        jepa,
+        anyup,
+        &model_config,
+        FeatureFramePipelineConfig {
+            pca_update: config.pca_update_config(),
+            measurement: burn_jepa::FeatureFrameMeasureConfig::enabled(),
+            ..FeatureFramePipelineConfig::default()
+        },
+        1,
+        [image_size, image_size],
+        &device,
+    )
+    .expect("pipeline");
+    let grid = pipeline.grid();
+    let mask = SparseTokenMask::all(grid.len());
+
+    for sequence in 0..2 {
+        let processed = run_stage_pipeline_step(
+            &config,
+            &mut pipeline,
+            synthetic_image_tensor(sequence, image_size, &device),
+            &mask,
+            &mask,
+            FrameId {
+                stream_id: 0,
+                sequence,
+                capture_time_nanos: sequence.saturating_mul(16_666_667),
+            },
+            grid,
+            model_config.patch_size,
+            BevyJepaFrameSource::SyntheticLocalMotion,
+            false,
+            FeatureFrameRequest::low_res(),
+        )
+        .expect("low-res stage");
+
+        if sequence == 1 {
+            assert!(processed.metrics.pca_update_applied);
+            let StagePanelData::Host {
+                low_res_rgba,
+                width,
+                height,
+                ..
+            } = processed.panels
+            else {
+                panic!("CPU display transfer should expose host panel bytes");
+            };
+            let colors = panel_patch_center_colors(
+                &low_res_rgba,
+                width as usize,
+                height as usize,
+                grid.height,
+                grid.width,
+            );
+            assert!(
+                unique_rgb_color_count(&colors, 12) >= 3,
+                "low-res PCA panel should not collapse to a mono-color grid, got {colors:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn viewer_pipeline_rounds_image_requests_to_patch_multiple() {
     let config = BevyJepaConfig {
         pipeline: FeatureFrameViewerConfig {
@@ -786,6 +981,89 @@ fn patch_diff_mask_includes_all_patches_above_threshold() {
             coords_to_token_index(0, 2, 1, grid),
             coords_to_token_index(0, 3, 2, grid),
         ]
+    );
+}
+
+#[test]
+fn patch_diff_refresh_state_promotes_subthreshold_camera_motion() {
+    let device = JepaBevyDevice::default();
+    let config = BevyJepaConfig {
+        source: BevyJepaFrameSource::Camera,
+        mask_source: BevyJepaMaskSource::PatchDiff,
+        pipeline: FeatureFrameViewerConfig {
+            context_density: 0.25,
+            patch_diff_threshold: 0.10,
+            patch_diff_dense_fallback_density: 1.0,
+            sparse_encode_mode: BevyJepaSparseEncodeMode::Exact,
+            patch_diff_refresh: PatchDiffRefreshConfig {
+                subthreshold_decay: 1.0,
+                subthreshold_trigger: 1.0,
+                subthreshold_max_density: 0.25,
+                age_refresh_enabled: false,
+                blue_noise_enabled: false,
+                max_extra_density: 0.25,
+                ..PatchDiffRefreshConfig::default()
+            },
+            ..FeatureFrameViewerConfig::default()
+        },
+        ..BevyJepaConfig::default()
+    };
+    let mut model_config = VJepaConfig::tiny_for_tests();
+    model_config.image_size = 64;
+    model_config.num_frames = 2;
+    model_config.tubelet_size = 2;
+    model_config.patch_size = 16;
+    let grid = TokenGridShape::new(1, 4, 4);
+    let distractor = coords_to_token_index(0, 0, 0, grid);
+    let slow = coords_to_token_index(0, 2, 1, grid);
+    let mut refresh_state = PatchDiffRefreshState::default();
+
+    let frames = [
+        rgba_with_two_patch_levels(64, 64, (0, 0), 0, (2, 1), 0, 16),
+        rgba_with_two_patch_levels(64, 64, (0, 0), 20, (2, 1), 10, 16),
+        rgba_with_two_patch_levels(64, 64, (0, 0), 40, (2, 1), 20, 16),
+        rgba_with_two_patch_levels(64, 64, (0, 0), 60, (2, 1), 30, 16),
+    ];
+
+    let mut latest = None;
+    for pair in frames.windows(2).take(2) {
+        let previous = rgba_image_to_tensor(pair[0].clone(), 64, &device).expect("prev");
+        let current = rgba_image_to_tensor(pair[1].clone(), 64, &device).expect("current");
+        latest = Some(
+            run_sparse_mask_node_with_refresh_state(
+                &config,
+                Some(&previous),
+                Some(&pair[0]),
+                Some(&pair[1]),
+                &current,
+                &model_config,
+                grid,
+                Some(&mut refresh_state),
+            )
+            .expect("patch-diff mask"),
+        );
+    }
+    let second = latest.expect("second mask");
+    assert!(second.write_mask.indices().contains(&distractor));
+    assert!(!second.write_mask.indices().contains(&slow));
+
+    let previous = rgba_image_to_tensor(frames[2].clone(), 64, &device).expect("prev");
+    let current = rgba_image_to_tensor(frames[3].clone(), 64, &device).expect("current");
+    let third = run_sparse_mask_node_with_refresh_state(
+        &config,
+        Some(&previous),
+        Some(&frames[2]),
+        Some(&frames[3]),
+        &current,
+        &model_config,
+        grid,
+        Some(&mut refresh_state),
+    )
+    .expect("patch-diff mask");
+
+    assert!(
+        third.write_mask.indices().contains(&slow),
+        "stateful refresh should include repeated below-threshold camera motion"
     );
 }
 
@@ -1606,6 +1884,50 @@ fn rgba_with_patches(
     )
 }
 
+fn panel_patch_center_colors(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    grid_height: usize,
+    grid_width: usize,
+) -> Vec<[u8; 3]> {
+    let patch_h = (height / grid_height.max(1)).max(1);
+    let patch_w = (width / grid_width.max(1)).max(1);
+    let mut colors = Vec::with_capacity(grid_height * grid_width);
+    for row in 0..grid_height {
+        for col in 0..grid_width {
+            let y = (row * patch_h + patch_h / 2).min(height.saturating_sub(1));
+            let x = (col * patch_w + patch_w / 2).min(width.saturating_sub(1));
+            let offset = (y * width + x) * 4;
+            colors.push([rgba[offset], rgba[offset + 1], rgba[offset + 2]]);
+        }
+    }
+    colors
+}
+
+fn unique_rgb_color_count(colors: &[[u8; 3]], min_distance: u8) -> usize {
+    let threshold = u32::from(min_distance).pow(2);
+    colors
+        .iter()
+        .enumerate()
+        .filter(|(index, color)| {
+            colors[..*index]
+                .iter()
+                .all(|seen| rgb_distance_sq(seen, color) > threshold)
+        })
+        .count()
+}
+
+fn rgb_distance_sq(left: &[u8; 3], right: &[u8; 3]) -> u32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let delta = i32::from(*left) - i32::from(*right);
+            (delta * delta) as u32
+        })
+        .sum()
+}
+
 fn rgba_with_base_and_patches(
     width: u32,
     height: u32,
@@ -1625,4 +1947,44 @@ fn rgba_with_base_and_patches(
         }
     }
     image
+}
+
+fn rgba_with_two_patch_levels(
+    width: u32,
+    height: u32,
+    first_patch: (usize, usize),
+    first_level: u8,
+    second_patch: (usize, usize),
+    second_level: u8,
+    patch_size: usize,
+) -> RgbaImage {
+    let mut image = RgbaImage::new(width, height);
+    paint_patch(
+        &mut image,
+        first_patch,
+        patch_size,
+        image::Rgba([first_level, first_level, first_level, 255]),
+    );
+    paint_patch(
+        &mut image,
+        second_patch,
+        patch_size,
+        image::Rgba([second_level, second_level, second_level, 255]),
+    );
+    image
+}
+
+fn paint_patch(
+    image: &mut RgbaImage,
+    patch: (usize, usize),
+    patch_size: usize,
+    color: image::Rgba<u8>,
+) {
+    let row_start = patch.0 * patch_size;
+    let col_start = patch.1 * patch_size;
+    for y in row_start..(row_start + patch_size).min(image.height() as usize) {
+        for x in col_start..(col_start + patch_size).min(image.width() as usize) {
+            image.put_pixel(x as u32, y as u32, color);
+        }
+    }
 }

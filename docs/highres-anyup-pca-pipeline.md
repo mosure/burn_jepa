@@ -157,6 +157,13 @@ restores one-to-one encode/write masks for experiments. `--prewarm-shape-buckets
 is enabled by default and runs those bucket widths during pipeline
 initialization, then resets encoder/cache/PCA state before admitting live
 frames.
+Patch-diff refresh is stateful but still bounded by the same context budget:
+subthreshold residuals accumulate over time, old token positions receive
+age-priority refreshes, and a deterministic blue-noise probe covers quiet
+regions. These refresh modes are meant to reduce semantic drift in the
+interframe cache when a patch changes slowly enough that no single frame crosses
+the threshold. They never replace above-threshold motion patches, and dense
+fallback still runs after refresh selection.
 
 The current WGPU sparse-vs-dense crossover should be read at the full
 JEPA+cache level, not from cache writes alone. A focused tiny JEPA+cache sweep

@@ -3,9 +3,9 @@ use crate::SparsePatchifyBatchPlan;
 use crate::{
     FeaturePcaConfig, FeaturePcaProjector, FeaturePcaUpdateConfig, FeaturePcaUpdateScheduler,
     InterframeJepaFeatureMemory, InterframeJepaFeatureMemoryConfig,
-    InterframeJepaFeatureMemoryOutput, SparseMaskBatch, SparseTokenMask, TokenGridShape, TttState,
-    VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaTttModel, apply_token_mask,
-    jepa_feature_tokens_to_nchw,
+    InterframeJepaFeatureMemoryOutput, PatchDiffRefreshState, SparseMaskBatch, SparseTokenMask,
+    TokenGridShape, TttState, VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaTttModel,
+    apply_token_mask, jepa_feature_tokens_to_nchw,
 };
 use anyhow::{Result, bail, ensure};
 use burn::tensor::Tensor;
@@ -532,6 +532,7 @@ pub struct SparseJepaAnyUpPcaPipeline<B: Backend> {
     pca: FeaturePcaProjector<B>,
     pca_update_scheduler: FeaturePcaUpdateScheduler,
     pca_samples: FeaturePcaSampleBuffer<B>,
+    patch_diff_refresh_state: PatchDiffRefreshState,
     config: SparseJepaAnyUpPcaPipelineConfig,
     batch: usize,
     image_size: [usize; 2],
@@ -614,6 +615,7 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
             pca,
             pca_update_scheduler,
             pca_samples,
+            patch_diff_refresh_state: PatchDiffRefreshState::default(),
             config,
             batch,
             image_size,
@@ -662,6 +664,14 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         &self.pca_update_scheduler
     }
 
+    pub fn patch_diff_refresh_state(&self) -> &PatchDiffRefreshState {
+        &self.patch_diff_refresh_state
+    }
+
+    pub fn patch_diff_refresh_state_mut(&mut self) -> &mut PatchDiffRefreshState {
+        &mut self.patch_diff_refresh_state
+    }
+
     pub fn grid(&self) -> TokenGridShape {
         self.grid
     }
@@ -683,6 +693,7 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         self.token_memory.reset();
         self.pca_update_scheduler.reset();
         self.pca_samples.reset();
+        self.patch_diff_refresh_state.reset();
     }
 
     pub fn reset_visualization_state(&mut self) -> Result<()> {

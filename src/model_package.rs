@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, SystemTime};
@@ -20,7 +22,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{TttEncoderConfig, VJepa2_1Model, VJepaConfig, VJepaTttModel};
 
-pub const DEFAULT_BURN_JEPA_MODEL_BASE_URL: &str = "https://aberration.technology/model/burn_jepa";
+pub const DEFAULT_BURN_JEPA_MODEL_ROOT_URL: &str = "https://aberration.technology/model/burn_jepa";
+pub const DEFAULT_BURN_JEPA_MODEL_BASE_URL: &str =
+    "https://aberration.technology/model/burn_jepa/vjepa2_1_ttt";
 pub const DEFAULT_BURNPACK_SHARD_MAX_BYTES: u64 = 20 * 1024 * 1024;
 pub const DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR: &str = ".burn_jepa";
 pub const DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR: &str = "models/burn_jepa";
@@ -51,6 +55,81 @@ impl BurnJepaPackageModelKind {
             Self::Ttt => "ttt",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BurnJepaModelProfile {
+    #[serde(rename = "vjepa2_1_base", alias = "vjepa21_base", alias = "base")]
+    Vjepa21Base,
+    #[default]
+    #[serde(rename = "vjepa2_1_ttt", alias = "vjepa21_ttt", alias = "ttt")]
+    Vjepa21Ttt,
+}
+
+impl BurnJepaModelProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vjepa21Base => "vjepa2_1_base",
+            Self::Vjepa21Ttt => "vjepa2_1_ttt",
+        }
+    }
+
+    pub const fn model_kind(self) -> BurnJepaPackageModelKind {
+        match self {
+            Self::Vjepa21Base => BurnJepaPackageModelKind::Base,
+            Self::Vjepa21Ttt => BurnJepaPackageModelKind::Ttt,
+        }
+    }
+
+    pub const fn valid_values() -> &'static [&'static str] {
+        &[
+            "vjepa2_1_ttt",
+            "vjepa2.1-ttt",
+            "vjepa21-ttt",
+            "ttt",
+            "vjepa2_1_base",
+            "vjepa2.1-base",
+            "vjepa21-base",
+            "base",
+        ]
+    }
+}
+
+impl fmt::Display for BurnJepaModelProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BurnJepaModelProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "vjepa2_1_base"
+            | "vjepa2.1-base"
+            | "vjepa21-base"
+            | "vjepa2-base"
+            | "base"
+            | "vjepa-base"
+            | "vjepa2_1_vit_base_384"
+            | "vjepa2_1_vitb" => Ok(Self::Vjepa21Base),
+            "vjepa2_1_ttt" | "vjepa2.1-ttt" | "vjepa21-ttt" | "vjepa2-ttt" | "ttt"
+            | "trained-ttt" | "production-ttt" | "vjepa-ttt" => Ok(Self::Vjepa21Ttt),
+            other => Err(format!(
+                "unsupported burn_jepa model profile `{other}`; expected one of {}",
+                Self::valid_values().join(", ")
+            )),
+        }
+    }
+}
+
+pub fn burn_jepa_model_profile_base_url(profile: BurnJepaModelProfile) -> String {
+    format!(
+        "{}/{}",
+        DEFAULT_BURN_JEPA_MODEL_ROOT_URL.trim_end_matches('/'),
+        profile.as_str()
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,17 +238,35 @@ pub struct BurnpackPartsReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BurnJepaModelBootstrapConfig {
     pub cache_root: Option<PathBuf>,
+    pub model_profile: BurnJepaModelProfile,
     pub model_base_url: String,
     pub manifest_url: Option<String>,
 }
 
 impl Default for BurnJepaModelBootstrapConfig {
     fn default() -> Self {
+        let model_profile = BurnJepaModelProfile::default();
         Self {
             cache_root: None,
-            model_base_url: DEFAULT_BURN_JEPA_MODEL_BASE_URL.to_string(),
+            model_profile,
+            model_base_url: burn_jepa_model_profile_base_url(model_profile),
             manifest_url: None,
         }
+    }
+}
+
+impl BurnJepaModelBootstrapConfig {
+    pub fn for_profile(model_profile: BurnJepaModelProfile) -> Self {
+        Self {
+            model_profile,
+            model_base_url: burn_jepa_model_profile_base_url(model_profile),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_env_overrides(self) -> Self {
+        apply_model_bootstrap_env_overrides(self)
     }
 }
 
@@ -468,7 +565,8 @@ pub fn default_burn_jepa_model_cache_root_with_config(
     let home = user_home_dir().context("failed to resolve user home directory for model cache")?;
     Ok(home
         .join(DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR)
-        .join(DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR))
+        .join(DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR)
+        .join(config.model_profile.as_str()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -493,7 +591,8 @@ pub fn resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress<F>(
 where
     F: Fn(String),
 {
-    let cache_root = default_burn_jepa_model_cache_root_with_config(config)?;
+    let config = normalized_model_bootstrap_config(config);
+    let cache_root = default_burn_jepa_model_cache_root_with_config(&config)?;
     progress(format!(
         "resolving burn_jepa model cache under {}",
         cache_root.display()
@@ -566,6 +665,19 @@ where
             cache_root.display()
         )
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn normalized_model_bootstrap_config(
+    config: &BurnJepaModelBootstrapConfig,
+) -> BurnJepaModelBootstrapConfig {
+    let mut config = config.clone();
+    if config.model_base_url == DEFAULT_BURN_JEPA_MODEL_BASE_URL
+        && config.model_profile != BurnJepaModelProfile::default()
+    {
+        config.model_base_url = burn_jepa_model_profile_base_url(config.model_profile);
+    }
+    config
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1108,10 +1220,23 @@ fn part_matches_cache(path: &Path, part: &BurnpackPartEntry) -> Result<bool> {
 fn apply_model_bootstrap_env_overrides(
     mut config: BurnJepaModelBootstrapConfig,
 ) -> BurnJepaModelBootstrapConfig {
+    let had_profile_default_url =
+        config.model_base_url == burn_jepa_model_profile_base_url(config.model_profile);
+    if let Ok(value) =
+        std::env::var("BURN_JEPA_MODEL_PROFILE").or_else(|_| std::env::var("BURN_JEPA_MODEL_NAME"))
+    {
+        if let Ok(profile) = BurnJepaModelProfile::from_str(&value) {
+            config.model_profile = profile;
+            if had_profile_default_url {
+                config.model_base_url = burn_jepa_model_profile_base_url(profile);
+            }
+        }
+    }
     if let Some(root) = std::env::var_os("BURN_JEPA_CACHE_DIR") {
         config.cache_root = Some(
             PathBuf::from(root)
                 .join(DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR)
+                .join(config.model_profile.as_str())
                 .to_path_buf(),
         );
     }
@@ -1426,6 +1551,39 @@ mod tests {
     }
 
     #[test]
+    fn model_profiles_resolve_distinct_cdn_routes() {
+        assert_eq!(
+            BurnJepaModelProfile::from_str("base").expect("base profile"),
+            BurnJepaModelProfile::Vjepa21Base
+        );
+        assert_eq!(
+            BurnJepaModelProfile::from_str("ttt").expect("ttt profile"),
+            BurnJepaModelProfile::Vjepa21Ttt
+        );
+        assert_eq!(
+            burn_jepa_model_profile_base_url(BurnJepaModelProfile::Vjepa21Base),
+            "https://aberration.technology/model/burn_jepa/vjepa2_1_base"
+        );
+        assert_eq!(
+            burn_jepa_model_profile_base_url(BurnJepaModelProfile::Vjepa21Ttt),
+            DEFAULT_BURN_JEPA_MODEL_BASE_URL
+        );
+        assert_ne!(
+            burn_jepa_model_profile_base_url(BurnJepaModelProfile::Vjepa21Base),
+            burn_jepa_model_profile_base_url(BurnJepaModelProfile::Vjepa21Ttt)
+        );
+        assert_eq!(
+            serde_json::to_string(&BurnJepaModelProfile::Vjepa21Base).expect("serialize base"),
+            "\"vjepa2_1_base\""
+        );
+        assert_eq!(
+            serde_json::from_str::<BurnJepaModelProfile>("\"vjepa21_ttt\"")
+                .expect("deserialize ttt alias"),
+            BurnJepaModelProfile::Vjepa21Ttt
+        );
+    }
+
+    #[test]
     fn tiny_vjepa_burnpack_parts_roundtrip() {
         let device = Default::default();
         let config = VJepaConfig::tiny_for_tests();
@@ -1517,7 +1675,7 @@ mod tests {
             ..BurnJepaPipelinePackageManifest::default()
         };
         let json = manifest.to_json_string().expect("manifest json");
-        assert!(json.contains("https://aberration.technology/model/burn_jepa"));
+        assert!(json.contains("https://aberration.technology/model/burn_jepa/vjepa2_1_ttt"));
         assert!(json.contains("\"record_dtype\": \"f16\""));
         assert!(json.contains("vjepa_ttt.bpk.parts.json"));
         let decoded = BurnJepaPipelinePackageManifest::from_json_str(&json).expect("decode");
@@ -1566,6 +1724,7 @@ mod tests {
         let cache_root = temp.path().join("cache");
         let config = BurnJepaModelBootstrapConfig {
             cache_root: Some(cache_root.clone()),
+            model_profile: BurnJepaModelProfile::Vjepa21Base,
             model_base_url: server.base_url.clone(),
             manifest_url: None,
         };

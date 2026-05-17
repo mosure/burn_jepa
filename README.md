@@ -551,10 +551,10 @@ page uses `getUserMedia` plus the exported
 `frame_input(...)` bridge. Native runs default to the trained encoder-only TTT
 V-JEPA 2.1 encoder, loaded from a sharded `.bpk` package when
 `--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`, or
-`target/burn-jepa-web/model/manifest.json` is available. A legacy local `.mpk`
-is only used when explicitly passed with `--ttt-model` or
-`BURN_JEPA_TTT_MODEL`; use `--encoder-source base-checkpoint`/`tiny-test` for
-explicit alternatives.
+`target/burn-jepa-web/model/vjepa2_1_ttt/manifest.json` is available. A legacy
+local `.mpk` is only used when explicitly passed with `--ttt-model` or
+`BURN_JEPA_TTT_MODEL`; use `--model-profile vjepa2_1_base` or
+`--encoder-source base-checkpoint`/`tiny-test` for explicit alternatives.
 Base-checkpoint mode defaults to
 `~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384`; pass
 `--jepa-checkpoint-dir` and `--jepa-config` when the official V-JEPA 2.1
@@ -592,6 +592,14 @@ patch-diff threshold to `1 - Q`; it does not impose a fixed quality-percent
 token density. The Bevy camera path compensates uniform global RGB/luma shifts
 and includes relative-luma/chroma scoring so the mask is less sensitive to
 average scene brightness.
+Patch-diff also carries a small refresh state in the live pipeline. Repeated
+subthreshold scores accumulate with decay, stale token positions are refreshed
+by age priority, and a deterministic blue-noise probe adds a tiny background
+refresh. These tokens only fill unused context budget, so patches above the
+instantaneous threshold are still preserved first. Disable the policy with
+`--no-patch-diff-refresh`, or tune it with the `--patch-diff-subthreshold-*`,
+`--patch-diff-age-refresh-*`, `--patch-diff-blue-noise-density`, and
+`--patch-diff-refresh-density` arguments.
 If thresholding selects much of the token grid, the viewer promotes the mask to
 dense ordered mode. The default `--patch-diff-dense-fallback-density 0.60`
 keeps low- and medium-density adaptive motion sparse, then routes high-motion
@@ -632,29 +640,44 @@ store floating-point records as f16 for deployment size, while native and wasm
 loaders upcast those records back into the active backend dtype at load time.
 Native runs check
 `--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`,
-`target/burn-jepa-web/model/manifest.json`, then an auto-downloaded cache under
-`~/.burn_jepa/models/burn_jepa`. The cache fetches the same deployment URL that
-wasm uses by default: `https://aberration.technology/model/burn_jepa/manifest.json`.
-Override it with `--model-base-url`, `BURN_JEPA_MODEL_BASE_URL`, or
-`BURN_JEPA_MODEL_MANIFEST_URL`; use `--model-cache-dir` or
+`target/burn-jepa-web/model/{model_profile}/manifest.json`, then an
+auto-downloaded cache under `~/.burn_jepa/models/burn_jepa/{model_profile}`.
+The default profile is `vjepa2_1_ttt`, whose CDN route is
+`https://aberration.technology/model/burn_jepa/vjepa2_1_ttt/manifest.json`.
+Use `--model-profile vjepa2_1_base` for the f16 base V-JEPA 2.1 package at
+`https://aberration.technology/model/burn_jepa/vjepa2_1_base/manifest.json`.
+Override exact URLs with `--model-base-url`, `BURN_JEPA_MODEL_BASE_URL`, or
+`BURN_JEPA_MODEL_MANIFEST_URL`; `BURN_JEPA_MODEL_PROFILE` /
+`BURN_JEPA_MODEL_NAME` select the default profile for native auto-cache. Use
+`--model-cache-dir` or
 `BURN_JEPA_MODEL_CACHE_DIR` for an exact cache directory. A legacy `.mpk`
 checkpoint is still accepted only when `--ttt-model` or `BURN_JEPA_TTT_MODEL`
 is explicitly set. The wasm viewer does not read local `.mpk`, `.pt`, or
-`.safetensors` files. Export a `.bpk` package and split it into cacheable
-burnpack parts:
+`.safetensors` files. Export both f16 `.bpk` packages and split them into
+cacheable burnpack parts:
 
 ```sh
 cargo run --bin burn-jepa -- export-bpk \
   --config configs/deploy/vjepa21-base-bpk-export.toml \
-  --output target/burn-jepa-web/model/vjepa2_1_vit_base_384.bpk \
+  --output target/burn-jepa-web/model/vjepa2_1_base/jepa.bpk \
   --shard-mib 20 \
-  --model-base-url https://aberration.technology/model/burn_jepa \
-  --deploy-dir target/burn-jepa-cdn-upload \
+  --model-profile vjepa2_1_base \
+  --deploy-dir target/burn-jepa-cdn-upload/vjepa2_1_base \
+  --overwrite-shards \
+  --overwrite-deploy
+
+cargo run --bin burn-jepa -- export-bpk \
+  --config configs/deploy/vjepa21-ttt-bpk-export.toml \
+  --output target/burn-jepa-web/model/vjepa2_1_ttt/jepa_ttt.bpk \
+  --shard-mib 20 \
+  --model-profile vjepa2_1_ttt \
+  --deploy-dir target/burn-jepa-cdn-upload/vjepa2_1_ttt \
+  --overwrite-shards \
   --overwrite-deploy
 ```
 
-This writes `jepa_ttt.bpk`, `jepa_ttt.bpk.parts.json`, one or more
-`jepa_ttt.bpk.part-*.bpk` files, and `manifest.json`. With `--deploy-dir`, it
+This writes `manifest.json`, the `.bpk.parts.json` file, and one or more
+`.bpk.part-*.bpk` files for each model profile. With `--deploy-dir`, it
 also writes a clean CDN/upload directory containing only `manifest.json`, the
 parts manifest, and shard files. The export fails if f32 tensors remain in the
 burnpack. Each part is a valid partial burnpack, so wasm loads shards
@@ -665,8 +688,10 @@ under `https://aberration.technology/model/burn_jepa/*`.
 Native cache smoke:
 
 ```sh
-cargo run --bin burn-jepa -- cache-model
-cargo run --no-default-features --features ndarray --bin burn-jepa -- verify-bpk
+cargo run --bin burn-jepa -- cache-model --model-profile vjepa2_1_ttt
+cargo run --bin burn-jepa -- cache-model --model-profile vjepa2_1_base
+cargo run --no-default-features --features ndarray --bin burn-jepa -- verify-bpk --model-profile vjepa2_1_ttt
+cargo run --no-default-features --features ndarray --bin burn-jepa -- verify-bpk --model-profile vjepa2_1_base
 ```
 
 `verify-bpk` uses Burn 0.21's `burn-store` path: it clean-initializes the
@@ -700,6 +725,7 @@ cd crates/bevy_jepa
 npm run build:wasm
 npm run serve
 # open http://127.0.0.1:8080/?model-base=http://127.0.0.1:8091&source=static
+# CDN profile switch: ?model-profile=vjepa2_1_base or ?model-profile=vjepa2_1_ttt
 ```
 
 Use `?load-model=false` for tiny smoke tests that exercise the wasm app without
@@ -714,5 +740,5 @@ wasm-bindgen --target web --out-dir target/burn-jepa-wasm-api/out \
   --out-name burn_jepa target/wasm32-unknown-unknown/release/burn_jepa.wasm
 cd crates/bevy_jepa
 npm run test:wasm-api
-BURN_JEPA_WASM_MODEL_MANIFEST_URL=https://aberration.technology/model/burn_jepa/manifest.json npm run test:wasm-api
+BURN_JEPA_WASM_MODEL_MANIFEST_URL=https://aberration.technology/model/burn_jepa/vjepa2_1_ttt/manifest.json npm run test:wasm-api
 ```
