@@ -106,4 +106,5 @@ features = [
 ]
 
 [dev-dependencies]
+burn = { version = "0.21", default-features = false, features = ["ndarray", "std"] }
 futures-lite = "2"

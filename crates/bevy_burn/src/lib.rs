@@ -531,18 +531,20 @@ fn gpu_bevy_to_burn<B: Backend>(
 mod cpu_tests {
     use super::*;
     use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-    use burn_wgpu::Wgpu;
 
-    type BurnBackend = Wgpu<f32, i32>;
+    type BurnBackend = burn::backend::NdArray<f32>;
 
     fn default_app() -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.insert_resource(Assets::<Image>::default());
-        app.add_plugins(BevyBurnBridgePlugin::<BurnBackend> {
-            cpu_only: true,
-            ..default()
-        });
+        app.add_systems(
+            Update,
+            (
+                bevy_to_burn_update::<BurnBackend>,
+                burn_to_bevy_update::<BurnBackend>,
+            ),
+        );
         app
     }
 
