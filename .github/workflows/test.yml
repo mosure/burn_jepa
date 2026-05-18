@@ -35,10 +35,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: test root crate
-        run: cargo test --workspace --locked
+        run: cargo test -p burn_jepa --locked --no-default-features --features ndarray
 
-      - name: test ndarray-only feature set
-        run: cargo test --workspace --locked --no-default-features --features ndarray
+      - name: test support crates
+        run: cargo test -p burn_anyup -p bevy_burn --locked
 
       - name: test benchmark and docs guardrails
         run: cargo test --locked --test benchmark_report

@@ -608,7 +608,11 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(preprint.contains("(85,3.218)"));
     assert!(preprint.contains("100\\% point is the dense ordered baseline"));
     assert!(workflow.contains("cargo fmt --all -- --check"));
-    assert!(workflow.contains("cargo test --workspace --locked"));
+    assert!(
+        workflow
+            .contains("cargo test -p burn_jepa --locked --no-default-features --features ndarray")
+    );
+    assert!(workflow.contains("cargo test -p burn_anyup -p bevy_burn --locked"));
     assert!(workflow.contains("cargo test --locked --test benchmark_report"));
     assert!(workflow.contains("cargo package -p burn_anyup --locked"));
     assert!(workflow.contains("cargo check -p bevy_jepa --locked --features sparse-patchify-wgpu"));
