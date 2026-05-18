@@ -32,11 +32,11 @@ impl Default for FeaturePcaConfig {
             epsilon: 1.0e-6,
             display_scale: 1.0,
             display_mode: FeaturePcaDisplayMode::SemanticRgb,
-            display_momentum: 0.2,
+            display_momentum: 0.08,
             display_std_floor: 1.0e-3,
             display_clip_sigma: 2.5,
-            online_learning_rate: 0.35,
-            mean_momentum: 0.25,
+            online_learning_rate: 0.08,
+            mean_momentum: 0.08,
         }
     }
 }
@@ -191,7 +191,10 @@ pub struct FeaturePcaUpdateScheduler {
 impl FeaturePcaUpdateScheduler {
     pub fn new(config: FeaturePcaUpdateConfig) -> Result<Self> {
         config.validate()?;
-        let next_update_frame = config.warmup_frames + config.every_n_frames;
+        let next_update_frame = config
+            .warmup_frames
+            .saturating_add(config.min_sample_frames as u64)
+            .max(1);
         Ok(Self {
             config,
             observed_frames: 0,
@@ -206,7 +209,11 @@ impl FeaturePcaUpdateScheduler {
 
     pub fn reset(&mut self) {
         self.observed_frames = 0;
-        self.next_update_frame = self.config.warmup_frames + self.config.every_n_frames;
+        self.next_update_frame = self
+            .config
+            .warmup_frames
+            .saturating_add(self.config.min_sample_frames as u64)
+            .max(1);
         self.update_count = 0;
     }
 
@@ -564,9 +571,29 @@ impl<B: Backend> FeaturePcaProjector<B> {
                 let coefficient = (vector.clone() * previous.clone()).sum_dim(1);
                 vector = vector - previous.clone() * coefficient.repeat_dim(1, self.feature_dim);
             }
-            basis.push(self.normalize_component(vector));
+            let reference =
+                self.components
+                    .clone()
+                    .slice([0..1, 0..self.feature_dim, channel..channel + 1]);
+            let vector = self.align_component_sign(self.normalize_component(vector), reference);
+            basis.push(vector);
         }
         Tensor::cat(basis, 2)
+    }
+
+    fn align_component_sign(
+        &self,
+        component: Tensor<B, 3>,
+        reference: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        let sign = (component.clone() * reference)
+            .sum_dim(1)
+            .greater_equal_elem(0.0)
+            .float()
+            .mul_scalar(2.0)
+            .sub_scalar(1.0)
+            .repeat_dim(1, self.feature_dim);
+        component * sign
     }
 
     fn normalize_component(&self, component: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -703,5 +730,63 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .sqrt()
             .add_scalar(1.0);
         (scaled / denom).mul_scalar(0.5).add_scalar(0.5)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestBackend = burn::backend::NdArray<f32>;
+
+    #[test]
+    fn pca_scheduler_fits_early_then_uses_configured_cadence() {
+        let mut scheduler = FeaturePcaUpdateScheduler::new(FeaturePcaUpdateConfig {
+            mode: FeaturePcaUpdateMode::RollingOja,
+            every_n_frames: 16,
+            warmup_frames: 0,
+            min_tokens_per_update: 1,
+            iterations_per_update: 1,
+            sample_window_frames: 16,
+            min_sample_frames: 2,
+        })
+        .expect("scheduler");
+
+        assert!(!scheduler.observe_batch(1, 4).update);
+        assert!(scheduler.observe_batch(1, 4).update);
+        for _ in 3..18 {
+            assert!(!scheduler.observe_batch(1, 4).update);
+        }
+        assert!(scheduler.observe_batch(1, 4).update);
+        assert_eq!(scheduler.update_count(), 2);
+    }
+
+    #[test]
+    fn pca_component_stabilization_preserves_channel_signs() {
+        let device = Default::default();
+        let projector =
+            FeaturePcaProjector::<TestBackend>::identity(3, FeaturePcaConfig::default(), &device)
+                .expect("projector");
+        let negative_identity = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![
+                    -1.0, 0.0, 0.0, //
+                    0.0, -1.0, 0.0, //
+                    0.0, 0.0, -1.0,
+                ],
+                [1, 3, 3],
+            ),
+            &device,
+        );
+
+        let values = projector
+            .stabilize_components(negative_identity)
+            .to_data()
+            .to_vec::<f32>()
+            .expect("component values");
+
+        assert!(values[0] > 0.99, "{values:?}");
+        assert!(values[4] > 0.99, "{values:?}");
+        assert!(values[8] > 0.99, "{values:?}");
     }
 }

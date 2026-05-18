@@ -110,10 +110,11 @@ center prior, so any "autogaze" output must come from `burn_autogaze` rather
 than from generated test motion.
 
 The PCA basis update is decoupled from display emission. By default the viewer
-updates the rolling low-resolution PCA basis every processed low-res frame after
-a two-frame warmup, using a 16-frame sample window. Stable features across time
-define the color space without spending several seconds on the cold-start
-identity basis, while the rolling window smooths color drift. PCA display uses
+fits the rolling low-resolution PCA basis after a two-frame warmup and then on
+every processed low-res frame, using a 16-frame sample window. Stable features
+across time define the color space without spending several seconds on the
+cold-start identity basis, while sign-stable updates reduce PCA color flicker.
+PCA display uses
 the V-JEPA 2.1 dense-feature visualization
 protocol: the first three PCA components of observed patch features are mapped
 to RGB with rolling, device-resident normalization so colors remain semantically
@@ -225,12 +226,13 @@ low-res token-cache PCA available every processed stage frame. Positive values
 send completed low-res cache snapshots to a separate AnyUp worker with its own
 latest-frame overwrite slot. The default `--high-res-pca-every 0` means AnyUp is
 opt-in, so it cannot stall the camera -> mask -> JEPA -> low-res cache path.
-The low-res PCA basis is adaptive by default: `--pca-update-every 1` updates the
-rolling Oja basis after a two-frame warmup while sampling from a 16-frame
-device-resident window. This keeps the color space responsive without fitting
-PCA from a single frame. Use `--pca-sample-window-frames`,
-`--pca-min-sample-frames`, and `--pca-update-iterations` to trade color
-stability against adaptation speed and update cost.
+The low-res PCA basis is adaptive by default: `--pca-update-every 1` performs
+an early two-frame warmup fit, then updates the rolling Oja basis every processed
+low-res frame while sampling from a 16-frame device-resident window. Use
+`--pca-update-every 0` to lock the current basis, or
+`--pca-sample-window-frames`, `--pca-min-sample-frames`, and
+`--pca-update-iterations` to trade color stability against adaptation speed and
+update cost.
 
 For camera input, preview frames stay as center-cropped RGBA until they are
 actually admitted into the sparse JEPA stage. The pending slot therefore does

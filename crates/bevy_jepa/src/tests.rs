@@ -318,6 +318,66 @@ fn control_actions_toggle_pca_basis_training_without_rebuild() {
 }
 
 #[test]
+fn pca_lock_applies_to_pipeline_returning_from_active_task() {
+    let device = JepaBevyDevice::default();
+    let mut config = tiny_viewer_config();
+    let image_size = config.pipeline_image_size();
+    let active_pca_update = config.pca_update_config();
+    let model_config = tiny_viewer_model_config(image_size);
+    let jepa = VJepa2_1Model::<JepaBevyBackend>::new(&model_config, &device);
+    let mut anyup_config = AnyUpConfig::tiny_for_tests();
+    anyup_config.input_dim = 3;
+    let anyup = AnyUp::<JepaBevyBackend>::new(anyup_config, &device).expect("AnyUp");
+    let pipeline = FeatureFramePipeline::<JepaBevyBackend>::new(
+        jepa,
+        anyup,
+        &model_config,
+        FeatureFramePipelineConfig {
+            pca_update: config.pca_update_config(),
+            ..FeatureFramePipelineConfig::default()
+        },
+        1,
+        [image_size, image_size],
+        &device,
+    )
+    .expect("pipeline");
+    assert!(pipeline.config().pca_update.enabled());
+    assert!(pipeline.pca_update_scheduler().config().enabled());
+
+    let signature = RuntimePipelineSignature::new(&config, image_size);
+    let mut runtime = JepaRuntime {
+        pipeline_signature: Some(signature.clone()),
+        ..JepaRuntime::default()
+    };
+
+    config.pca_update_every = 0;
+    runtime
+        .apply_pca_update_config(&config)
+        .expect("missing active pipeline should defer cleanly");
+
+    let completed = finish_jepa_task_output(
+        &config,
+        &mut runtime,
+        &device,
+        JepaAsyncTaskOutput {
+            signature,
+            pca_update: active_pca_update,
+            pipeline,
+            result: Err("sentinel".to_string()),
+        },
+    );
+    assert!(
+        completed.is_none(),
+        "stale PCA completion should be suppressed instead of repainting old colors"
+    );
+
+    let returned = runtime.pipeline.as_ref().expect("returned pipeline");
+    assert!(!returned.config().pca_update.enabled());
+    assert!(!returned.pca_update_scheduler().config().enabled());
+    assert_eq!(runtime.stale_completions, 1);
+}
+
+#[test]
 fn control_tabs_are_view_state_not_pipeline_rebuilds() {
     let config = BevyJepaConfig::default();
     let mut controls = JepaControlsState::default();
@@ -409,6 +469,73 @@ fn control_actions_switch_dense_and_sparse_pipeline_presets() {
         config.sparse_encode_mode,
         BevyJepaSparseEncodeMode::BucketedContext
     );
+}
+
+#[test]
+fn control_actions_preserve_pca_settings_across_pipeline_changes() {
+    let mut config = BevyJepaConfig::default();
+    config.pca_update_every = 23;
+    config.pca_sample_window_frames = 41;
+    config.pca_min_sample_frames = 7;
+    config.pca_update_iterations = 5;
+    let pca = PcaControlSettings::capture(&config);
+
+    for action in [
+        JepaControlAction::TogglePanel,
+        JepaControlAction::TabPipeline,
+        JepaControlAction::TabMask,
+        JepaControlAction::TabPca,
+        JepaControlAction::TabAnyUp,
+        JepaControlAction::ModelBase,
+        JepaControlAction::ModelTtt,
+        JepaControlAction::PipelineDense,
+        JepaControlAction::PipelineSparse,
+        JepaControlAction::Resolution256,
+        JepaControlAction::Resolution512,
+        JepaControlAction::AnyUpOff,
+        JepaControlAction::AnyUpEvery8,
+        JepaControlAction::AnyUpEvery1,
+        JepaControlAction::AnyUpEfficientLocal,
+        JepaControlAction::AnyUpUpstreamMasked,
+        JepaControlAction::PatchRefresh,
+        JepaControlAction::SubthresholdRefresh,
+        JepaControlAction::AgeRefresh,
+        JepaControlAction::BlueNoiseRefresh,
+    ] {
+        apply_control_action(&mut config, action);
+        assert_eq!(
+            PcaControlSettings::capture(&config),
+            pca,
+            "{action:?} should not reset PCA settings"
+        );
+    }
+}
+
+#[test]
+fn control_sliders_preserve_pca_settings_for_non_pca_fields() {
+    let mut config = BevyJepaConfig::default();
+    config.pca_update_every = 17;
+    config.pca_sample_window_frames = 37;
+    config.pca_min_sample_frames = 11;
+    config.pca_update_iterations = 6;
+    let pca = PcaControlSettings::capture(&config);
+
+    for kind in [
+        JepaControlSliderKind::PatchDiffThreshold,
+        JepaControlSliderKind::ContextDensity,
+        JepaControlSliderKind::MinContextDensity,
+        JepaControlSliderKind::DenseFallbackDensity,
+        JepaControlSliderKind::SubthresholdTrigger,
+        JepaControlSliderKind::AgeIntervalFrames,
+        JepaControlSliderKind::BlueNoiseDensity,
+    ] {
+        apply_control_slider_value(&mut config, kind, 0.75);
+        assert_eq!(
+            PcaControlSettings::capture(&config),
+            pca,
+            "{kind:?} should not reset PCA settings"
+        );
+    }
 }
 
 #[test]
@@ -631,6 +758,16 @@ fn default_headless_low_res_pca_updates_after_short_warmup() {
         .expect("third low-res stage");
     assert!(third.metrics.pca_update_applied);
     assert_eq!(third.metrics.pca_sample_frames, 3);
+
+    let mut later_metrics = third.metrics;
+    for _ in 3..18 {
+        later_metrics = pipeline
+            .step_with_stage_request(FeatureFrameRequest::low_res())
+            .expect("later low-res stage")
+            .metrics;
+    }
+    assert!(later_metrics.pca_update_applied);
+    assert_eq!(later_metrics.pca_sample_frames, 16);
 }
 
 #[test]
@@ -1926,9 +2063,35 @@ fn metrics_text_clarifies_bucketed_encode_and_ttt_diagnostics() {
     assert!(encode.contains("bucketed"));
     assert!(ttt.contains("diag off"));
     assert!(basis.contains("cached"));
-    assert!(basis.contains("@1f"));
+    assert!(basis.contains(&format!("@{}f", DEFAULT_PCA_UPDATE_EVERY)));
     assert!(updates.contains("2.0 fps"));
     assert!(updates.contains("3 total"));
+}
+
+#[test]
+fn metrics_status_shows_runtime_autotune_message() {
+    let config = BevyJepaConfig::default();
+    let metrics = BevyJepaMetrics::default();
+    let runtime = JepaRuntime {
+        status_message: Some(shape_prewarm_status_message(
+            "autotuning",
+            &[256, 512, 1024],
+        )),
+        ..JepaRuntime::default()
+    };
+    let history = MetricsRollingState::default();
+
+    let status = metric_value_text(
+        &config,
+        &metrics,
+        &runtime,
+        &history,
+        MetricValueKind::Status,
+    );
+
+    assert!(status.contains("autotuning sparse token widths"));
+    assert!(status.contains("256"));
+    assert!(status.contains("1024"));
 }
 
 #[test]

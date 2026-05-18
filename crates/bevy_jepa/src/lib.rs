@@ -26,8 +26,9 @@ use burn::tensor::{
 use burn_jepa::{
     AnyUp, AnyUpImageGrid, FeatureFrameBatch, FeatureFrameMetrics, FeatureFramePipeline,
     FeatureFramePipelineConfig, FeatureFrameRequest, FeatureFrameSparseEncodeMode,
-    FeaturePcaProjector, FrameId, HighResFrameArtifacts, LowResFrameArtifacts, SparseTokenMask,
-    TokenGridShape, VJEPA_IMAGE_MEAN, VJEPA_IMAGE_STD, VJepaConfig, shape_prewarm_masks,
+    FeaturePcaProjector, FeaturePcaUpdateConfig, FrameId, HighResFrameArtifacts,
+    LowResFrameArtifacts, SparseTokenMask, TokenGridShape, VJEPA_IMAGE_MEAN, VJEPA_IMAGE_STD,
+    VJepaConfig, shape_prewarm_masks,
 };
 #[cfg(feature = "sparse-patchify-wgpu")]
 use burn_jepa::{SparseMaskBatch, SparsePatchifyBatchPlan};
@@ -43,8 +44,7 @@ pub mod platform;
 
 #[cfg(test)]
 use burn_jepa::{
-    FeaturePcaUpdateConfig, bucket_sparse_mask, center_prior_mask, finalize_patch_diff_mask,
-    finalize_patch_diff_masks,
+    bucket_sparse_mask, center_prior_mask, finalize_patch_diff_mask, finalize_patch_diff_masks,
 };
 pub use config::{
     BevyJepaAnyUpModelPackageProfile, BevyJepaConfig, BevyJepaDisplayTransfer, BevyJepaEncodePath,
@@ -205,6 +205,9 @@ fn sync_bevy_backend(device: &JepaBevyDevice) -> Result<()> {
     }
 }
 
+// Give the overlay at least one rendered frame to show the startup/autotune state.
+const SHAPE_PREWARM_STATUS_DELAY_FRAMES: u8 = 2;
+
 #[derive(Resource, Default)]
 struct JepaRuntime {
     pipeline: Option<FeatureFramePipeline<JepaBevyBackend>>,
@@ -214,6 +217,7 @@ struct JepaRuntime {
     pipeline_patch_size: Option<usize>,
     active_task: Option<Task<JepaAsyncTaskOutput>>,
     pending_stage: Option<PendingStageFrame>,
+    pending_shape_prewarm: Option<PendingShapePrewarm>,
     high_res_runtime: Option<AnyUpHighResRuntime>,
     high_res_signature: Option<RuntimePipelineSignature>,
     high_res_task: Option<Task<HighResAsyncTaskOutput>>,
@@ -244,8 +248,16 @@ struct JepaRuntime {
     last_high_res_anyup_decode_us: u64,
     last_high_res_pca_us: u64,
     last_high_res_display_tensor_us: u64,
+    status_message: Option<String>,
     last_error: Option<String>,
     last_logged_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingShapePrewarm {
+    signature: RuntimePipelineSignature,
+    token_widths: Vec<usize>,
+    delay_frames: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -647,6 +659,49 @@ enum JepaControlSliderKind {
     BlueNoiseDensity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PcaControlSettings {
+    update_every: u64,
+    sample_window_frames: usize,
+    min_sample_frames: usize,
+    update_iterations: usize,
+}
+
+impl PcaControlSettings {
+    fn capture(config: &BevyJepaConfig) -> Self {
+        Self {
+            update_every: config.pca_update_every,
+            sample_window_frames: config.pca_sample_window_frames,
+            min_sample_frames: config.pca_min_sample_frames,
+            update_iterations: config.pca_update_iterations,
+        }
+    }
+
+    fn apply(self, config: &mut BevyJepaConfig) {
+        config.pca_update_every = self.update_every;
+        config.pca_sample_window_frames = self.sample_window_frames;
+        config.pca_min_sample_frames = self.min_sample_frames;
+        config.pca_update_iterations = self.update_iterations;
+    }
+}
+
+fn is_pca_control_action(action: JepaControlAction) -> bool {
+    matches!(
+        action,
+        JepaControlAction::PcaTrain | JepaControlAction::PcaLock
+    )
+}
+
+fn is_pca_slider_kind(kind: JepaControlSliderKind) -> bool {
+    matches!(
+        kind,
+        JepaControlSliderKind::PcaUpdateEvery
+            | JepaControlSliderKind::PcaSampleWindowFrames
+            | JepaControlSliderKind::PcaMinSampleFrames
+            | JepaControlSliderKind::PcaUpdateIterations
+    )
+}
+
 #[derive(Component)]
 struct JepaControlSlider {
     kind: JepaControlSliderKind,
@@ -775,26 +830,14 @@ impl JepaRuntime {
                 [image_size, image_size],
                 device,
             )?);
-            if config.prewarm_shape_buckets {
-                let pipeline = self.pipeline.as_mut().expect("pipeline initialized");
-                match prewarm_feature_frame_shapes(config, pipeline, image_size, device) {
-                    Ok(Some(report)) => log(&format!(
-                        "bevy_jepa: prewarmed sparse token widths {:?} in {:.1} ms",
-                        report.token_widths,
-                        micros_to_ms(report.total_us)
-                    )),
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = pipeline.reset_visualization_state();
-                        log(&format!(
-                            "bevy_jepa: sparse shape prewarm skipped after error: {error:#}"
-                        ));
-                    }
-                }
-            }
             let pipeline = self.pipeline.as_ref().expect("pipeline initialized");
             self.pipeline_grid = Some(pipeline.grid());
             self.pipeline_patch_size = Some(model_config.patch_size);
+            self.pending_shape_prewarm = pending_shape_prewarm(config, pipeline, signature.clone());
+            self.status_message = self
+                .pending_shape_prewarm
+                .as_ref()
+                .map(|pending| shape_prewarm_status_message("autotuning", &pending.token_widths));
             self.model_config = Some(model_config);
             self.pipeline_signature = Some(signature);
             self.pending_stage = None;
@@ -822,6 +865,53 @@ impl JepaRuntime {
             .expect("model config initialized with pipeline");
         let pipeline = self.pipeline.as_mut().expect("pipeline initialized");
         Ok((pipeline, model_config))
+    }
+
+    fn advance_shape_prewarm(
+        &mut self,
+        config: &BevyJepaConfig,
+        device: &JepaBevyDevice,
+    ) -> Result<bool> {
+        let image_size = config.pipeline_image_size();
+        let signature = RuntimePipelineSignature::new(config, image_size);
+        let _ = self.ensure_pipeline(config, device)?;
+        let Some(pending) = self.pending_shape_prewarm.as_mut() else {
+            self.status_message = None;
+            return Ok(true);
+        };
+        if pending.signature != signature {
+            self.pending_shape_prewarm = None;
+            self.status_message = None;
+            return Ok(true);
+        }
+
+        self.status_message = Some(shape_prewarm_status_message(
+            "autotuning",
+            &pending.token_widths,
+        ));
+        if pending.delay_frames > 0 {
+            pending.delay_frames -= 1;
+            return Ok(false);
+        }
+
+        let pipeline = self.pipeline.as_mut().expect("pipeline initialized");
+        match prewarm_feature_frame_shapes(config, pipeline, image_size, device) {
+            Ok(Some(report)) => log(&format!(
+                "bevy_jepa: prewarmed sparse token widths {:?} in {:.1} ms",
+                report.token_widths,
+                micros_to_ms(report.total_us)
+            )),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = pipeline.reset_visualization_state();
+                log(&format!(
+                    "bevy_jepa: sparse shape prewarm skipped after error: {error:#}"
+                ));
+            }
+        }
+        self.pending_shape_prewarm = None;
+        self.status_message = None;
+        Ok(true)
     }
 
     fn take_pipeline(
@@ -1042,6 +1132,7 @@ impl JepaRuntime {
         self.prev_rgba = None;
         self.prev_stage_image = None;
         self.prev_stage_rgba = None;
+        self.status_message = None;
         self.last_error = None;
     }
 
@@ -1057,6 +1148,7 @@ impl JepaRuntime {
         self.high_res_signature = None;
         self.pending_stage = None;
         self.pending_high_res = None;
+        self.pending_shape_prewarm = None;
         self.prev_image = None;
         self.prev_rgba = None;
         self.prev_stage_image = None;
@@ -1070,15 +1162,27 @@ impl JepaRuntime {
         self.last_high_res_anyup_decode_us = 0;
         self.last_high_res_pca_us = 0;
         self.last_high_res_display_tensor_us = 0;
+        self.status_message = None;
         self.last_error = None;
     }
 
     fn apply_pca_update_config(&mut self, config: &BevyJepaConfig) -> Result<()> {
         if let Some(pipeline) = self.pipeline.as_mut() {
-            pipeline.set_pca_update_config(config.pca_update_config())?;
+            sync_pipeline_pca_update_config(config, pipeline)?;
         }
         Ok(())
     }
+}
+
+fn sync_pipeline_pca_update_config(
+    config: &BevyJepaConfig,
+    pipeline: &mut FeatureFramePipeline<JepaBevyBackend>,
+) -> Result<()> {
+    let pca_update = config.pca_update_config();
+    if pipeline.config().pca_update != pca_update {
+        pipeline.set_pca_update_config(pca_update)?;
+    }
+    Ok(())
 }
 
 fn high_res_panel_enabled(config: &BevyJepaConfig) -> bool {
@@ -1985,7 +2089,12 @@ fn finish_jepa_task_output(
 ) -> Option<Result<StageProcessedFrame, String>> {
     let current_signature = RuntimePipelineSignature::new(config, config.pipeline_image_size());
     if output.signature == current_signature {
-        let pipeline = output.pipeline;
+        let mut pipeline = output.pipeline;
+        let pca_config_changed = output.pca_update != config.pca_update_config();
+        if let Err(err) = sync_pipeline_pca_update_config(config, &mut pipeline) {
+            runtime.pipeline = Some(pipeline);
+            return Some(Err(err.to_string()));
+        }
         #[cfg(target_arch = "wasm32")]
         {
             let _ = device;
@@ -2039,7 +2148,12 @@ fn finish_jepa_task_output(
         } else {
             runtime.pipeline = Some(pipeline);
         }
-        Some(output.result)
+        if pca_config_changed {
+            runtime.stale_completions = runtime.stale_completions.saturating_add(1);
+            None
+        } else {
+            Some(output.result)
+        }
     } else {
         runtime.stale_completions = runtime.stale_completions.saturating_add(1);
         runtime.pending_stage = None;
@@ -2110,6 +2224,18 @@ fn process_runtime_source_frame(
     let mut stage = None;
     #[cfg(not(target_arch = "wasm32"))]
     let stage = None;
+    if !runtime.advance_shape_prewarm(config, device)? {
+        runtime.prev_image = source.image;
+        runtime.prev_rgba = source_rgba;
+        runtime.frame_index = runtime.frame_index.saturating_add(1);
+        return Ok(Some(SourcePreviewFrame {
+            panel: input_panel,
+            sequence: frame_index,
+            source: frame_source,
+            camera_frame_received,
+            stage: None,
+        }));
+    }
     if runtime.active_task.is_none() {
         let (pipeline, model_config, signature) = runtime.take_pipeline(config, device)?;
         let image = source_stage_image(
@@ -2233,6 +2359,7 @@ fn run_jepa_task_output(mut input: AdmittedJepaTaskInput) -> JepaAsyncTaskOutput
     .map_err(|err| err.to_string());
     JepaAsyncTaskOutput {
         signature: input.signature,
+        pca_update: input.pca_update,
         pipeline: input.pipeline,
         result,
     }
@@ -2288,6 +2415,7 @@ fn admitted_jepa_task_input(
         Some(pipeline.patch_diff_refresh_state_mut()),
     )?;
     Ok(AdmittedJepaTaskInput {
+        pca_update: config.pca_update_config(),
         config,
         signature,
         pipeline,
@@ -2518,6 +2646,7 @@ struct PendingStageFrame {
 struct AdmittedJepaTaskInput {
     config: BevyJepaConfig,
     signature: RuntimePipelineSignature,
+    pca_update: FeaturePcaUpdateConfig,
     pipeline: FeatureFramePipeline<JepaBevyBackend>,
     image: Tensor<JepaBevyBackend, 4>,
     write_mask: SparseTokenMask,
@@ -2532,6 +2661,7 @@ struct AdmittedJepaTaskInput {
 
 struct JepaAsyncTaskOutput {
     signature: RuntimePipelineSignature,
+    pca_update: FeaturePcaUpdateConfig,
     pipeline: FeatureFramePipeline<JepaBevyBackend>,
     result: Result<StageProcessedFrame, String>,
 }
@@ -2625,6 +2755,42 @@ fn run_feature_frame_pipeline_auto(
 struct ShapePrewarmReport {
     token_widths: Vec<usize>,
     total_us: u64,
+}
+
+fn pending_shape_prewarm(
+    config: &BevyJepaConfig,
+    pipeline: &FeatureFramePipeline<JepaBevyBackend>,
+    signature: RuntimePipelineSignature,
+) -> Option<PendingShapePrewarm> {
+    if !config.uses_bucketed_sparse_encode() || !config.prewarm_shape_buckets {
+        return None;
+    }
+    if config.encoder_source == BevyJepaEncoderSource::TinyTest {
+        return None;
+    }
+    let grid = pipeline.grid();
+    if grid.len() < 256 {
+        return None;
+    }
+    let token_widths = shape_prewarm_masks(grid, config)
+        .into_iter()
+        .map(|mask| mask.len())
+        .collect::<Vec<_>>();
+    if token_widths.is_empty() {
+        return None;
+    }
+    Some(PendingShapePrewarm {
+        signature,
+        token_widths,
+        delay_frames: SHAPE_PREWARM_STATUS_DELAY_FRAMES,
+    })
+}
+
+fn shape_prewarm_status_message(phase: &str, token_widths: &[usize]) -> String {
+    if token_widths.is_empty() {
+        return format!("{phase} sparse token shapes");
+    }
+    format!("{phase} sparse token widths {token_widths:?}")
 }
 
 fn prewarm_feature_frame_shapes(
@@ -3518,9 +3684,13 @@ fn metric_value_text(
     kind: MetricValueKind,
 ) -> String {
     match kind {
-        MetricValueKind::Status => {
-            format!("Status   {}", metrics_source_status(config, metrics))
-        }
+        MetricValueKind::Status => format!(
+            "Status   {}",
+            runtime
+                .status_message
+                .as_deref()
+                .unwrap_or_else(|| metrics_source_status(config, metrics))
+        ),
         MetricValueKind::Model => {
             format!(
                 "Model    {} / {}",
@@ -4107,7 +4277,8 @@ fn apply_control_action(
     config: &mut BevyJepaConfig,
     action: JepaControlAction,
 ) -> JepaControlReset {
-    match action {
+    let pca_settings = PcaControlSettings::capture(config);
+    let reset = match action {
         JepaControlAction::TogglePanel
         | JepaControlAction::TabPipeline
         | JepaControlAction::TabMask
@@ -4186,7 +4357,11 @@ fn apply_control_action(
                 !config.patch_diff_refresh.blue_noise_enabled;
             JepaControlReset::Visual
         }
+    };
+    if !is_pca_control_action(action) {
+        pca_settings.apply(config);
     }
+    reset
 }
 
 fn apply_control_slider_value(
@@ -4194,7 +4369,8 @@ fn apply_control_slider_value(
     kind: JepaControlSliderKind,
     normalized: f32,
 ) -> JepaControlReset {
-    match kind {
+    let pca_settings = PcaControlSettings::capture(config);
+    let reset = match kind {
         JepaControlSliderKind::PatchDiffThreshold => {
             config.patch_diff_threshold = slider_lerp(0.0, 0.20, normalized);
             JepaControlReset::Visual
@@ -4249,7 +4425,11 @@ fn apply_control_slider_value(
                 slider_lerp(0.0, 0.05, normalized);
             JepaControlReset::Visual
         }
+    };
+    if !is_pca_slider_kind(kind) {
+        pca_settings.apply(config);
     }
+    reset
 }
 
 fn set_model_profile(config: &mut BevyJepaConfig, profile: BevyJepaModelPackageProfile) {

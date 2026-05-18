@@ -56,7 +56,7 @@ pub const DEFAULT_PCA_SAMPLE_WINDOW_FRAMES: usize = 16;
 /// Minimum frames required before fitting the first rolling PCA basis.
 pub const DEFAULT_PCA_MIN_SAMPLE_FRAMES: usize = 2;
 /// Default Oja iterations per rolling PCA update.
-pub const DEFAULT_PCA_UPDATE_ITERATIONS: usize = 4;
+pub const DEFAULT_PCA_UPDATE_ITERATIONS: usize = 1;
 /// Default high-resolution AnyUp PCA cadence; zero keeps AnyUp off the hot path.
 pub const DEFAULT_HIGH_RES_PCA_EVERY: u64 = 0;
 

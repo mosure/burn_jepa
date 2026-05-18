@@ -248,16 +248,17 @@ PCA basis. This update node is independent from `FeatureFrameSchedule`: a frame
 can update the rolling PCA basis without emitting either low-res or high-res
 display artifacts, and a display artifact can use the last stable basis without
 forcing an update. Updates consume a rolling device-resident window of
-low-resolution token-cache snapshots. The Bevy viewer default updates every
-processed low-res frame after a two-frame warmup while sampling from a 16-frame
-window, so live PCA is fit from temporal context instead of a single cache
-snapshot. Each scheduled update runs configurable orthogonalized Oja/power
-iterations, maintains a moving mean, nudges components toward the observed
-covariance directions, then normalizes the basis.
-Because the basis is rolled forward instead of recomputed from scratch, signs and
-axes remain stable across frames, which reduces PCA color flicker. This is meant
-for live visualization and domain adaptation of the display basis, not as a
-replacement for an offline PCA fit on a large feature corpus.
+low-resolution token-cache snapshots. The Bevy viewer default performs an early
+two-frame warmup update, then updates every processed low-res frame while
+sampling from a 16-frame window, so live PCA is fit from temporal context instead
+of a single cache snapshot. Each scheduled update runs configurable
+orthogonalized Oja/power iterations, maintains a moving mean, nudges components
+toward the observed covariance directions, aligns component signs with the
+previous basis, then normalizes the basis. Because the basis is rolled forward
+instead of recomputed from scratch, signs and axes remain stable across frames,
+which reduces PCA color flicker. This is meant for live visualization and domain
+adaptation of the display basis, not as a replacement for an offline PCA fit on a
+large feature corpus.
 
 The legacy `update_pca_online` config flag maps to
 `FeaturePcaUpdateConfig::rolling_low_res_every(1)` for compatibility. New code
