@@ -161,13 +161,17 @@ that regime. The Bevy RGBA patch-diff node also uses this cutoff for a sampled
 high-motion precheck, so dense frames can bypass full per-patch scoring before
 they enter JEPA. By default the Bevy viewer uses bucketed sparse encode with
 exact cache writes: the displayed mask remains the cache-write mask, while the
-encoder context is widened to stable token buckets. This preserves every
-threshold-selected patch but adds real extra context tokens, so it is an
-approximate performance mode, not dummy padding. `--sparse-encode-mode exact`
-restores one-to-one encode/write masks for experiments. `--prewarm-shape-buckets`
-is enabled by default and runs those bucket widths during pipeline
-initialization, then resets encoder/cache/PCA state before admitting live
-frames.
+encoder context is widened to stable token buckets. The default bucket list is
+10%, 25%, and 50% of the current token grid, followed by the dense width;
+the shared library config can use an empty density list for the legacy fixed
+token step, while the Bevy CLI exposes that as `--legacy-sparse-mask-buckets`.
+This preserves every threshold-selected patch but adds real extra context
+tokens, so it is an approximate performance mode, not dummy padding.
+`--sparse-encode-mode exact` restores one-to-one encode/write masks for
+experiments.
+`--prewarm-shape-buckets` is enabled by default and runs those bucket widths
+during pipeline initialization, then resets encoder/cache/PCA state before
+admitting live frames.
 Patch-diff refresh is stateful but still bounded by the same context budget:
 subthreshold residuals accumulate over time, old token positions receive
 age-priority refreshes, and a deterministic blue-noise probe covers quiet

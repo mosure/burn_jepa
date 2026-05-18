@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/bevy_jepa", "crates/burn_anyup"]
+members = [".", "crates/bevy_burn", "crates/bevy_jepa", "crates/burn_anyup"]
 default-members = ["."]
 resolver = "3"
 
@@ -17,7 +17,7 @@ documentation = "https://docs.rs/burn_jepa"
 readme = "README.md"
 categories = ["computer-vision", "science", "wasm"]
 keywords = ["burn", "jepa", "sparse", "video", "vision"]
-exclude = ["/.github/", "/crates/bevy_jepa/", "/web/"]
+exclude = ["/.github/", "/crates/bevy_burn/", "/crates/bevy_jepa/", "/web/"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -129,7 +129,7 @@ features = ["fusion", "std", "metal"]
 version = "0.21.0"
 optional = true
 default-features = false
-features = ["fusion", "std", "webgpu"]
+features = ["std", "webgpu"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"

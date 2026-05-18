@@ -54,7 +54,9 @@ in the latest packed launch smoke.
   final-teacher supervision, warmup/cosine LR, and a low-weight
   LeJEPA/SIGReg-style latent Gaussian regularizer. The dense sample warmup and
   periodic dense steps are there so the shipped encoder-only student learns both
-  full-frame initialization and sparse carried-state updates.
+  full-frame initialization and sparse carried-state updates. Best-checkpoint
+  selection is `deploy_rollout`, so dense warmup losses are reported but do not
+  promote the saved `ttt-model-best.mpk` checkpoint.
 - `configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-thirds-cuda.toml`
   and
   `configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-every-other-cuda.toml`
@@ -137,6 +139,19 @@ cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --steps 1088 --batch-size 1 --no-full-grid
 ```
 
+Evaluate the saved best sampled deploy-rollout checkpoint as a diagnostic
+candidate, but do not promote it unless the long-rollout gates beat the final
+checkpoint:
+
+```sh
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- eval-ttt \
+  --config configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-cactus-64x-cuda.toml \
+  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model-best.mpk \
+  --steps 1088 --batch-size 1 --no-full-grid
+```
+
 Evaluate adversarial no-reset scene-switch recovery:
 
 ```sh
@@ -201,6 +216,12 @@ Stage 1 is ready to continue while all of these remain true:
   `freeze_fast_update` diagnostics show the adapter is using temporal memory.
 - Per-layer `adapter_delta_to_hidden` is nonzero but not exploding.
 - Train throughput is stable and no periodic checkpoint regresses sharply.
+- A saved best sampled checkpoint is evaluated against the final checkpoint on
+  the long-rollout gates; promotion is based on long-rollout eval, not mixed
+  training loss alone.
+- Feature-stability diagnostics stay non-collapsed: token spread should remain
+  materially nonzero and late rollout segments must not converge to one feature
+  value.
 
 Start the low-LR unfrozen stage only after stage 1 plateaus. A practical
 plateau criterion is no best-loss improvement over the last 10-20% of the run

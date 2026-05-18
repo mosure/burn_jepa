@@ -9,9 +9,9 @@ mod ttt;
 pub use config::{
     BurnJepaTrainConfig, JepaDispatchBackend, JepaTrainBackend, LearningRateScheduleConfig,
     LearningRateScheduleStats, TrainModelConfig, TrainingBatchingMode, TrainingLoopConfig,
-    TttDenseSampleTrainingConfig, TttDistillationConfig, TttLatentRegularizationConfig,
-    TttSequenceCurriculumConfig, TttSparsePatchifyTrainingMode, TttSparseRolloutMode,
-    TttStreamTrainingConfig,
+    TttBestCheckpointSelection, TttDenseSampleTrainingConfig, TttDistillationConfig,
+    TttLatentRegularizationConfig, TttSequenceCurriculumConfig, TttSparsePatchifyTrainingMode,
+    TttSparseRolloutMode, TttStreamTrainingConfig,
 };
 pub use dense::{DensePredictiveLoss, VJepaTrainingBatch, dense_predictive_loss, train_dense_jepa};
 pub use mask::{

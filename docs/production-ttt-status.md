@@ -11,6 +11,8 @@ external parity/data requirements.
   `/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/model.pt`
 - TTT adapter:
   `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk`
+- Best sampled deploy-rollout checkpoint, retained for audit:
+  `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model-best.mpk`
 - Sparse policy: AutoGaze-style sparse context masks, 410 / 2048 context
   tokens, 103 / 2048 target tokens at 256px / 16 frames.
 - Eval split: 164 held-out open-set windows from
@@ -40,19 +42,36 @@ cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --config configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml
 ```
 
-Training result:
+Training result after the stability-selection pass:
 
 - Saved model:
   `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk`.
+- Saved best sampled deploy-rollout checkpoint:
+  `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model-best.mpk`
+  at step `448`.
 - 512 optimizer steps, 1024 samples, 20.0% sparse context density.
-- Loss trace: initial `0.2566`, best `0.2106`, final `0.2771`.
-- Runtime: `956.2 s`, `1.071 samples/s`.
+- Mixed loss trace: initial `0.2324`, best `0.2110`, final `0.2770`.
+- Best checkpoint loss, excluding dense warmup/checkpoint samples:
+  `0.2110`.
+- Runtime: `927.6 s`, `1.104 samples/s`.
 - Backward/optimizer remains the training bottleneck:
-  `777.6 s` backward plus `20.9 s` optimizer.
+  `751.4 s` backward plus `20.7 s` optimizer.
 - Stream mix: `952` carried windows, `72` reset windows, no stream decay, no
   periodic reset.
 - Dense stabilization samples remained enabled: `71` dense steps and `441`
   sparse steps.
+- Gradient clipping is enabled at norm `0.5`.
+
+The training instability diagnosis was a checkpointing and selection issue,
+not simply an LR issue. Two 64-step CUDA probes at `5e-7` and `2.5e-7`
+learning rate with gradient clipping reproduced the same dense-to-sparse loss
+transition, so lowering LR alone did not fix the apparent tail regression. The
+training loop now keeps raw mixed loss visible while selecting best checkpoints
+only from deploy-rollout samples by default.
+
+This pass hardens stability and selection; it is not a quality upgrade over
+the previous Memory-ALiBi eval artifact, whose same-stream cactus loss was
+`0.3237`.
 
 Matched CUDA evals:
 
@@ -60,15 +79,29 @@ Matched CUDA evals:
 |---|---:|---:|---:|---:|---:|
 | Base sparse V-JEPA 2.1, same-stream cactus repeat | 1088 | 1 | 0.4799 | 0.7989 | 0.0000 |
 | Reset16 EMA TTT, same-stream cactus repeat | 136 | 9 | 0.3270 | 0.8666 | +0.0049 |
-| Memory-ALiBi TTT, same-stream cactus repeat | 1088 | 1 | 0.3237 | 0.8661 | -0.0009 |
+| Memory-ALiBi TTT final, same-stream cactus repeat | 1088 | 1 | 0.3273 | 0.8646 | -0.0009 |
+| Memory-ALiBi TTT train-loss-best, same-stream cactus repeat | 1088 | 1 | 0.3289 | 0.8639 | -0.0009 |
 | Reset-scene EMA TTT, adversarial stitched stream | 64 | 64 | 0.4209 | 0.8215 | -0.0338 |
-| Memory-ALiBi TTT, adversarial stitched stream | 512 | 1 | 0.2837 | 0.8812 | -0.0223 |
+| Memory-ALiBi TTT final, adversarial stitched stream | 512 | 1 | 0.2850 | 0.8807 | -0.0229 |
 
 The important change is not just aggregate loss.  The 1088-window same-stream
 run carried state for `1087` consecutive windows and stayed flat across the
-four 272-window segments (`0.3244 -> 0.3235` loss).  The adversarial stitched
+four 272-window segments (`0.3279 -> 0.3271` loss).  The adversarial stitched
 run carried through `502` scene switches without explicit reset and improved
-from first to last quarter (`0.2952 -> 0.2729` loss).
+from first to last quarter (`0.2967 -> 0.2739` loss).
+
+Feature-stability diagnostics did not show token collapse:
+
+| Gate | Relative spread | Mean pairwise token cosine | Collapse score |
+|---|---:|---:|---:|
+| Same-stream cactus repeat, final | 0.4573 | 0.7891 | 0.4283 |
+| Adversarial stitched stream, final | 0.4620 | 0.7836 | 0.4219 |
+
+The train-loss-best checkpoint is kept because it proves the checkpoint policy
+works, but it is not the promoted deployment checkpoint: the long-rollout eval
+gate selected the final checkpoint for this run. Future production promotion
+should always choose from saved checkpoints using the long-rollout gate, not
+raw mixed training loss alone.
 
 Promotion decision: Memory-ALiBi replaces the reset16 `longstable` checkpoint as
 the current candidate for carry-forever sparse temporal V-JEPA 2.1.  The
@@ -80,9 +113,10 @@ and includes the Memory-ALiBi TTT shape.
 Artifact reports:
 
 - `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-report.json`
-- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-candidate.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-final.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-best.json`
 - `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-base-sparse.json`
-- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-adversarial-8x/ttt-eval-report-candidate.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-adversarial-8x/ttt-eval-report-final.json`
 - `target/burn-jepa-production-final-256/long-rollout-cactus-repeat-reset16/ttt-eval-report-longstable-reset16.json`
 - `target/burn-jepa-production-final-256/long-rollout-adversarial-stitch-reset-4x/ttt-eval-report-longstable-reset-scene.json`
 

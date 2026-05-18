@@ -1437,7 +1437,7 @@ fn sparse_mask_bucket_padding_does_not_become_write_mask() {
     let masks = finalize_patch_diff_masks(changed.clone(), grid, &config);
 
     assert_eq!(masks.write_mask, changed);
-    assert_eq!(masks.encode_mask.len(), DEFAULT_SPARSE_MASK_BUCKET_TOKENS);
+    assert_eq!(masks.encode_mask.len(), 102);
     assert!(
         masks
             .encode_mask
@@ -1456,7 +1456,7 @@ fn default_sparse_encode_mode_keeps_writes_exact_and_buckets_encode() {
     let masks = finalize_patch_diff_masks(changed.clone(), grid, &config);
 
     assert_eq!(masks.write_mask, changed);
-    assert_eq!(masks.encode_mask.len(), DEFAULT_SPARSE_MASK_BUCKET_TOKENS);
+    assert_eq!(masks.encode_mask.len(), 102);
     assert!(
         masks
             .encode_mask
@@ -1497,8 +1497,27 @@ fn shape_prewarm_masks_cover_bucket_widths_once() {
     let masks = shape_prewarm_masks(grid, &config);
     let widths: Vec<_> = masks.iter().map(SparseTokenMask::len).collect();
 
-    assert_eq!(widths, vec![256, 512, 1024]);
+    assert_eq!(widths, vec![102, 256, 512, 1024]);
     assert!(masks.last().expect("dense mask").is_dense_ordered());
+}
+
+#[test]
+fn empty_sparse_bucket_density_list_uses_legacy_bucket_token_width() {
+    let grid = TokenGridShape::new(1, 32, 32);
+    let config = BevyJepaConfig {
+        pipeline: FeatureFrameViewerConfig {
+            sparse_encode_mode: BevyJepaSparseEncodeMode::BucketedContext,
+            sparse_mask_bucket_densities: Vec::new(),
+            prewarm_shape_buckets: true,
+            ..FeatureFrameViewerConfig::default()
+        },
+        ..BevyJepaConfig::default()
+    };
+
+    let masks = shape_prewarm_masks(grid, &config);
+    let widths: Vec<_> = masks.iter().map(SparseTokenMask::len).collect();
+
+    assert_eq!(widths, vec![256, 512, 1024]);
 }
 
 #[test]

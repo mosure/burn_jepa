@@ -3,10 +3,10 @@ use super::step::{self, TttRolloutKind};
 use crate::training::batch::TrainingBatchPlanner;
 use crate::training::config::BurnJepaTrainConfig;
 use crate::training::report::{
-    TttDomainEvalMetric, TttLongRolloutMetrics, TttLongRolloutSegmentMetric,
-    TttLongRolloutStreamMetric, TttStageMetrics, TttStreamTrainingMetrics,
-    TttTemporalDiagnosticMetrics, TttTemporalSegmentMetric, TttTemporalSegmentMetrics,
-    TttUtilizationMetrics, tensor_scalar,
+    TttDomainEvalMetric, TttFeatureStabilityMetrics, TttLongRolloutMetrics,
+    TttLongRolloutSegmentMetric, TttLongRolloutStreamMetric, TttStageMetrics,
+    TttStreamTrainingMetrics, TttTemporalDiagnosticMetrics, TttTemporalSegmentMetric,
+    TttTemporalSegmentMetrics, TttUtilizationMetrics, tensor_scalar,
 };
 use crate::{
     JepaSampleMetadata, SparseMaskBatch, TokenGridShape, VJepa2_1Model, VJepaTttModel,
@@ -37,6 +37,7 @@ pub(super) struct TttEvalSummary {
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub feature_stability: Option<TttFeatureStabilityMetrics>,
     pub long_rollout: Option<TttLongRolloutMetrics>,
     pub stream: TttStreamTrainingMetrics,
 }
@@ -300,6 +301,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyBackend>(
     let mut utilization = None;
     let mut temporal_diagnostics = TemporalDiagnosticAccumulator::default();
     let mut temporal_segments = TemporalSegmentAccumulator::new(3);
+    let mut feature_stability = FeatureStabilityAccumulator::default();
     let expected_windows = steps.saturating_mul(eval_batch_size.max(1)).max(1);
     let mut long_rollout = LongRolloutAccumulator::new(expected_windows, 4);
     let mut stream_state = super::StreamStateTracker::<B>::default();
@@ -459,6 +461,9 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyBackend>(
                 device,
             )?;
         }
+        if config.training.eval_feature_stability_diagnostics {
+            feature_stability.add_batch(student.free_run.tokens.clone())?;
+        }
         total += primary_loss * batch_size as f64;
         total_feature += feature_loss * batch_size as f64;
         if let Some(predictor_loss) = predictor_loss {
@@ -604,6 +609,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyBackend>(
         utilization,
         temporal_diagnostics: temporal_diagnostics.finish(),
         temporal_segments: temporal_segments.finish(),
+        feature_stability: feature_stability.finish(),
         long_rollout: long_rollout.finish(),
         stream: stream_state.metrics(config, false),
     })
@@ -903,6 +909,131 @@ impl TemporalSegmentAccumulator {
             late_minus_early_cosine,
             segments,
         })
+    }
+}
+
+#[derive(Default)]
+struct FeatureStabilityAccumulator {
+    samples: usize,
+    spatial_std_rms: f64,
+    relative_spread: f64,
+    mean_pairwise_token_cosine: f64,
+    collapse_score: f64,
+}
+
+impl FeatureStabilityAccumulator {
+    fn add_batch<B: Backend>(&mut self, tokens: Tensor<B, 3>) -> Result<()> {
+        let [batch, token_count, dim] = tokens.shape().dims::<3>();
+        if token_count == 0 || dim == 0 {
+            return Ok(());
+        }
+        let values = tokens
+            .into_data()
+            .to_vec::<f32>()
+            .context("read TTT feature stability tokens")?;
+        for sample in 0..batch {
+            let start = sample * token_count * dim;
+            let end = start + token_count * dim;
+            let metrics = feature_stability_for_sample(&values[start..end], token_count, dim);
+            self.samples += 1;
+            self.spatial_std_rms += metrics.spatial_std_rms;
+            self.relative_spread += metrics.relative_spread;
+            self.mean_pairwise_token_cosine += metrics.mean_pairwise_token_cosine;
+            self.collapse_score += metrics.collapse_score;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Option<TttFeatureStabilityMetrics> {
+        (self.samples > 0).then(|| {
+            let denom = self.samples as f64;
+            TttFeatureStabilityMetrics {
+                samples: self.samples,
+                spatial_std_rms: self.spatial_std_rms / denom,
+                relative_spread: self.relative_spread / denom,
+                mean_pairwise_token_cosine: self.mean_pairwise_token_cosine / denom,
+                collapse_score: self.collapse_score / denom,
+            }
+        })
+    }
+}
+
+fn feature_stability_for_sample(
+    values: &[f32],
+    token_count: usize,
+    dim: usize,
+) -> TttFeatureStabilityMetrics {
+    let mut mean = vec![0.0f64; dim];
+    let mut feature_rms = 0.0f64;
+    for token in 0..token_count {
+        let base = token * dim;
+        for offset in 0..dim {
+            let value = values[base + offset] as f64;
+            mean[offset] += value;
+            feature_rms += value * value;
+        }
+    }
+    for value in &mut mean {
+        *value /= token_count as f64;
+    }
+    let mut variance = 0.0f64;
+    for token in 0..token_count {
+        let base = token * dim;
+        for offset in 0..dim {
+            let centered = values[base + offset] as f64 - mean[offset];
+            variance += centered * centered;
+        }
+    }
+    let denom = (token_count * dim).max(1) as f64;
+    let spatial_std_rms = (variance / denom).sqrt();
+    let feature_rms = (feature_rms / denom).sqrt();
+    let relative_spread = spatial_std_rms / feature_rms.max(1.0e-12);
+    let mean_pairwise_token_cosine = sampled_mean_pairwise_token_cosine(values, token_count, dim);
+    let collapse_score =
+        (1.0 - relative_spread).clamp(0.0, 1.0) * mean_pairwise_token_cosine.max(0.0);
+    TttFeatureStabilityMetrics {
+        samples: 1,
+        spatial_std_rms,
+        relative_spread,
+        mean_pairwise_token_cosine,
+        collapse_score,
+    }
+}
+
+fn sampled_mean_pairwise_token_cosine(values: &[f32], token_count: usize, dim: usize) -> f64 {
+    if token_count < 2 || dim == 0 {
+        return 0.0;
+    }
+    let stride = (token_count / 16).max(1);
+    let mut cosine_sum = 0.0f64;
+    let mut cosine_count = 0usize;
+    for left in (0..token_count).step_by(stride) {
+        let right = (left + stride).min(token_count - 1);
+        if left == right {
+            continue;
+        }
+        let left_base = left * dim;
+        let right_base = right * dim;
+        let mut dot = 0.0f64;
+        let mut left_norm = 0.0f64;
+        let mut right_norm = 0.0f64;
+        for offset in 0..dim {
+            let left = values[left_base + offset] as f64;
+            let right = values[right_base + offset] as f64;
+            dot += left * right;
+            left_norm += left * left;
+            right_norm += right * right;
+        }
+        let denom = left_norm.sqrt() * right_norm.sqrt();
+        if denom > 0.0 {
+            cosine_sum += dot / denom;
+            cosine_count += 1;
+        }
+    }
+    if cosine_count == 0 {
+        0.0
+    } else {
+        cosine_sum / cosine_count as f64
     }
 }
 

@@ -5,12 +5,13 @@ use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_jepa::{
     BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseMaskBatch,
-    SparseTokenMask, TttBackpropMode, TttEncoderConfig, TttEvalModelKind, TttInsertionMode,
-    TttLayerPlacement, TttLayerState, TttMemoryDynamics, TttMemoryUpdateSource,
-    TttRolloutReportMode, TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttState,
-    TttStreamStepKind, TttSupervisionMode, TttTargetMode, VJepa2_1Model, VJepaTttLayer,
-    VJepaTttModel, apply_token_mask, evaluate_ttt_base_sparse, evaluate_ttt_model_file,
-    load_jepa_tensor_batch, synthetic_video, train_dense_jepa, train_ttt_distillation,
+    SparseTokenMask, TttBackpropMode, TttBestCheckpointSelection, TttEncoderConfig,
+    TttEvalModelKind, TttInsertionMode, TttLayerPlacement, TttLayerState, TttMemoryDynamics,
+    TttMemoryUpdateSource, TttRolloutReportMode, TttSparsePatchifyTrainingMode,
+    TttSparseRolloutMode, TttState, TttStreamStepKind, TttSupervisionMode, TttTargetMode,
+    VJepa2_1Model, VJepaTttLayer, VJepaTttModel, apply_token_mask, evaluate_ttt_base_sparse,
+    evaluate_ttt_model_file, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
+    train_ttt_distillation,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -46,6 +47,7 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     config.ttt.backprop_mode = TttBackpropMode::LayerLocal;
     config.training.max_steps = 3;
     config.training.batch_size = 2;
+    config.training.gradient_clip_norm = 0.25;
     config.training.lr_schedule = burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine {
         warmup_steps: 1,
         min_learning_rate: 1.0e-5,
@@ -63,6 +65,9 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     assert!(toml.contains("supervision = \"hybrid\""));
     assert!(toml.contains("hybrid_final_steps = 2"));
     assert!(toml.contains("backprop_mode = \"layer_local\""));
+    assert!(toml.contains("save_best_model = true"));
+    assert!(toml.contains("best_checkpoint_selection = \"deploy_rollout\""));
+    assert!(toml.contains("gradient_clip_norm = 0.25"));
     assert!(toml.contains("[training.lr_schedule]"));
     assert!(toml.contains("kind = \"linear_warmup_cosine\""));
     assert!(toml.contains("[loss]"));
@@ -87,6 +92,12 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     assert_eq!(parsed.ttt.backprop_mode, TttBackpropMode::LayerLocal);
     assert_eq!(parsed.training.max_steps, 3);
     assert_eq!(parsed.training.batch_size, 2);
+    assert_eq!(parsed.training.gradient_clip_norm, 0.25);
+    assert!(parsed.model.save_best_model);
+    assert_eq!(
+        parsed.model.best_checkpoint_selection,
+        TttBestCheckpointSelection::DeployRollout
+    );
     assert!(matches!(
         parsed.training.lr_schedule,
         burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine { .. }
@@ -322,6 +333,12 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
         carry_forever_alibi.ttt.memory_dynamics,
         TttMemoryDynamics::MemoryAlibi
     );
+    assert!(carry_forever_alibi.model.save_best_model);
+    assert_eq!(
+        carry_forever_alibi.model.best_checkpoint_selection,
+        TttBestCheckpointSelection::DeployRollout
+    );
+    assert_eq!(carry_forever_alibi.training.gradient_clip_norm, 0.5);
     assert_eq!(carry_forever_alibi.ttt.memory_bank_count(), 3);
     assert!(carry_forever_alibi.training.stream.enabled);
     assert_eq!(carry_forever_alibi.training.stream.reset_interval_steps, 0);
@@ -450,6 +467,11 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
             .reset_on_scene_change
     );
     assert_eq!(carry_forever_cactus_eval.training.eval_steps, 1088);
+    assert!(
+        carry_forever_cactus_eval
+            .training
+            .eval_feature_stability_diagnostics
+    );
     assert_eq!(
         carry_forever_adversarial_eval.dataset.repeat_mode,
         burn_jepa::JepaDatasetRepeatMode::AdversarialStitchedStream
@@ -460,6 +482,11 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
             .stream
             .reset_interval_steps,
         0
+    );
+    assert!(
+        carry_forever_adversarial_eval
+            .training
+            .eval_feature_stability_diagnostics
     );
 
     assert_eq!(stage2.ttt.layers, vec![3, 7, 11]);
@@ -1997,6 +2024,7 @@ fn ttt_stream_eval_carries_manifest_state_between_windows() {
 
     assert_eq!(eval.model_kind, TttEvalModelKind::Checkpoint);
     assert!(eval.model_path.is_some());
+    assert!(eval.feature_stability.is_none());
     assert!(eval.stream.enabled);
     assert_eq!(eval.stream.reset_steps, 1);
     assert_eq!(eval.stream.carried_steps, 1);
@@ -2042,6 +2070,18 @@ fn ttt_stream_eval_carries_manifest_state_between_windows() {
     assert_eq!(base_eval.stream.reset_steps, 1);
     assert_eq!(base_eval.stream.carried_steps, 1);
     assert!(base_eval.loss.is_finite());
+
+    config.training.eval_feature_stability_diagnostics = true;
+    let stability_eval =
+        evaluate_ttt_base_sparse::<AB>(&config, &device, 2).expect("feature stability eval");
+    let stability = stability_eval
+        .feature_stability
+        .expect("feature stability should be opt-in");
+    assert_eq!(stability.samples, 2);
+    assert!(stability.spatial_std_rms.is_finite());
+    assert!(stability.relative_spread.is_finite());
+    assert!(stability.mean_pairwise_token_cosine.is_finite());
+    assert!(stability.collapse_score.is_finite());
 }
 
 #[test]
@@ -2468,6 +2508,94 @@ fn ttt_training_can_disable_per_step_loss_trace_sync() {
     assert_eq!(report.initial_loss, report.final_loss);
     assert_eq!(report.best_loss, report.final_loss);
     assert_eq!(report.rollout.mode, TttRolloutReportMode::Dense);
+}
+
+#[test]
+fn ttt_training_rejects_negative_gradient_clip_norm() {
+    let mut config = BurnJepaTrainConfig::default();
+    config.training.gradient_clip_norm = -1.0;
+    let error = config
+        .validate_for_ttt()
+        .expect_err("negative gradient clip norm should be invalid");
+    assert!(
+        error.to_string().contains("gradient_clip_norm"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn ttt_training_saves_best_sampled_checkpoint() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-best-checkpoint");
+    config.model.save_model = true;
+    config.model.save_best_model = true;
+    config.training.max_steps = 2;
+    config.training.batch_size = 1;
+    config.training.loss_trace_interval = 1;
+    config.training.gradient_clip_norm = 0.5;
+    config.dataset.synthetic_len = 1;
+
+    let report = train_ttt_distillation::<AB>(&config, &device).expect("training with best save");
+    let final_model = report.model_path.expect("final TTT model path");
+    let best_model = report.best_model_path.expect("best TTT model path");
+
+    assert!(
+        final_model.exists(),
+        "final model missing at {final_model:?}"
+    );
+    assert!(best_model.exists(), "best model missing at {best_model:?}");
+    assert_eq!(
+        best_model.file_name().and_then(|name| name.to_str()),
+        Some("ttt-model-best.mpk")
+    );
+    assert!(
+        report
+            .best_model_step
+            .is_some_and(|step| (1..=2).contains(&step))
+    );
+    assert_eq!(report.gradient_clip_norm, 0.5);
+}
+
+#[test]
+fn ttt_training_best_checkpoint_skips_dense_warmup_by_default() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-best-deploy-rollout");
+    config.model.save_model = true;
+    config.model.save_best_model = true;
+    config.model.best_checkpoint_selection = TttBestCheckpointSelection::DeployRollout;
+    config.training.max_steps = 2;
+    config.training.batch_size = 1;
+    config.training.loss_trace_interval = 1;
+    config.training.dense_samples.enabled = true;
+    config.training.dense_samples.warmup_steps = 1;
+    config.training.dense_samples.interval_steps = 0;
+    config.training.mask = Some(burn_jepa::TrainingMaskConfig::PrecomputedMasks {
+        context_indices: vec![0, 2, 5, 7],
+        target_indices: vec![1, 3],
+    });
+    config.training.sparse_rollout = TttSparseRolloutMode::TargetMask;
+    config.training.sparse_patchify_training = TttSparsePatchifyTrainingMode::DensePatchEmbed;
+    config.dataset.synthetic_len = 1;
+
+    let report =
+        train_ttt_distillation::<AB>(&config, &device).expect("training with dense warmup");
+
+    assert_eq!(
+        report.best_checkpoint_selection,
+        TttBestCheckpointSelection::DeployRollout
+    );
+    assert_eq!(
+        report.best_model_step,
+        Some(2),
+        "default best checkpoint should track deploy sparse rollout, not dense warmup"
+    );
+    assert_eq!(report.dense_samples.dense_steps, 1);
+    assert_eq!(report.dense_samples.sparse_steps, 1);
+    assert!(report.best_checkpoint_loss.is_some());
 }
 
 #[test]

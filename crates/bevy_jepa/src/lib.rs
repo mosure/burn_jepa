@@ -60,9 +60,10 @@ pub use config::{
     DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
     DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES,
     DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
-    DEFAULT_SPARSE_MASK_BUCKET_TOKENS, DEFAULT_TTT_MODEL_PATH, DEFAULT_VJEPA21_CHECKPOINT_DIR,
-    DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME, FeatureFrameViewerConfig,
-    MIN_PIPELINE_IMAGE_SIZE, PIPELINE_IMAGE_SIZE_MULTIPLE, PatchDiffRefreshConfig,
+    DEFAULT_SPARSE_MASK_BUCKET_DENSITIES, DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
+    DEFAULT_TTT_MODEL_PATH, DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH,
+    DEFAULT_VJEPA21_WEIGHTS_NAME, FeatureFrameViewerConfig, MIN_PIPELINE_IMAGE_SIZE,
+    PIPELINE_IMAGE_SIZE_MULTIPLE, PatchDiffRefreshConfig,
     default_anyup_model_manifest_path_for_profile, default_model_manifest_path_for_profile,
 };
 use display::{
@@ -289,6 +290,7 @@ struct RuntimePipelineSignature {
     patch_diff_blue_noise_seed: u64,
     patch_diff_refresh_max_density_bits: u32,
     sparse_mask_bucket_tokens: usize,
+    sparse_mask_bucket_density_bits: Vec<u32>,
     prewarm_shape_buckets: bool,
     ttt_runtime_enabled: bool,
     ttt_update_fast_weight: bool,
@@ -370,6 +372,11 @@ impl RuntimePipelineSignature {
                 .max_extra_density
                 .to_bits(),
             sparse_mask_bucket_tokens: config.sparse_mask_bucket_tokens,
+            sparse_mask_bucket_density_bits: config
+                .sparse_mask_bucket_densities
+                .iter()
+                .map(|density| density.to_bits())
+                .collect(),
             prewarm_shape_buckets: config.prewarm_shape_buckets,
             ttt_runtime_enabled: config.ttt_runtime.enabled,
             ttt_update_fast_weight: config.ttt_runtime.update_fast_weight,

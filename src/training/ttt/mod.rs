@@ -7,7 +7,7 @@ use super::batch::{
     TrainingBatchPlanner, TrainingBatchPrefetcher, cpu_batch_from_planner,
     materialize_training_batch,
 };
-use super::config::BurnJepaTrainConfig;
+use super::config::{BurnJepaTrainConfig, TttBestCheckpointSelection};
 use super::model_io::{load_student_model, load_teacher_model};
 use super::report::{
     TrainingLossSummary, TttBackpropMetrics, TttDenseSampleMetrics, TttEvalModelKind,
@@ -18,7 +18,7 @@ use super::report::{
 use crate::{JepaSampleMetadata, TttState, VJepaTttModel, dataset_from_config, video_token_grid};
 use anyhow::{Context, Result, ensure};
 use burn::module::Module;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamWConfig, GradientsParams, Optimizer, grad_clipping::GradientClippingConfig};
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
@@ -384,9 +384,13 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             )
             .with_context(|| format!("load TTT checkpoint {}", path.display()))?;
     }
-    let mut optim = AdamWConfig::new()
-        .with_weight_decay(config.training.weight_decay)
-        .init::<B, VJepaTttModel<B>>();
+    let mut optim_config = AdamWConfig::new().with_weight_decay(config.training.weight_decay);
+    if config.training.gradient_clip_norm > 0.0 {
+        optim_config = optim_config.with_grad_clipping(Some(GradientClippingConfig::Norm(
+            config.training.gradient_clip_norm,
+        )));
+    }
+    let mut optim = optim_config.init::<B, VJepaTttModel<B>>();
     let dataset = dataset_from_config(&config.dataset, true)?;
     validate_stream_dataset(config, dataset.as_ref())?;
     let batch_planner = TrainingBatchPlanner::new(dataset.as_ref(), config.training.batching)?;
@@ -429,6 +433,9 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     let mut train_samples = 0usize;
     let mut dense_sample_steps = 0usize;
     let mut sparse_sample_steps = 0usize;
+    let mut best_model_path = None;
+    let mut best_model_step = None;
+    let mut best_checkpoint_loss = None;
 
     for step_index in 0..config.training.max_steps {
         let supervision = config
@@ -585,6 +592,24 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
                 stream_step_kind,
                 stream_reset_interval,
             );
+            let checkpoint_eligible = best_checkpoint_eligible(
+                config.model.best_checkpoint_selection,
+                dense_sample_step,
+                step_rollout,
+                stream_step_kind,
+            );
+            let checkpoint_improved =
+                checkpoint_eligible && best_checkpoint_loss.is_none_or(|best| final_loss < best);
+            if checkpoint_improved {
+                best_checkpoint_loss = Some(final_loss);
+            }
+            if checkpoint_improved && config.model.save_model && config.model.save_best_model {
+                let save_start = Instant::now();
+                let path = save_model_to_stem(config, &model, "ttt-model-best")?;
+                train_stage.report_ms += save_start.elapsed().as_millis();
+                best_model_path = Some(path);
+                best_model_step = Some(step_number);
+            }
         }
 
         let backward_start = Instant::now();
@@ -650,6 +675,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         mut utilization,
         temporal_diagnostics,
         temporal_segments,
+        feature_stability,
         eval_long_rollout,
     ) = if config.training.eval_steps > 0 {
         let eval = eval::evaluate_ttt_dataset(
@@ -677,6 +703,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             eval.utilization,
             eval.temporal_diagnostics,
             eval.temporal_segments,
+            eval.feature_stability,
             eval.long_rollout,
         )
     } else {
@@ -695,6 +722,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             0,
             TttStageMetrics::default(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -784,12 +812,18 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         utilization,
         temporal_diagnostics,
         temporal_segments,
+        feature_stability,
         eval_long_rollout,
         train_elapsed_ms,
         eval_elapsed_ms,
         elapsed_ms,
         samples_per_second: samples_per_second(samples, train_elapsed_ms),
         model_path,
+        best_model_path,
+        best_model_step,
+        best_checkpoint_loss,
+        best_checkpoint_selection: config.model.best_checkpoint_selection,
+        gradient_clip_norm: config.training.gradient_clip_norm,
         report_path: config.model.output_dir.join("ttt-report.json"),
     };
     let report_start = Instant::now();
@@ -923,6 +957,7 @@ fn evaluate_ttt_model_optional_file<B: step::TttSparsePatchifyBackend>(
         utilization: eval.utilization,
         temporal_diagnostics: eval.temporal_diagnostics,
         temporal_segments: eval.temporal_segments,
+        feature_stability: eval.feature_stability,
         long_rollout: eval.long_rollout,
         stream: eval.stream,
         elapsed_ms,
@@ -1062,15 +1097,40 @@ fn save_model_if_enabled<B: step::TttSparsePatchifyTrainingBackend>(
     if !config.model.save_model {
         return Ok(None);
     }
-    let path = config.model.output_dir.join("ttt-model");
+    save_model_to_stem(config, model, "ttt-model").map(Some)
+}
+
+fn save_model_to_stem<B: step::TttSparsePatchifyTrainingBackend>(
+    config: &BurnJepaTrainConfig,
+    model: &VJepaTttModel<B>,
+    stem: &str,
+) -> Result<std::path::PathBuf> {
+    let path = config.model.output_dir.join(stem);
     model
         .clone()
         .save_file(
             path.clone(),
             &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
         )
-        .context("save TTT model")?;
-    Ok(Some(path.with_extension("mpk")))
+        .with_context(|| format!("save TTT model {}", path.display()))?;
+    Ok(path.with_extension("mpk"))
+}
+
+fn best_checkpoint_eligible(
+    selection: TttBestCheckpointSelection,
+    dense_sample_step: bool,
+    rollout: step::TttRolloutKind,
+    stream_step: Option<TttStreamStepKind>,
+) -> bool {
+    let sparse_step = !dense_sample_step && rollout != step::TttRolloutKind::Dense;
+    match selection {
+        TttBestCheckpointSelection::AllSampled => true,
+        TttBestCheckpointSelection::DeployRollout => !dense_sample_step,
+        TttBestCheckpointSelection::SparseOnly => sparse_step,
+        TttBestCheckpointSelection::CarriedSparseOnly => {
+            sparse_step && !matches!(stream_step, Some(TttStreamStepKind::Reset))
+        }
+    }
 }
 
 struct LossProgress {
@@ -1103,9 +1163,12 @@ impl LossProgress {
         trace_interval: usize,
         stream_step: Option<TttStreamStepKind>,
         effective_reset_interval_steps: Option<usize>,
-    ) {
+    ) -> bool {
         self.initial_loss.get_or_insert(loss);
-        self.best_loss = self.best_loss.min(loss);
+        let improved = loss < self.best_loss;
+        if improved {
+            self.best_loss = loss;
+        }
         self.final_loss = loss;
         if trace_interval > 0 && step.is_multiple_of(trace_interval) {
             self.loss_trace.push(TttStepMetric {
@@ -1115,5 +1178,6 @@ impl LossProgress {
                 effective_reset_interval_steps,
             });
         }
+        improved
     }
 }

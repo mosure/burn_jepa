@@ -59,10 +59,13 @@ the sampled frame is already above the cutoff.
 The viewer defaults to shape-stable bucketed sparse encode with exact cache
 writes (`bucketed-context`): threshold-selected patches still define the
 low-res cache overwrite mask, while the encoder context is widened into stable
-GPU buckets controlled by `--sparse-mask-bucket-tokens 256`. This never drops
-threshold-selected patches, but it adds real extra context tokens, so use
-`--sparse-encode-mode exact` when an experiment needs encode tokens to match the
-displayed write mask exactly.
+GPU buckets. The default buckets are grid-relative densities
+`--sparse-mask-bucket-densities 0.10,0.25,0.50`, with dense as the final
+fallback. `--legacy-sparse-mask-buckets` restores the fixed-width
+`--sparse-mask-bucket-tokens 256` stepping. This never drops threshold-selected
+patches, but it adds real extra context tokens, so use `--sparse-encode-mode
+exact` when an experiment needs encode tokens to match the displayed write mask
+exactly.
 `--prewarm-shape-buckets` is enabled by default to move bucket specializations
 to startup; use `--no-prewarm-shape-buckets` to disable it.
 The pipeline image size is at least 256x256, defaults to 512x512 sparse

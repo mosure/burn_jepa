@@ -56,6 +56,7 @@ eval_batch_size = 1
 eval_full_grid = false
 eval_utilization_diagnostics = true
 eval_temporal_diagnostics = false
+eval_feature_stability_diagnostics = true
 cache_teacher_tokens = true
 teacher_cache_max_entries = 256
 prefetch_batches = true

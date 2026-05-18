@@ -105,6 +105,10 @@ impl BurnJepaTrainConfig {
             self.training.learning_rate.is_finite() && self.training.learning_rate >= 0.0,
             "training.learning_rate must be finite and non-negative"
         );
+        ensure!(
+            self.training.gradient_clip_norm.is_finite() && self.training.gradient_clip_norm >= 0.0,
+            "training.gradient_clip_norm must be finite and non-negative"
+        );
         self.training
             .lr_schedule
             .validate(self.training.max_steps, self.training.learning_rate)?;
@@ -159,6 +163,8 @@ pub struct TrainModelConfig {
     pub weights_name: Option<String>,
     pub output_dir: PathBuf,
     pub save_model: bool,
+    pub save_best_model: bool,
+    pub best_checkpoint_selection: TttBestCheckpointSelection,
 }
 
 impl Default for TrainModelConfig {
@@ -171,8 +177,20 @@ impl Default for TrainModelConfig {
             weights_name: None,
             output_dir: PathBuf::from("target/burn-jepa-train"),
             save_model: true,
+            save_best_model: true,
+            best_checkpoint_selection: TttBestCheckpointSelection::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TttBestCheckpointSelection {
+    AllSampled,
+    #[default]
+    DeployRollout,
+    SparseOnly,
+    CarriedSparseOnly,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,6 +204,7 @@ pub struct TrainingLoopConfig {
     pub learning_rate: f64,
     pub lr_schedule: LearningRateScheduleConfig,
     pub weight_decay: f32,
+    pub gradient_clip_norm: f32,
     pub context_keep_ratio: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<TrainingMaskConfig>,
@@ -198,6 +217,7 @@ pub struct TrainingLoopConfig {
     pub eval_full_grid: bool,
     pub eval_utilization_diagnostics: bool,
     pub eval_temporal_diagnostics: bool,
+    pub eval_feature_stability_diagnostics: bool,
     pub cache_teacher_tokens: bool,
     pub teacher_cache_max_entries: usize,
     pub prefetch_batches: bool,
@@ -216,6 +236,7 @@ impl Default for TrainingLoopConfig {
             learning_rate: 1.0e-3,
             lr_schedule: LearningRateScheduleConfig::default(),
             weight_decay: 0.0,
+            gradient_clip_norm: 0.0,
             context_keep_ratio: 0.75,
             mask: None,
             sparse_rollout: TttSparseRolloutMode::Auto,
@@ -227,6 +248,7 @@ impl Default for TrainingLoopConfig {
             eval_full_grid: true,
             eval_utilization_diagnostics: false,
             eval_temporal_diagnostics: false,
+            eval_feature_stability_diagnostics: false,
             cache_teacher_tokens: false,
             teacher_cache_max_entries: 32,
             prefetch_batches: false,

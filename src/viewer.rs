@@ -27,6 +27,8 @@ pub const DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 1.0 - DEFAULT_PATCH_DIFF_QUALITY;
 pub const DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY: f32 = 0.60;
 /// Default sparse encode bucket width used to reduce GPU shape churn.
 pub const DEFAULT_SPARSE_MASK_BUCKET_TOKENS: usize = 256;
+/// Default sparse encode bucket densities used before falling back to the dense shape.
+pub const DEFAULT_SPARSE_MASK_BUCKET_DENSITIES: &[f32] = &[0.10, 0.25, 0.50];
 /// Whether patch-diff refresh adds bounded drift-prevention tokens by default.
 pub const DEFAULT_PATCH_DIFF_REFRESH_ENABLED: bool = true;
 /// Default residual decay for subthreshold patch-diff evidence.
@@ -559,6 +561,12 @@ pub struct FeatureFrameViewerConfig {
     pub sparse_encode_mode: FeatureFrameSparseEncodeMode,
     /// Token bucket width used with [`FeatureFrameSparseEncodeMode::BucketedContext`].
     pub sparse_mask_bucket_tokens: usize,
+    /// Optional grid-relative bucket targets used before the legacy fixed-width step.
+    ///
+    /// Values are densities in `(0, 1]`, so `0.10` means roughly 10% of the
+    /// current token grid. When empty, the legacy `sparse_mask_bucket_tokens`
+    /// multiple is used.
+    pub sparse_mask_bucket_densities: Vec<f32>,
     /// Bounded refresh policy for slow/stale patch-diff tokens.
     pub patch_diff_refresh: PatchDiffRefreshConfig,
     /// Prewarm bucketed sparse widths during startup.
@@ -595,6 +603,7 @@ impl Default for FeatureFrameViewerConfig {
             patch_diff_dense_fallback_density: DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
             sparse_encode_mode: FeatureFrameSparseEncodeMode::BucketedContext,
             sparse_mask_bucket_tokens: DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
+            sparse_mask_bucket_densities: DEFAULT_SPARSE_MASK_BUCKET_DENSITIES.to_vec(),
             patch_diff_refresh: PatchDiffRefreshConfig::default(),
             prewarm_shape_buckets: DEFAULT_PREWARM_SHAPE_BUCKETS,
             anyup_q_chunk_size: DEFAULT_ANYUP_CHUNK_SIZE,
@@ -659,6 +668,15 @@ impl FeatureFrameViewerConfig {
         matches!(
             self.sparse_encode_mode,
             FeatureFrameSparseEncodeMode::BucketedContext
+        )
+    }
+
+    /// Stable sparse encode bucket widths for the provided token grid.
+    pub fn sparse_mask_bucket_widths(&self, grid: TokenGridShape) -> Vec<usize> {
+        sparse_mask_bucket_widths(
+            grid,
+            self.sparse_mask_bucket_tokens,
+            &self.sparse_mask_bucket_densities,
         )
     }
 
@@ -775,6 +793,64 @@ pub fn bucket_sparse_mask(
     mask.padded_to_multiple(effective_bucket)
 }
 
+/// Stable sparse encode bucket widths for a token grid.
+pub fn sparse_mask_bucket_widths(
+    grid: TokenGridShape,
+    bucket_tokens: usize,
+    bucket_densities: &[f32],
+) -> Vec<usize> {
+    if grid.len() < 256 {
+        return Vec::new();
+    }
+    let mut widths = Vec::new();
+    if bucket_densities.is_empty() {
+        if bucket_tokens > 1 {
+            let bucket = bucket_tokens.min((grid.len() / 4).max(1));
+            let mut width = bucket;
+            while width < grid.len() {
+                widths.push(width);
+                width = width.saturating_add(bucket);
+            }
+        }
+    } else {
+        widths.extend(bucket_densities.iter().filter_map(|density| {
+            if density.is_finite() && *density > 0.0 {
+                Some(density_tokens(
+                    grid.len(),
+                    *density,
+                    DensityRound::Round,
+                    0.0,
+                ))
+            } else {
+                None
+            }
+        }));
+    }
+    widths.push(grid.len());
+    widths.sort_unstable();
+    widths.dedup();
+    widths
+}
+
+/// Pads sparse masks to the next configured bucket width while preserving all selected tokens.
+pub fn bucket_sparse_mask_with_config(
+    mask: SparseTokenMask,
+    grid: TokenGridShape,
+    config: &FeatureFrameViewerConfig,
+) -> SparseTokenMask {
+    if grid.len() < 256 || mask.is_dense_ordered() {
+        return mask;
+    }
+    let Some(target_len) = config
+        .sparse_mask_bucket_widths(grid)
+        .into_iter()
+        .find(|width| *width >= mask.len())
+    else {
+        return mask;
+    };
+    mask.padded_to_len(target_len)
+}
+
 /// Applies dense fallback and sparse encode widening to a threshold-selected patch-diff mask.
 pub fn finalize_patch_diff_masks(
     mask: SparseTokenMask,
@@ -786,7 +862,7 @@ pub fn finalize_patch_diff_masks(
     let encode_mask = match config.sparse_encode_mode {
         FeatureFrameSparseEncodeMode::Exact => write_mask.clone(),
         FeatureFrameSparseEncodeMode::BucketedContext => {
-            bucket_sparse_mask(write_mask.clone(), grid, config.sparse_mask_bucket_tokens)
+            bucket_sparse_mask_with_config(write_mask.clone(), grid, config)
         }
     };
     FeatureFrameSparseMasks {
@@ -823,21 +899,9 @@ pub fn shape_prewarm_masks(
         }
     };
 
-    let bucket = if !config.uses_bucketed_sparse_encode()
-        || config.sparse_mask_bucket_tokens <= 1
-        || grid.len() < 256
-    {
-        0
-    } else {
-        config
-            .sparse_mask_bucket_tokens
-            .min((grid.len() / 4).max(1))
-    };
-    if bucket > 0 {
-        let mut width = bucket;
-        while width < grid.len() {
+    for width in config.sparse_mask_bucket_widths(grid) {
+        if width < grid.len() {
             push_mask(SparseTokenMask::evenly_spaced(grid.len(), width));
-            width = width.saturating_add(bucket);
         }
     }
     push_mask(SparseTokenMask::all(grid.len()));
@@ -1129,6 +1193,10 @@ mod tests {
             config.pca_update_iterations > 1,
             "live PCA should converge from the identity basis quickly enough for viewer/docs output"
         );
+        assert_eq!(
+            config.sparse_mask_bucket_densities,
+            DEFAULT_SPARSE_MASK_BUCKET_DENSITIES
+        );
     }
 
     #[test]
@@ -1155,7 +1223,7 @@ mod tests {
             finalize_patch_diff_masks(changed.clone(), grid, &FeatureFrameViewerConfig::default());
 
         assert_eq!(masks.write_mask, changed);
-        assert_eq!(masks.encode_mask.len(), DEFAULT_SPARSE_MASK_BUCKET_TOKENS);
+        assert_eq!(masks.encode_mask.len(), 102);
         assert!(
             masks
                 .encode_mask
@@ -1170,8 +1238,37 @@ mod tests {
         let masks = shape_prewarm_masks(grid, &FeatureFrameViewerConfig::default());
         let widths: Vec<_> = masks.iter().map(SparseTokenMask::len).collect();
 
-        assert_eq!(widths, vec![256, 512, 1024]);
+        assert_eq!(widths, vec![102, 256, 512, 1024]);
         assert!(masks.last().expect("dense mask").is_dense_ordered());
+    }
+
+    #[test]
+    fn empty_bucket_density_list_uses_legacy_fixed_width_steps() {
+        let grid = TokenGridShape::new(1, 32, 32);
+        let config = FeatureFrameViewerConfig {
+            sparse_mask_bucket_densities: Vec::new(),
+            ..FeatureFrameViewerConfig::default()
+        };
+        let widths: Vec<_> = shape_prewarm_masks(grid, &config)
+            .iter()
+            .map(SparseTokenMask::len)
+            .collect();
+
+        assert_eq!(widths, vec![256, 512, 1024]);
+    }
+
+    #[test]
+    fn bucket_density_list_selects_next_configured_width() {
+        let grid = TokenGridShape::new(1, 32, 32);
+        let mask = SparseTokenMask::evenly_spaced(grid.len(), 120);
+        let config = FeatureFrameViewerConfig {
+            sparse_mask_bucket_densities: vec![0.10, 0.25, 0.50],
+            ..FeatureFrameViewerConfig::default()
+        };
+        let masks = finalize_patch_diff_masks(mask.clone(), grid, &config);
+
+        assert_eq!(masks.write_mask, mask);
+        assert_eq!(masks.encode_mask.len(), 256);
     }
 
     #[test]

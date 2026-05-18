@@ -1,6 +1,7 @@
 use crate::{
-    LearningRateScheduleConfig, LearningRateScheduleStats, TttBackpropMode, TttInsertionMode,
-    TttMemoryDynamics, TttMemoryUpdateSource, TttSupervisionMode, TttTargetMode,
+    LearningRateScheduleConfig, LearningRateScheduleStats, TttBackpropMode,
+    TttBestCheckpointSelection, TttInsertionMode, TttMemoryDynamics, TttMemoryUpdateSource,
+    TttSupervisionMode, TttTargetMode,
 };
 use anyhow::{Context, Result};
 use burn::tensor::Tensor;
@@ -216,6 +217,15 @@ pub struct TttTemporalSegmentMetrics {
     pub late_minus_early_cosine: Option<f64>,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TttFeatureStabilityMetrics {
+    pub samples: usize,
+    pub spatial_std_rms: f64,
+    pub relative_spread: f64,
+    pub mean_pairwise_token_cosine: f64,
+    pub collapse_score: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TttLongRolloutSegmentMetric {
     pub segment: usize,
@@ -343,12 +353,18 @@ pub struct TttTrainingReport {
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub feature_stability: Option<TttFeatureStabilityMetrics>,
     pub eval_long_rollout: Option<TttLongRolloutMetrics>,
     pub train_elapsed_ms: u128,
     pub eval_elapsed_ms: u128,
     pub elapsed_ms: u128,
     pub samples_per_second: f64,
     pub model_path: Option<PathBuf>,
+    pub best_model_path: Option<PathBuf>,
+    pub best_model_step: Option<usize>,
+    pub best_checkpoint_loss: Option<f64>,
+    pub best_checkpoint_selection: TttBestCheckpointSelection,
+    pub gradient_clip_norm: f32,
     pub report_path: PathBuf,
 }
 
@@ -379,6 +395,7 @@ pub struct TttEvalReport {
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub feature_stability: Option<TttFeatureStabilityMetrics>,
     pub long_rollout: Option<TttLongRolloutMetrics>,
     pub stream: TttStreamTrainingMetrics,
     pub elapsed_ms: u128,

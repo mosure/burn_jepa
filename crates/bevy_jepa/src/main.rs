@@ -18,8 +18,8 @@ use bevy_jepa::{
     DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER, DEFAULT_PATCH_DIFF_THRESHOLD,
     DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES, DEFAULT_PCA_UPDATE_EVERY,
     DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
-    DEFAULT_SPARSE_MASK_BUCKET_TOKENS, DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH,
-    DEFAULT_VJEPA21_WEIGHTS_NAME,
+    DEFAULT_SPARSE_MASK_BUCKET_DENSITIES, DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
+    DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_jepa::DEFAULT_BURN_JEPA_MODEL_BASE_URL;
@@ -150,6 +150,18 @@ struct Cli {
     sparse_mask_bucket_tokens: usize,
     #[arg(
         long,
+        value_delimiter = ',',
+        help = "Comma-separated grid-relative sparse encode bucket densities, e.g. 0.10,0.25,0.50. Omit for the viewer default list."
+    )]
+    sparse_mask_bucket_densities: Vec<f32>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Use legacy fixed-width sparse buckets from --sparse-mask-bucket-tokens instead of density buckets."
+    )]
+    legacy_sparse_mask_buckets: bool,
+    #[arg(
+        long,
         action = ArgAction::SetTrue,
         default_value_t = DEFAULT_PREWARM_SHAPE_BUCKETS,
         help = "Prewarm bucketed sparse encode widths during startup. Only applies with --sparse-encode-mode bucketed-context."
@@ -274,6 +286,16 @@ impl From<Cli> for BevyJepaConfig {
                 },
                 sparse_encode_mode: cli.sparse_encode_mode,
                 sparse_mask_bucket_tokens: cli.sparse_mask_bucket_tokens,
+                sparse_mask_bucket_densities: if cli.legacy_sparse_mask_buckets {
+                    Vec::new()
+                } else if cli.sparse_mask_bucket_densities.is_empty() {
+                    DEFAULT_SPARSE_MASK_BUCKET_DENSITIES.to_vec()
+                } else {
+                    cli.sparse_mask_bucket_densities
+                        .into_iter()
+                        .map(|density| density.clamp(0.0, 1.0))
+                        .collect()
+                },
                 prewarm_shape_buckets: cli.prewarm_shape_buckets && !cli.no_prewarm_shape_buckets,
                 anyup_q_chunk_size: cli.anyup_q_chunk_size,
                 pca_update_every: cli.pca_update_every,
@@ -375,6 +397,30 @@ mod tests {
             config.sparse_encode_mode,
             BevyJepaSparseEncodeMode::BucketedContext
         );
+        assert_eq!(config.sparse_mask_bucket_tokens, 64);
+    }
+
+    #[test]
+    fn sparse_mask_bucket_densities_are_configurable() {
+        let config = BevyJepaConfig::from(Cli::parse_from([
+            "bevy_jepa",
+            "--sparse-mask-bucket-densities",
+            "0.10,0.25,0.50",
+        ]));
+
+        assert_eq!(config.sparse_mask_bucket_densities, vec![0.10, 0.25, 0.50]);
+    }
+
+    #[test]
+    fn legacy_sparse_mask_buckets_use_fixed_token_widths() {
+        let config = BevyJepaConfig::from(Cli::parse_from([
+            "bevy_jepa",
+            "--legacy-sparse-mask-buckets",
+            "--sparse-mask-bucket-tokens",
+            "64",
+        ]));
+
+        assert_eq!(config.sparse_mask_bucket_densities, Vec::<f32>::new());
         assert_eq!(config.sparse_mask_bucket_tokens, 64);
     }
 

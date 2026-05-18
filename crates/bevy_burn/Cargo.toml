@@ -1,0 +1,106 @@
+[package]
+name = "bevy_burn"
+description = "bevy burn bindings"
+version = "0.4.10"
+edition = "2021"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT"
+keywords = [
+  "bevy",
+  "burn",
+  "machine-learning",
+  "compute-shader",
+]
+categories = [
+  "computer-vision",
+  "graphics",
+  "rendering",
+]
+homepage = "https://github.com/mosure/bevy_burn"
+repository = "https://github.com/mosure/bevy_burn"
+readme = "README.md"
+publish = false
+exclude = [
+  ".devcontainer",
+  ".github",
+  "docs",
+  "dist",
+  "build",
+  "assets",
+  "credits",
+]
+
+[features]
+default = []
+# Native viewers can use Burn fusion for faster tensor-to-texture transfer.
+# Browser builds keep this off because WebGPU validation rejects some fused
+# CubeCL storage-buffer read/write scopes.
+fusion = ["burn/fusion", "burn-wgpu/fusion", "dep:burn-cubecl-fusion"]
+
+[dependencies]
+burn-core = { version = "0.21" }
+burn-cubecl = { version = "0.21", default-features = false }
+bytemuck = "1.23"
+wgpu = "29.0"
+
+[dependencies.burn]
+version = "0.21"
+default-features = false
+features = ["std"]
+
+[dependencies.burn-cubecl-fusion]
+version = "0.21"
+default-features = false
+features = ["std"]
+optional = true
+
+[dependencies.burn-wgpu]
+version = "0.21"
+default-features = false
+features = ["std"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.3", default-features = false, features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", default-features = false, features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+
+[dependencies.bevy]
+git = "https://github.com/bevyengine/bevy"
+rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce"
+default-features = false
+features = [
+  "bevy_asset",
+  "bevy_camera",
+  "bevy_core_pipeline",
+  "bevy_image",
+  "bevy_log",
+  "bevy_pbr",
+  "bevy_render",
+  "bevy_sprite",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_window",
+  "bevy_winit",
+  "debug",
+  "default_font",
+  "png",
+  "std",
+  "tonemapping_luts",
+  "webgpu",
+  "x11",
+  "zstd_rust",
+]
+
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  'Document',
+  'Element',
+  'HtmlElement',
+  'Location',
+  'Node',
+  'Window',
+]
