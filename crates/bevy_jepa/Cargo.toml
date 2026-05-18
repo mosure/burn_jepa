@@ -13,13 +13,14 @@ publish = false
 [features]
 default = []
 sparse-patchify-wgpu = ["burn_jepa/sparse-patchify-wgpu"]
+wasm-fusion = ["bevy_burn/fusion", "burn/fusion", "burn_jepa/wasm-fusion"]
 
 [dependencies]
 anyhow = "1"
-# Keep WGPU fusion target-specific: browser WebGPU validation rejects some fused command scopes.
+# Browser WGPU fusion is opt-in through `wasm-fusion`; the default remains
+# non-fused until WebGPU validation is proven stable across browsers.
 burn = { version = "0.21.0", default-features = false, features = ["std", "webgpu"] }
-# Keep browser Burn WGPU non-fused. WebGPU rejects some fused CubeCL
-# read-write/read-only storage-buffer scopes; native re-enables fusion below.
+# Native re-enables fusion below; wasm can opt in with `--features wasm-fusion`.
 burn_jepa = { path = "../..", default-features = false, features = ["wasm", "webgpu"] }
 bevy_burn = { path = "../bevy_burn", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -80,6 +81,7 @@ tempfile = "3"
 
 [lib]
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "bevy_jepa"

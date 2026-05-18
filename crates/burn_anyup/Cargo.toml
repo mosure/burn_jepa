@@ -20,6 +20,7 @@ dispatch = ["burn/dispatch"]
 webgpu = ["burn/webgpu"]
 wgpu = ["burn/wgpu"]
 cuda = ["burn/cuda"]
+fusion = ["burn/fusion"]
 
 [dependencies]
 anyhow = "1"

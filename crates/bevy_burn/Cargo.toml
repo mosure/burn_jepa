@@ -32,9 +32,7 @@ exclude = [
 
 [features]
 default = []
-# Native viewers can use Burn fusion for faster tensor-to-texture transfer.
-# Browser builds keep this off because WebGPU validation rejects some fused
-# CubeCL storage-buffer read/write scopes.
+# Burn fusion is opt-in for browser builds and enabled by native viewers.
 fusion = ["burn/fusion", "burn-wgpu/fusion", "dep:burn-cubecl-fusion"]
 
 [dependencies]

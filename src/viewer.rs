@@ -682,6 +682,9 @@ impl FeatureFrameViewerConfig {
 
     /// Shared rolling PCA update config for live low-resolution feature visualization.
     pub fn pca_update_config(&self) -> FeaturePcaUpdateConfig {
+        if self.pca_update_every == 0 {
+            return FeaturePcaUpdateConfig::disabled();
+        }
         let sample_window_frames = self.pca_sample_window_frames.max(2);
         FeaturePcaUpdateConfig {
             mode: FeaturePcaUpdateMode::RollingOja,

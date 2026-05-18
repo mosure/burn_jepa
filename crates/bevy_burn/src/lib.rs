@@ -37,6 +37,19 @@ use std::{
 pub mod gpu_burn_to_bevy;
 use gpu_burn_to_bevy::{BurnBevyPrepare, GpuBurnToBevyPlugin};
 
+fn burn_runtime_options() -> BurnRuntimeOptions {
+    #[cfg(all(target_arch = "wasm32", feature = "fusion"))]
+    {
+        let mut options = BurnRuntimeOptions::default();
+        options.memory_config = burn_wgpu::MemoryConfiguration::ExclusivePages;
+        return options;
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "fusion")))]
+    {
+        BurnRuntimeOptions::default()
+    }
+}
+
 #[derive(Resource, Clone, Debug, Default)]
 pub struct BurnDevice {
     inner: Option<BurnWgpuDevice>,
@@ -160,7 +173,7 @@ where
                 backend: wgpu_backend,
             };
 
-            let runtime_options = BurnRuntimeOptions::default();
+            let runtime_options = burn_runtime_options();
             let burn_device = init_burn_device(wgpu_setup, runtime_options);
 
             render_app
@@ -713,7 +726,7 @@ mod gpu_tests {
                 backend: adapter_info.backend,
             };
             let burn_device =
-                BurnDevice::from(init_burn_device(burn_setup, BurnRuntimeOptions::default()));
+                BurnDevice::from(init_burn_device(burn_setup, burn_runtime_options()));
 
             Self {
                 render_device,

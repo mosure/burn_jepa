@@ -213,9 +213,22 @@ async fn webgpu_device() -> WasmDevice {
     if WEBGPU_RUNTIME_READY.with(Cell::get) {
         return device;
     }
-    wgpu::init_setup_async::<wgpu::graphics::WebGpu>(&device, Default::default()).await;
+    wgpu::init_setup_async::<wgpu::graphics::WebGpu>(&device, wasm_runtime_options()).await;
     WEBGPU_RUNTIME_READY.with(|flag| flag.set(true));
     device
+}
+
+fn wasm_runtime_options() -> wgpu::RuntimeOptions {
+    #[cfg(feature = "wasm-fusion")]
+    {
+        let mut options = wgpu::RuntimeOptions::default();
+        options.memory_config = wgpu::MemoryConfiguration::ExclusivePages;
+        return options;
+    }
+    #[cfg(not(feature = "wasm-fusion"))]
+    {
+        wgpu::RuntimeOptions::default()
+    }
 }
 
 async fn fetch_parts_bundle(parts_manifest_url: &str) -> Result<Vec<Vec<u8>>, JsValue> {

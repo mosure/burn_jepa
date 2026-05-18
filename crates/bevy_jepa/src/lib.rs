@@ -38,6 +38,7 @@ mod display;
 mod mask;
 mod metrics;
 mod model_loading;
+pub mod perf;
 pub mod platform;
 
 #[cfg(test)]
@@ -226,6 +227,7 @@ struct JepaRuntime {
     input_frames_seen: u64,
     completed_frames: u64,
     high_res_frames: u64,
+    pca_update_events: u64,
     latest_input_sequence: u64,
     dropped_frames: usize,
     overwritten_frames: usize,
@@ -233,9 +235,11 @@ struct JepaRuntime {
     last_input_at: Option<ViewerInstant>,
     last_completion_at: Option<ViewerInstant>,
     last_high_res_completion_at: Option<ViewerInstant>,
+    last_pca_update_at: Option<ViewerInstant>,
     input_fps: f64,
     low_res_fps: f64,
     high_res_fps: f64,
+    pca_update_fps: f64,
     last_high_res_anyup_context_us: u64,
     last_high_res_anyup_decode_us: u64,
     last_high_res_pca_us: u64,
@@ -266,10 +270,6 @@ struct RuntimePipelineSignature {
     anyup_model_auto_download: bool,
     anyup_attention_mode: burn_jepa::AnyUpAttentionMode,
     anyup_q_chunk_size: usize,
-    pca_update_every: u64,
-    pca_sample_window_frames: usize,
-    pca_min_sample_frames: usize,
-    pca_update_iterations: usize,
     sparse_encode_mode: BevyJepaSparseEncodeMode,
     patch_diff_threshold_bits: u32,
     context_density_bits: u32,
@@ -325,10 +325,6 @@ impl RuntimePipelineSignature {
             anyup_model_auto_download: config.anyup_model_auto_download,
             anyup_attention_mode: config.anyup_attention_mode,
             anyup_q_chunk_size: config.anyup_q_chunk_size,
-            pca_update_every: config.pca_update_every,
-            pca_sample_window_frames: config.pca_sample_window_frames,
-            pca_min_sample_frames: config.pca_min_sample_frames,
-            pca_update_iterations: config.pca_update_iterations,
             sparse_encode_mode: config.sparse_encode_mode,
             patch_diff_threshold_bits: config.patch_diff_threshold.to_bits(),
             context_density_bits: config.context_density.to_bits(),
@@ -533,6 +529,7 @@ enum MetricValueKind {
     StageTokenViewLatency,
     StageLowResPcaLatency,
     StagePcaBasis,
+    StagePcaUpdates,
     StageAnyUpLatency,
     StageDisplayLatency,
 }
@@ -549,9 +546,19 @@ struct MetricRollingSample {
     viewer_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum JepaControlsTab {
+    #[default]
+    Pipeline,
+    Mask,
+    Pca,
+    AnyUp,
+}
+
 #[derive(Resource, Default)]
 struct JepaControlsState {
     expanded: bool,
+    tab: JepaControlsTab,
 }
 
 #[derive(Resource, Default)]
@@ -561,6 +568,11 @@ struct JepaActiveSlider {
 
 #[derive(Component)]
 struct ControlsPanel;
+
+#[derive(Component)]
+struct ControlsTabPanel {
+    tab: JepaControlsTab,
+}
 
 #[derive(Component)]
 struct ControlsSummaryText;
@@ -579,6 +591,10 @@ struct HighResPanelElement;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JepaControlAction {
     TogglePanel,
+    TabPipeline,
+    TabMask,
+    TabPca,
+    TabAnyUp,
     ModelTtt,
     ModelBase,
     PipelineSparse,
@@ -590,6 +606,8 @@ enum JepaControlAction {
     AnyUpEvery1,
     AnyUpEfficientLocal,
     AnyUpUpstreamMasked,
+    PcaTrain,
+    PcaLock,
     PatchRefresh,
     SubthresholdRefresh,
     AgeRefresh,
@@ -600,6 +618,7 @@ enum JepaControlAction {
 enum JepaControlReset {
     None,
     Visual,
+    PcaConfig,
     Rebuild,
 }
 
@@ -619,6 +638,10 @@ enum JepaControlSliderKind {
     ContextDensity,
     MinContextDensity,
     DenseFallbackDensity,
+    PcaUpdateEvery,
+    PcaSampleWindowFrames,
+    PcaMinSampleFrames,
+    PcaUpdateIterations,
     SubthresholdTrigger,
     AgeIntervalFrames,
     BlueNoiseDensity,
@@ -785,6 +808,9 @@ impl JepaRuntime {
             self.prev_stage_rgba = None;
             self.frame_index = 0;
             self.last_high_res_completion_at = None;
+            self.last_pca_update_at = None;
+            self.pca_update_events = 0;
+            self.pca_update_fps = 0.0;
             self.last_high_res_anyup_context_us = 0;
             self.last_high_res_anyup_decode_us = 0;
             self.last_high_res_pca_us = 0;
@@ -916,7 +942,7 @@ impl JepaRuntime {
         self.latest_input_sequence = sequence;
     }
 
-    fn record_completion(&mut self, high_res_updated: bool) {
+    fn record_completion(&mut self, high_res_updated: bool, pca_update_applied: bool) {
         let now = viewer_now();
         if let Some(previous) = self.last_completion_at {
             let seconds = viewer_seconds_since(now, previous);
@@ -929,6 +955,20 @@ impl JepaRuntime {
         if high_res_updated {
             self.record_high_res_completion();
         }
+        if pca_update_applied {
+            self.record_pca_update(now);
+        }
+    }
+
+    fn record_pca_update(&mut self, now: ViewerInstant) {
+        if let Some(previous) = self.last_pca_update_at {
+            let seconds = viewer_seconds_since(now, previous);
+            if seconds.is_finite() && seconds > 0.0 {
+                self.pca_update_fps = 1.0 / seconds;
+            }
+        }
+        self.last_pca_update_at = Some(now);
+        self.pca_update_events = self.pca_update_events.saturating_add(1);
     }
 
     fn record_high_res_completion(&mut self) {
@@ -955,9 +995,11 @@ impl JepaRuntime {
         metrics.input_frame_index = self.latest_input_sequence;
         metrics.completed_frames = self.completed_frames;
         metrics.high_res_frames = self.high_res_frames;
+        metrics.pca_update_events = self.pca_update_events;
         metrics.input_fps = self.input_fps;
         metrics.low_res_fps = self.low_res_fps;
         metrics.high_res_fps = self.high_res_fps;
+        metrics.pca_update_fps = self.pca_update_fps;
         metrics.in_flight_frames = usize::from(self.active_task.is_some())
             + usize::from(self.pending_stage.is_some())
             + usize::from(self.high_res_task.is_some())
@@ -1021,11 +1063,21 @@ impl JepaRuntime {
         self.prev_stage_rgba = None;
         self.frame_index = 0;
         self.last_high_res_completion_at = None;
+        self.last_pca_update_at = None;
+        self.pca_update_events = 0;
+        self.pca_update_fps = 0.0;
         self.last_high_res_anyup_context_us = 0;
         self.last_high_res_anyup_decode_us = 0;
         self.last_high_res_pca_us = 0;
         self.last_high_res_display_tensor_us = 0;
         self.last_error = None;
+    }
+
+    fn apply_pca_update_config(&mut self, config: &BevyJepaConfig) -> Result<()> {
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            pipeline.set_pca_update_config(config.pca_update_config())?;
+        }
+        Ok(())
     }
 }
 
@@ -1246,6 +1298,7 @@ fn setup_metrics_overlay(mut commands: Commands, config: Res<BevyJepaConfig>) {
                     MetricValueKind::StageTokenViewLatency,
                     MetricValueKind::StageLowResPcaLatency,
                     MetricValueKind::StagePcaBasis,
+                    MetricValueKind::StagePcaUpdates,
                 ],
                 false,
             );
@@ -1383,105 +1436,165 @@ fn setup_controls_ui(mut commands: Commands) {
                             ..default()
                         },
                     ));
-                    spawn_control_section_title(
-                        panel,
-                        "Model",
-                        "Choose the encoder package and the token input mode.",
-                    );
-                    spawn_control_row(
-                        panel,
-                        "Model package",
-                        &[
-                            (JepaControlAction::ModelTtt, "TTT"),
-                            (JepaControlAction::ModelBase, "Base"),
-                        ],
-                    );
-                    spawn_control_row(
-                        panel,
-                        "JEPA input",
-                        &[
-                            (JepaControlAction::PipelineSparse, "Sparse"),
-                            (JepaControlAction::PipelineDense, "Dense"),
-                        ],
-                    );
-                    spawn_control_row(
-                        panel,
-                        "Resolution",
-                        &[
-                            (JepaControlAction::Resolution256, "256"),
-                            (JepaControlAction::Resolution512, "512"),
-                        ],
-                    );
-                    spawn_control_section_title(
-                        panel,
-                        "High-Resolution Decode",
-                        "AnyUp runs off the low-res cache and may be decimated.",
-                    );
-                    spawn_control_row(
-                        panel,
-                        "AnyUp cadence",
-                        &[
-                            (JepaControlAction::AnyUpOff, "Off"),
-                            (JepaControlAction::AnyUpEvery8, "1/8"),
-                            (JepaControlAction::AnyUpEvery1, "1/1"),
-                        ],
-                    );
-                    spawn_control_row(
-                        panel,
-                        "Attention",
-                        &[
-                            (JepaControlAction::AnyUpEfficientLocal, "Local"),
-                            (JepaControlAction::AnyUpUpstreamMasked, "Masked"),
-                        ],
-                    );
-                    spawn_control_section_title(
-                        panel,
-                        "Patch-Diff Mask",
-                        "Threshold selects changed patches; refresh prevents stale tokens.",
-                    );
-                    spawn_slider_row(
-                        panel,
-                        "Diff threshold",
-                        JepaControlSliderKind::PatchDiffThreshold,
-                    );
-                    spawn_slider_row(panel, "Max density", JepaControlSliderKind::ContextDensity);
-                    spawn_slider_row(
-                        panel,
-                        "Min density",
-                        JepaControlSliderKind::MinContextDensity,
-                    );
-                    spawn_slider_row(
-                        panel,
-                        "Dense cutoff",
-                        JepaControlSliderKind::DenseFallbackDensity,
-                    );
-                    spawn_control_row(
-                        panel,
-                        "Refresh",
-                        &[
-                            (JepaControlAction::PatchRefresh, "Enable"),
-                            (JepaControlAction::SubthresholdRefresh, "Subthr"),
-                            (JepaControlAction::AgeRefresh, "Age"),
-                            (JepaControlAction::BlueNoiseRefresh, "Blue"),
-                        ],
-                    );
-                    spawn_slider_row(
-                        panel,
-                        "Subthr trigger",
-                        JepaControlSliderKind::SubthresholdTrigger,
-                    );
-                    spawn_slider_row(
-                        panel,
-                        "Age interval",
-                        JepaControlSliderKind::AgeIntervalFrames,
-                    );
-                    spawn_slider_row(
-                        panel,
-                        "Blue density",
-                        JepaControlSliderKind::BlueNoiseDensity,
-                    );
+                    spawn_control_row(panel, "Settings", &controls_tab_actions());
+                    spawn_controls_tab_panel(panel, JepaControlsTab::Pipeline, |tab| {
+                        spawn_control_section_title(
+                            tab,
+                            "Pipeline",
+                            "Choose the encoder package, token input mode, and grid size.",
+                        );
+                        spawn_control_row(
+                            tab,
+                            "Model package",
+                            &[
+                                (JepaControlAction::ModelTtt, "TTT"),
+                                (JepaControlAction::ModelBase, "Base"),
+                            ],
+                        );
+                        spawn_control_row(
+                            tab,
+                            "JEPA input",
+                            &[
+                                (JepaControlAction::PipelineSparse, "Sparse"),
+                                (JepaControlAction::PipelineDense, "Dense"),
+                            ],
+                        );
+                        spawn_control_row(
+                            tab,
+                            "Resolution",
+                            &[
+                                (JepaControlAction::Resolution256, "256"),
+                                (JepaControlAction::Resolution512, "512"),
+                            ],
+                        );
+                    });
+                    spawn_controls_tab_panel(panel, JepaControlsTab::Mask, |tab| {
+                        spawn_control_section_title(
+                            tab,
+                            "Patch-Diff Mask",
+                            "Threshold selects changed patches; refresh prevents stale tokens.",
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Diff threshold",
+                            JepaControlSliderKind::PatchDiffThreshold,
+                        );
+                        spawn_slider_row(tab, "Max density", JepaControlSliderKind::ContextDensity);
+                        spawn_slider_row(
+                            tab,
+                            "Min density",
+                            JepaControlSliderKind::MinContextDensity,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Dense cutoff",
+                            JepaControlSliderKind::DenseFallbackDensity,
+                        );
+                        spawn_control_row(
+                            tab,
+                            "Refresh",
+                            &[
+                                (JepaControlAction::PatchRefresh, "Enable"),
+                                (JepaControlAction::SubthresholdRefresh, "Subthr"),
+                                (JepaControlAction::AgeRefresh, "Age"),
+                                (JepaControlAction::BlueNoiseRefresh, "Blue"),
+                            ],
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Subthr trigger",
+                            JepaControlSliderKind::SubthresholdTrigger,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Age interval",
+                            JepaControlSliderKind::AgeIntervalFrames,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Blue density",
+                            JepaControlSliderKind::BlueNoiseDensity,
+                        );
+                    });
+                    spawn_controls_tab_panel(panel, JepaControlsTab::Pca, |tab| {
+                        spawn_control_section_title(
+                            tab,
+                            "PCA Visualization",
+                            "Fit a rolling semantic color basis, or lock the current projection.",
+                        );
+                        spawn_control_row(
+                            tab,
+                            "Basis fitting",
+                            &[
+                                (JepaControlAction::PcaTrain, "Train"),
+                                (JepaControlAction::PcaLock, "Lock"),
+                            ],
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Update every",
+                            JepaControlSliderKind::PcaUpdateEvery,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Sample window",
+                            JepaControlSliderKind::PcaSampleWindowFrames,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Min samples",
+                            JepaControlSliderKind::PcaMinSampleFrames,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Iterations",
+                            JepaControlSliderKind::PcaUpdateIterations,
+                        );
+                    });
+                    spawn_controls_tab_panel(panel, JepaControlsTab::AnyUp, |tab| {
+                        spawn_control_section_title(
+                            tab,
+                            "High-Resolution Decode",
+                            "AnyUp runs off the low-res cache and may be decimated.",
+                        );
+                        spawn_control_row(
+                            tab,
+                            "AnyUp cadence",
+                            &[
+                                (JepaControlAction::AnyUpOff, "Off"),
+                                (JepaControlAction::AnyUpEvery8, "1/8"),
+                                (JepaControlAction::AnyUpEvery1, "1/1"),
+                            ],
+                        );
+                        spawn_control_row(
+                            tab,
+                            "Attention",
+                            &[
+                                (JepaControlAction::AnyUpEfficientLocal, "Local"),
+                                (JepaControlAction::AnyUpUpstreamMasked, "Masked"),
+                            ],
+                        );
+                    });
                 });
         });
+}
+
+fn spawn_controls_tab_panel(
+    builder: &mut ChildSpawnerCommands<'_>,
+    tab: JepaControlsTab,
+    spawn: impl FnOnce(&mut ChildSpawnerCommands<'_>),
+) {
+    builder
+        .spawn((
+            ControlsTabPanel { tab },
+            Node {
+                display: Display::None,
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(CONTROL_ROW_GAP_PX),
+                ..default()
+            },
+        ))
+        .with_children(spawn);
 }
 
 fn spawn_control_section_title(
@@ -1766,7 +1879,10 @@ fn apply_jepa_completion_to_world(
             let mut metrics = processed.metrics.clone();
             {
                 let mut runtime = world.resource_mut::<JepaRuntime>();
-                runtime.record_completion(processed.high_res_updated);
+                runtime.record_completion(
+                    processed.high_res_updated,
+                    processed.metrics.pca_update_applied,
+                );
                 let mut enqueue_error = None;
                 if let Some(input) = processed.high_res_input {
                     #[cfg(target_arch = "wasm32")]
@@ -3494,6 +3610,11 @@ fn metric_value_text(
             format!("Project  {}", format_metric_ms(metrics.low_res_pca_us))
         }
         MetricValueKind::StagePcaBasis => format_pca_basis_line(config, metrics),
+        MetricValueKind::StagePcaUpdates => format!(
+            "Updates  {}  {} total",
+            format_metric_fps(metrics.pca_update_fps),
+            metrics.pca_update_events
+        ),
         MetricValueKind::StageAnyUpLatency => format!(
             "Decode   ctx {}  up {}",
             format_metric_ms(metrics.anyup_context_us),
@@ -3584,8 +3705,11 @@ fn format_ttt_stability_line(config: &BevyJepaConfig, metrics: &BevyJepaMetrics)
 }
 
 fn format_pca_basis_line(config: &BevyJepaConfig, metrics: &BevyJepaMetrics) -> String {
+    if config.pca_update_every == 0 {
+        return "Basis   locked".to_string();
+    }
     if metrics.pca_sample_window_frames == 0 {
-        return "Basis   off".to_string();
+        return "Basis   waiting".to_string();
     }
     let status = if metrics.pca_update_applied {
         "fit"
@@ -3709,6 +3833,14 @@ fn publish_wasm_metrics(metrics: &BevyJepaMetrics) {
         ("encodeUs", metrics.encode_us as f64),
         ("cacheUpdateUs", metrics.cache_update_us as f64),
         ("lowResPcaUs", metrics.low_res_pca_us as f64),
+        ("pcaUpdateUs", metrics.pca_update_us as f64),
+        ("pcaUpdateEvents", metrics.pca_update_events as f64),
+        ("pcaUpdateFps", metrics.pca_update_fps),
+        ("pcaSampleFrames", metrics.pca_sample_frames as f64),
+        (
+            "pcaSampleWindowFrames",
+            metrics.pca_sample_window_frames as f64,
+        ),
         ("totalUs", metrics.total_us as f64),
         ("viewerTotalUs", metrics.viewer_total_us as f64),
         (
@@ -3761,11 +3893,12 @@ fn control_button_interactions(
             controls.expanded = !controls.expanded;
             continue;
         }
-        match apply_control_action(&mut config, button.action) {
-            JepaControlReset::None => {}
-            JepaControlReset::Visual => runtime.reset_visual_state(),
-            JepaControlReset::Rebuild => runtime.rebuild_pipeline_state(),
+        if let Some(tab) = control_tab_for_action(button.action) {
+            controls.tab = tab;
+            continue;
         }
+        let reset = apply_control_action(&mut config, button.action);
+        apply_control_reset(&config, &mut runtime, reset);
     }
 }
 
@@ -3808,13 +3941,26 @@ fn control_slider_interactions(
     let Some(relative) = cursor.normalized else {
         return;
     };
-    match apply_control_slider_value_if_changed(
+    let reset = apply_control_slider_value_if_changed(
         &mut config,
         slider.kind,
         slider_normalized_from_relative_x(relative.x),
-    ) {
+    );
+    apply_control_reset(&config, &mut runtime, reset);
+}
+
+fn apply_control_reset(
+    config: &BevyJepaConfig,
+    runtime: &mut JepaRuntime,
+    reset: JepaControlReset,
+) {
+    match reset {
         JepaControlReset::None => {}
         JepaControlReset::Visual => runtime.reset_visual_state(),
+        JepaControlReset::PcaConfig => match runtime.apply_pca_update_config(config) {
+            Ok(()) => runtime.clear_error(),
+            Err(err) => runtime.set_error("PCA config", err.to_string()),
+        },
         JepaControlReset::Rebuild => runtime.rebuild_pipeline_state(),
     }
 }
@@ -3841,7 +3987,18 @@ fn slider_normalized_from_relative_x(relative_x: f32) -> f32 {
 fn update_controls_ui(
     config: Res<BevyJepaConfig>,
     controls: Res<JepaControlsState>,
-    mut panels: Query<&mut Node, (With<ControlsPanel>, Without<JepaControlSliderFill>)>,
+    mut panels: Query<
+        &mut Node,
+        (
+            With<ControlsPanel>,
+            Without<ControlsTabPanel>,
+            Without<JepaControlSliderFill>,
+        ),
+    >,
+    mut tab_panels: Query<
+        (&ControlsTabPanel, &mut Node),
+        (Without<ControlsPanel>, Without<JepaControlSliderFill>),
+    >,
     mut summaries: Query<
         &mut Text,
         (
@@ -3877,6 +4034,13 @@ fn update_controls_ui(
 ) {
     for mut panel in &mut panels {
         panel.display = if controls.expanded {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    for (tab_panel, mut node) in &mut tab_panels {
+        node.display = if controls.expanded && tab_panel.tab == controls.tab {
             Display::Flex
         } else {
             Display::None
@@ -3944,7 +4108,11 @@ fn apply_control_action(
     action: JepaControlAction,
 ) -> JepaControlReset {
     match action {
-        JepaControlAction::TogglePanel => JepaControlReset::None,
+        JepaControlAction::TogglePanel
+        | JepaControlAction::TabPipeline
+        | JepaControlAction::TabMask
+        | JepaControlAction::TabPca
+        | JepaControlAction::TabAnyUp => JepaControlReset::None,
         JepaControlAction::ModelTtt => {
             set_model_profile(config, BevyJepaModelPackageProfile::Vjepa21Ttt);
             JepaControlReset::Rebuild
@@ -3988,6 +4156,16 @@ fn apply_control_action(
         JepaControlAction::AnyUpUpstreamMasked => {
             config.anyup_attention_mode = burn_jepa::AnyUpAttentionMode::UpstreamMasked;
             JepaControlReset::Rebuild
+        }
+        JepaControlAction::PcaTrain => {
+            if config.pca_update_every == 0 {
+                config.pca_update_every = DEFAULT_PCA_UPDATE_EVERY.max(1);
+            }
+            JepaControlReset::PcaConfig
+        }
+        JepaControlAction::PcaLock => {
+            config.pca_update_every = 0;
+            JepaControlReset::PcaConfig
         }
         JepaControlAction::PatchRefresh => {
             config.patch_diff_refresh.enabled = !config.patch_diff_refresh.enabled;
@@ -4034,6 +4212,28 @@ fn apply_control_slider_value(
         JepaControlSliderKind::DenseFallbackDensity => {
             config.patch_diff_dense_fallback_density = slider_lerp(0.0, 1.0, normalized);
             JepaControlReset::Visual
+        }
+        JepaControlSliderKind::PcaUpdateEvery => {
+            config.pca_update_every = slider_lerp(0.0, 60.0, normalized).round() as u64;
+            JepaControlReset::PcaConfig
+        }
+        JepaControlSliderKind::PcaSampleWindowFrames => {
+            config.pca_sample_window_frames = slider_lerp(2.0, 120.0, normalized).round() as usize;
+            config.pca_min_sample_frames = config
+                .pca_min_sample_frames
+                .clamp(1, config.pca_sample_window_frames);
+            JepaControlReset::PcaConfig
+        }
+        JepaControlSliderKind::PcaMinSampleFrames => {
+            config.pca_min_sample_frames = slider_lerp(1.0, 60.0, normalized).round() as usize;
+            config.pca_min_sample_frames = config
+                .pca_min_sample_frames
+                .clamp(1, config.pca_sample_window_frames.max(1));
+            JepaControlReset::PcaConfig
+        }
+        JepaControlSliderKind::PcaUpdateIterations => {
+            config.pca_update_iterations = slider_lerp(1.0, 12.0, normalized).round() as usize;
+            JepaControlReset::PcaConfig
         }
         JepaControlSliderKind::SubthresholdTrigger => {
             config.patch_diff_refresh.subthreshold_trigger = slider_lerp(0.1, 4.0, normalized);
@@ -4122,6 +4322,18 @@ fn slider_normalized_value(config: &BevyJepaConfig, kind: JepaControlSliderKind)
         JepaControlSliderKind::DenseFallbackDensity => {
             slider_unlerp(0.0, 1.0, config.patch_diff_dense_fallback_density)
         }
+        JepaControlSliderKind::PcaUpdateEvery => {
+            slider_unlerp(0.0, 60.0, config.pca_update_every as f32)
+        }
+        JepaControlSliderKind::PcaSampleWindowFrames => {
+            slider_unlerp(2.0, 120.0, config.pca_sample_window_frames as f32)
+        }
+        JepaControlSliderKind::PcaMinSampleFrames => {
+            slider_unlerp(1.0, 60.0, config.pca_min_sample_frames as f32)
+        }
+        JepaControlSliderKind::PcaUpdateIterations => {
+            slider_unlerp(1.0, 12.0, config.pca_update_iterations as f32)
+        }
         JepaControlSliderKind::SubthresholdTrigger => {
             slider_unlerp(0.1, 4.0, config.patch_diff_refresh.subthreshold_trigger)
         }
@@ -4152,6 +4364,22 @@ fn slider_value_label(config: &BevyJepaConfig, kind: JepaControlSliderKind) -> S
         JepaControlSliderKind::DenseFallbackDensity => {
             format!("{:.0}%", config.patch_diff_dense_fallback_density * 100.0)
         }
+        JepaControlSliderKind::PcaUpdateEvery => {
+            if config.pca_update_every == 0 {
+                "locked".to_string()
+            } else {
+                format!("{}f", config.pca_update_every)
+            }
+        }
+        JepaControlSliderKind::PcaSampleWindowFrames => {
+            format!("{}f", config.pca_sample_window_frames)
+        }
+        JepaControlSliderKind::PcaMinSampleFrames => {
+            format!("{}f", config.pca_min_sample_frames)
+        }
+        JepaControlSliderKind::PcaUpdateIterations => {
+            format!("{}", config.pca_update_iterations)
+        }
         JepaControlSliderKind::SubthresholdTrigger => {
             format!("{:.1}", config.patch_diff_refresh.subthreshold_trigger)
         }
@@ -4169,7 +4397,7 @@ fn slider_value_label(config: &BevyJepaConfig, kind: JepaControlSliderKind) -> S
 
 fn controls_summary(config: &BevyJepaConfig) -> String {
     format!(
-        "{} | {} {}px | patch thr {:.3} ({:>4.1}% quality) | refresh {} / sub {} / age {} / blue {} | AnyUp {} {}",
+        "{} | {} {}px | patch thr {:.3} ({:>4.1}% quality) | refresh {} / sub {} / age {} / blue {} | PCA {} | AnyUp {} {}",
         config.model_profile,
         if dense_pipeline_enabled(config) {
             "dense"
@@ -4183,6 +4411,11 @@ fn controls_summary(config: &BevyJepaConfig) -> String {
         on_off(config.patch_diff_refresh.subthreshold_enabled),
         on_off(config.patch_diff_refresh.age_refresh_enabled),
         on_off(config.patch_diff_refresh.blue_noise_enabled),
+        if config.pca_update_every == 0 {
+            "locked".to_string()
+        } else {
+            format!("fit/{}f", config.pca_update_every)
+        },
         if config.high_res_pca_every == 0 {
             "off".to_string()
         } else {
@@ -4193,7 +4426,26 @@ fn controls_summary(config: &BevyJepaConfig) -> String {
 }
 
 fn default_controls_help() -> &'static str {
-    "Hover a control for details. Model, resolution, dense/sparse, and AnyUp mode rebuild the pipeline; mask sliders update the visual state."
+    "Use tabs to switch between pipeline, mask, PCA, and AnyUp settings. Hover a control for details."
+}
+
+fn controls_tab_actions() -> [(JepaControlAction, &'static str); 4] {
+    [
+        (JepaControlAction::TabPipeline, "Pipeline"),
+        (JepaControlAction::TabMask, "Mask"),
+        (JepaControlAction::TabPca, "PCA"),
+        (JepaControlAction::TabAnyUp, "AnyUp"),
+    ]
+}
+
+fn control_tab_for_action(action: JepaControlAction) -> Option<JepaControlsTab> {
+    match action {
+        JepaControlAction::TabPipeline => Some(JepaControlsTab::Pipeline),
+        JepaControlAction::TabMask => Some(JepaControlsTab::Mask),
+        JepaControlAction::TabPca => Some(JepaControlsTab::Pca),
+        JepaControlAction::TabAnyUp => Some(JepaControlsTab::AnyUp),
+        _ => None,
+    }
 }
 
 fn hovered_control_help(
@@ -4207,6 +4459,16 @@ fn hovered_control_help(
 fn control_help_text(action: JepaControlAction) -> &'static str {
     match action {
         JepaControlAction::TogglePanel => "Open or close the runtime settings panel.",
+        JepaControlAction::TabPipeline => {
+            "Show model package, sparse/dense pipeline, and input resolution settings."
+        }
+        JepaControlAction::TabMask => {
+            "Show patch-diff threshold, density, and stale-token refresh settings."
+        }
+        JepaControlAction::TabPca => "Show PCA basis fitting and projection stability settings.",
+        JepaControlAction::TabAnyUp => {
+            "Show high-resolution AnyUp decode cadence and attention settings."
+        }
         JepaControlAction::ModelTtt => {
             "Use the sparse temporal TTT V-JEPA 2.1 package. This is the deployment path."
         }
@@ -4238,6 +4500,12 @@ fn control_help_text(action: JepaControlAction) -> &'static str {
         JepaControlAction::AnyUpUpstreamMasked => {
             "Use the upstream-style masked attention variant for comparison."
         }
+        JepaControlAction::PcaTrain => {
+            "Resume rolling PCA basis fitting for the low/high-res feature color projection."
+        }
+        JepaControlAction::PcaLock => {
+            "Stop rolling PCA updates and keep the current projection fixed to reduce color drift."
+        }
         JepaControlAction::PatchRefresh => {
             "Enable extra refresh patches beyond direct threshold hits to reduce stale tokens."
         }
@@ -4267,6 +4535,18 @@ fn slider_help_text(kind: JepaControlSliderKind) -> &'static str {
         JepaControlSliderKind::DenseFallbackDensity => {
             "Route very dense sparse masks to dense JEPA when sparse overhead would dominate."
         }
+        JepaControlSliderKind::PcaUpdateEvery => {
+            "Rolling PCA cadence in processed frames. Zero locks the current projection."
+        }
+        JepaControlSliderKind::PcaSampleWindowFrames => {
+            "Number of recent low-res feature frames retained for each PCA basis update."
+        }
+        JepaControlSliderKind::PcaMinSampleFrames => {
+            "Minimum buffered frames before fitting or refreshing the PCA basis."
+        }
+        JepaControlSliderKind::PcaUpdateIterations => {
+            "Oja iterations per PCA update. Higher values stabilize color at extra cost."
+        }
         JepaControlSliderKind::SubthresholdTrigger => {
             "Accumulated weak-diff score required before a subthreshold patch refreshes."
         }
@@ -4280,6 +4560,10 @@ fn slider_help_text(kind: JepaControlSliderKind) -> &'static str {
 fn control_button_label(config: &BevyJepaConfig, action: JepaControlAction) -> String {
     match action {
         JepaControlAction::TogglePanel => "Settings".to_string(),
+        JepaControlAction::TabPipeline => "pipeline".to_string(),
+        JepaControlAction::TabMask => "mask".to_string(),
+        JepaControlAction::TabPca => "PCA".to_string(),
+        JepaControlAction::TabAnyUp => "AnyUp".to_string(),
         JepaControlAction::PatchRefresh => {
             format!("refresh {}", on_off(config.patch_diff_refresh.enabled))
         }
@@ -4312,6 +4596,8 @@ fn control_button_label(config: &BevyJepaConfig, action: JepaControlAction) -> S
         JepaControlAction::AnyUpEvery1 => "1/1".to_string(),
         JepaControlAction::AnyUpEfficientLocal => "local".to_string(),
         JepaControlAction::AnyUpUpstreamMasked => "masked".to_string(),
+        JepaControlAction::PcaTrain => "train".to_string(),
+        JepaControlAction::PcaLock => "lock".to_string(),
     }
 }
 
@@ -4322,6 +4608,10 @@ fn control_button_active(
 ) -> bool {
     match action {
         JepaControlAction::TogglePanel => controls.expanded,
+        JepaControlAction::TabPipeline
+        | JepaControlAction::TabMask
+        | JepaControlAction::TabPca
+        | JepaControlAction::TabAnyUp => control_tab_for_action(action) == Some(controls.tab),
         JepaControlAction::ModelTtt => {
             config.model_profile == BevyJepaModelPackageProfile::Vjepa21Ttt
                 && config.encoder_source == BevyJepaEncoderSource::TrainedTtt
@@ -4343,6 +4633,8 @@ fn control_button_active(
         JepaControlAction::AnyUpUpstreamMasked => {
             config.anyup_attention_mode == burn_jepa::AnyUpAttentionMode::UpstreamMasked
         }
+        JepaControlAction::PcaTrain => config.pca_update_every > 0,
+        JepaControlAction::PcaLock => config.pca_update_every == 0,
         JepaControlAction::PatchRefresh => config.patch_diff_refresh.enabled,
         JepaControlAction::SubthresholdRefresh => config.patch_diff_refresh.subthreshold_enabled,
         JepaControlAction::AgeRefresh => config.patch_diff_refresh.age_refresh_enabled,

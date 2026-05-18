@@ -293,6 +293,70 @@ fn control_actions_toggle_anyup_panel_cadence() {
 }
 
 #[test]
+fn control_actions_toggle_pca_basis_training_without_rebuild() {
+    let mut config = BevyJepaConfig::default();
+
+    assert!(config.pca_update_config().enabled());
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::PcaLock),
+        JepaControlReset::PcaConfig
+    );
+    assert_eq!(config.pca_update_every, 0);
+    assert!(!config.pca_update_config().enabled());
+    assert!(control_button_active(
+        &config,
+        JepaControlAction::PcaLock,
+        &JepaControlsState::default()
+    ));
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::PcaTrain),
+        JepaControlReset::PcaConfig
+    );
+    assert_eq!(config.pca_update_every, DEFAULT_PCA_UPDATE_EVERY.max(1));
+    assert!(config.pca_update_config().enabled());
+}
+
+#[test]
+fn control_tabs_are_view_state_not_pipeline_rebuilds() {
+    let config = BevyJepaConfig::default();
+    let mut controls = JepaControlsState::default();
+
+    assert_eq!(controls.tab, JepaControlsTab::Pipeline);
+    assert_eq!(
+        control_tab_for_action(JepaControlAction::TabMask),
+        Some(JepaControlsTab::Mask)
+    );
+    let mut tab_config = BevyJepaConfig::default();
+    assert_eq!(
+        apply_control_action(&mut tab_config, JepaControlAction::TabMask),
+        JepaControlReset::None
+    );
+    assert!(control_button_active(
+        &config,
+        JepaControlAction::TabPipeline,
+        &controls
+    ));
+    assert!(!control_button_active(
+        &config,
+        JepaControlAction::TabMask,
+        &controls
+    ));
+
+    controls.tab = JepaControlsTab::Mask;
+    assert!(control_button_active(
+        &config,
+        JepaControlAction::TabMask,
+        &controls
+    ));
+    assert_eq!(
+        control_button_label(&config, JepaControlAction::TabPca),
+        "PCA"
+    );
+    assert!(control_help_text(JepaControlAction::TabAnyUp).contains("AnyUp"));
+}
+
+#[test]
 fn control_actions_switch_anyup_attention_mode() {
     let mut config = BevyJepaConfig::default();
 
@@ -364,6 +428,22 @@ fn control_sliders_update_numeric_pipeline_fields() {
 
     apply_control_slider_value(&mut config, JepaControlSliderKind::AgeIntervalFrames, 1.0);
     assert_eq!(config.patch_diff_refresh.age_refresh_interval_frames, 300);
+
+    assert_eq!(
+        apply_control_slider_value(&mut config, JepaControlSliderKind::PcaUpdateEvery, 0.0),
+        JepaControlReset::PcaConfig
+    );
+    assert_eq!(config.pca_update_every, 0);
+    apply_control_slider_value(
+        &mut config,
+        JepaControlSliderKind::PcaSampleWindowFrames,
+        0.0,
+    );
+    assert_eq!(config.pca_sample_window_frames, 2);
+    apply_control_slider_value(&mut config, JepaControlSliderKind::PcaMinSampleFrames, 1.0);
+    assert!(config.pca_min_sample_frames <= config.pca_sample_window_frames);
+    apply_control_slider_value(&mut config, JepaControlSliderKind::PcaUpdateIterations, 1.0);
+    assert_eq!(config.pca_update_iterations, 12);
 }
 
 #[test]
@@ -398,6 +478,40 @@ fn controls_ui_system_has_disjoint_text_queries() {
         .add_systems(Update, update_controls_ui);
 
     app.update();
+}
+
+#[test]
+fn controls_ui_shows_only_selected_tab_panel() {
+    let mut app = App::new();
+    app.insert_resource(BevyJepaConfig::default())
+        .insert_resource(JepaControlsState {
+            expanded: true,
+            tab: JepaControlsTab::Mask,
+        })
+        .add_systems(Startup, setup_controls_ui)
+        .add_systems(Update, update_controls_ui);
+
+    app.update();
+    assert_visible_controls_tab(&mut app, JepaControlsTab::Mask);
+
+    app.world_mut().resource_mut::<JepaControlsState>().tab = JepaControlsTab::Pca;
+    app.update();
+    assert_visible_controls_tab(&mut app, JepaControlsTab::Pca);
+}
+
+fn assert_visible_controls_tab(app: &mut App, active: JepaControlsTab) {
+    let mut query = app.world_mut().query::<(&ControlsTabPanel, &Node)>();
+    let mut count = 0;
+    for (panel, node) in query.iter(app.world()) {
+        count += 1;
+        let expected = if panel.tab == active {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        assert_eq!(node.display, expected, "tab {:?}", panel.tab);
+    }
+    assert_eq!(count, 4);
 }
 
 #[test]
@@ -483,6 +597,10 @@ fn default_viewer_pca_uses_smooth_rolling_updates() {
         pca_update.iterations_per_update,
         DEFAULT_PCA_UPDATE_ITERATIONS
     );
+
+    let mut locked = config;
+    locked.pca_update_every = 0;
+    assert!(!locked.pca_update_config().enabled());
 }
 
 #[test]
@@ -1684,6 +1802,8 @@ fn metrics_overlay_updates_structured_fields_and_graph() {
         pca_update_us: 90,
         pca_sample_frames: 8,
         pca_sample_window_frames: 16,
+        pca_update_events: 3,
+        pca_update_fps: 2.0,
         ..BevyJepaMetrics::default()
     })
     .init_resource::<JepaRuntime>()
@@ -1748,6 +1868,8 @@ fn metrics_text_clarifies_bucketed_encode_and_ttt_diagnostics() {
         dense_tokens: 1024,
         pca_sample_frames: 16,
         pca_sample_window_frames: 16,
+        pca_update_events: 3,
+        pca_update_fps: 2.0,
         stage_metrics: FeatureFrameMetrics {
             write_width: 12,
             valid_write_tokens: 12,
@@ -1790,6 +1912,13 @@ fn metrics_text_clarifies_bucketed_encode_and_ttt_diagnostics() {
         &history,
         MetricValueKind::StagePcaBasis,
     );
+    let updates = metric_value_text(
+        &config,
+        &metrics,
+        &runtime,
+        &history,
+        MetricValueKind::StagePcaUpdates,
+    );
 
     assert!(write.contains("12/1024"));
     assert!(write.contains("cache mask"));
@@ -1798,15 +1927,21 @@ fn metrics_text_clarifies_bucketed_encode_and_ttt_diagnostics() {
     assert!(ttt.contains("diag off"));
     assert!(basis.contains("cached"));
     assert!(basis.contains("@1f"));
+    assert!(updates.contains("2.0 fps"));
+    assert!(updates.contains("3 total"));
 }
 
 #[test]
 fn controls_help_text_documents_dense_sparse_and_threshold_controls() {
     assert!(default_controls_help().contains("Hover"));
+    assert!(default_controls_help().contains("tabs"));
+    assert!(control_help_text(JepaControlAction::TabMask).contains("patch-diff"));
     assert!(control_help_text(JepaControlAction::PipelineSparse).contains("patch-diff"));
     assert!(control_help_text(JepaControlAction::PipelineDense).contains("full-frame"));
+    assert!(control_help_text(JepaControlAction::PcaLock).contains("fixed"));
     assert!(slider_help_text(JepaControlSliderKind::PatchDiffThreshold).contains("Lower"));
     assert!(slider_help_text(JepaControlSliderKind::DenseFallbackDensity).contains("dense JEPA"));
+    assert!(slider_help_text(JepaControlSliderKind::PcaUpdateEvery).contains("Zero locks"));
 }
 
 #[test]

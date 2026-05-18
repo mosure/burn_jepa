@@ -1109,6 +1109,15 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         Ok(())
     }
 
+    pub fn set_pca_update_config(&mut self, pca_update: FeaturePcaUpdateConfig) -> Result<()> {
+        pca_update.validate()?;
+        self.config.pca_update = pca_update;
+        let effective_pca_update = self.config.effective_pca_update();
+        self.pca_update_scheduler = FeaturePcaUpdateScheduler::new(effective_pca_update.clone())?;
+        self.pca_samples = FeaturePcaSampleBuffer::new(effective_pca_update.sample_window_frames)?;
+        Ok(())
+    }
+
     pub fn step_image_keep_ratio(
         &mut self,
         image: Tensor<B, 4>,
