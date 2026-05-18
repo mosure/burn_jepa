@@ -8,6 +8,8 @@ const knownWasmPanicNeedles = [
   "condvar wait not supported",
   "Buffer is already mapped",
   "used in submit while mapped",
+  "usage (Storage(read-write)|Storage(read-only))",
+  "CubeCL Tasks Encoder",
   "std::time::Instant",
 ];
 

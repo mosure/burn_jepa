@@ -2212,18 +2212,29 @@ fn measure_ttt_state_fast_weight_rms<B: Backend>(state: &TttState<B>) -> Result<
     let mut sum_sq = 0.0f64;
     let mut count = 0usize;
     for layer in &state.layers {
-        let Some(weight) = &layer.fast_weight else {
-            continue;
-        };
-        let values = weight
-            .clone()
-            .to_data()
-            .to_vec::<f32>()
-            .context("read TTT fast-weight diagnostics")?;
-        count += values.len();
-        for value in values {
-            let value = value as f64;
-            sum_sq += value * value;
+        if let Some(weight) = &layer.fast_weight {
+            let values = weight
+                .clone()
+                .to_data()
+                .to_vec::<f32>()
+                .context("read TTT fast-weight diagnostics")?;
+            count += values.len();
+            for value in values {
+                let value = value as f64;
+                sum_sq += value * value;
+            }
+        }
+        if let Some(weight) = &layer.fast_weight_banks {
+            let values = weight
+                .clone()
+                .to_data()
+                .to_vec::<f32>()
+                .context("read TTT banked fast-weight diagnostics")?;
+            count += values.len();
+            for value in values {
+                let value = value as f64;
+                sum_sq += value * value;
+            }
         }
     }
     Ok((count > 0).then(|| (sum_sq / count as f64).sqrt()))

@@ -12,7 +12,8 @@ native/wasm Bevy demos.
 
 <img src="./docs/jepa_sparse_pipeline_frame.png" alt="input, sparse mask, low-res PCA, and high-res PCA from the sparse V-JEPA pipeline">
 
-frame 20 from the e2e sparse gallery: input, patch-diff sparse mask, low-res
+frame 3 from the e2e sparse gallery, generated with the local f16 V-JEPA 2.1
+base package and f16 AnyUp package: input, patch-diff sparse mask, low-res
 token-cache PCA, and high-res AnyUp PCA.
 
 ## features

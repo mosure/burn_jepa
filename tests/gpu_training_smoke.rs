@@ -174,8 +174,8 @@ fn sparse_patchify_smoke_config(
         burn_jepa::TttSparsePatchifyTrainingMode::FrozenSparsePatchify;
     config.training.loss_trace_interval = 0;
     config.training.mask = Some(burn_jepa::TrainingMaskConfig::PrecomputedMasks {
-        context_indices: vec![0, 2, 5, 7],
-        target_indices: vec![1, 3],
+        context_indices: vec![0, 2, 4, 6],
+        target_indices: vec![1, 3, 5, 7],
     });
     config.dataset.synthetic_len = 1;
     config

@@ -2,15 +2,15 @@
 
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Int, Tensor, TensorData};
 use burn_jepa::{
     BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseMaskBatch,
-    SparseTokenMask, TttBackpropMode, TttEncoderConfig, TttEvalModelKind, TttLayerPlacement,
-    TttLayerState, TttMemoryUpdateSource, TttRolloutReportMode, TttSparsePatchifyTrainingMode,
-    TttSparseRolloutMode, TttStreamStepKind, TttSupervisionMode, TttTargetMode, VJepa2_1Model,
-    VJepaTttLayer, VJepaTttModel, apply_token_mask, evaluate_ttt_base_sparse,
-    evaluate_ttt_model_file, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
-    train_ttt_distillation,
+    SparseTokenMask, TttBackpropMode, TttEncoderConfig, TttEvalModelKind, TttInsertionMode,
+    TttLayerPlacement, TttLayerState, TttMemoryDynamics, TttMemoryUpdateSource,
+    TttRolloutReportMode, TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttState,
+    TttStreamStepKind, TttSupervisionMode, TttTargetMode, VJepa2_1Model, VJepaTttLayer,
+    VJepaTttModel, apply_token_mask, evaluate_ttt_base_sparse, evaluate_ttt_model_file,
+    load_jepa_tensor_batch, synthetic_video, train_dense_jepa, train_ttt_distillation,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -39,6 +39,7 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
 
     let mut config = burn_jepa::training::BurnJepaTrainConfig::default();
     config.ttt.target = TttTargetMode::SelfHidden;
+    config.ttt.insertion = TttInsertionMode::InPlaceMlp;
     config.ttt.memory_update = TttMemoryUpdateSource::TeacherForcedDiagnostic;
     config.ttt.supervision = TttSupervisionMode::Hybrid;
     config.ttt.hybrid_final_steps = 2;
@@ -56,6 +57,7 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
 
     let toml = config.to_toml_string().expect("serialize config");
     assert!(toml.contains("[ttt]"));
+    assert!(toml.contains("insertion = \"in_place_mlp\""));
     assert!(toml.contains("target = \"self_hidden\""));
     assert!(toml.contains("memory_update = \"teacher_forced_diagnostic\""));
     assert!(toml.contains("supervision = \"hybrid\""));
@@ -74,10 +76,12 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     let _loss_config: burn_jepa::TttDistillationConfig = parsed.loss.clone();
 
     assert_eq!(parsed.ttt.target, TttTargetMode::SelfHidden);
+    assert_eq!(parsed.ttt.insertion, TttInsertionMode::InPlaceMlp);
     assert_eq!(
         parsed.ttt.memory_update,
         TttMemoryUpdateSource::TeacherForcedDiagnostic
     );
+    assert_eq!(parsed.ttt.memory_dynamics, TttMemoryDynamics::Ema);
     assert_eq!(parsed.ttt.supervision, TttSupervisionMode::Hybrid);
     assert_eq!(parsed.ttt.hybrid_final_steps, 2);
     assert_eq!(parsed.ttt.backprop_mode, TttBackpropMode::LayerLocal);
@@ -91,6 +95,36 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     assert_eq!(parsed.loss.latent_regularization.weight, 1.0e-4);
     assert_eq!(parsed.loss.latent_regularization.covariance_weight, 0.25);
     assert_eq!(parsed.loss.latent_regularization.covariance_sketch_dim, 8);
+}
+
+#[test]
+fn ttt_memory_alibi_config_round_trips_and_resolves_banks() {
+    let mut config = burn_jepa::training::BurnJepaTrainConfig::default();
+    config.ttt.memory_dynamics = TttMemoryDynamics::MemoryAlibi;
+    config.ttt.memory_alibi_half_lives = vec![4, 32, 256];
+    config.ttt.memory_alibi_read_weights = vec![2.0, 1.0, 1.0];
+    config.ttt.memory_alibi_update_weights = vec![1.0, 0.5, 0.25];
+    config.ttt.memory_clip_rms = 8.0;
+    config.training.max_steps = 2;
+
+    let toml = config.to_toml_string().expect("serialize config");
+    assert!(toml.contains("memory_dynamics = \"memory_alibi\""));
+    assert!(toml.contains("memory_alibi_half_lives"));
+
+    let parsed: burn_jepa::training::BurnJepaTrainConfig =
+        toml::from_str(&toml).expect("parse config");
+    parsed
+        .validate_for_ttt()
+        .expect("memory-alibi config validates");
+    assert_eq!(parsed.ttt.memory_bank_count(), 3);
+    assert_eq!(
+        parsed.ttt.resolved_memory_alibi_half_lives(),
+        vec![4, 32, 256]
+    );
+    assert_eq!(
+        parsed.ttt.resolved_memory_alibi_read_weights(),
+        vec![0.5, 0.25, 0.25]
+    );
 }
 
 #[test]
@@ -142,6 +176,10 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
         "../configs/production/vjepa21-ttt-stage1-stream-tbptt-sigreg-cuda.toml"
     ))
     .expect("parse SIGReg stream production config");
+    let carry_forever_alibi: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml"
+    ))
+    .expect("parse carry-forever Memory-ALiBi production config");
     let verified_lowlr_stream: BurnJepaTrainConfig = toml::from_str(include_str!(
         "../configs/production/vjepa21-ttt-stage1-stream-tbptt-verified-lowlr-cuda.toml"
     ))
@@ -178,6 +216,14 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
         "../configs/production/vjepa21-ttt-long-rollout-sigreg-cuda.toml"
     ))
     .expect("parse SIGReg long rollout eval config");
+    let carry_forever_cactus_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-cactus-64x-cuda.toml"
+    ))
+    .expect("parse carry-forever cactus eval config");
+    let carry_forever_adversarial_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-adversarial-8x-cuda.toml"
+    ))
+    .expect("parse carry-forever adversarial eval config");
     let stage2: BurnJepaTrainConfig = toml::from_str(include_str!(
         "../configs/production/vjepa21-ttt-stage2-unfrozen-low-lr-cuda.toml"
     ))
@@ -272,6 +318,27 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
             .output_dir
             .ends_with("stage1-stream-tbptt-sigreg")
     );
+    assert_eq!(
+        carry_forever_alibi.ttt.memory_dynamics,
+        TttMemoryDynamics::MemoryAlibi
+    );
+    assert_eq!(carry_forever_alibi.ttt.memory_bank_count(), 3);
+    assert!(carry_forever_alibi.training.stream.enabled);
+    assert_eq!(carry_forever_alibi.training.stream.reset_interval_steps, 0);
+    assert!(!carry_forever_alibi.training.stream.reset_on_scene_change);
+    assert!(
+        !carry_forever_alibi
+            .training
+            .stream
+            .reset_on_non_monotonic_start
+    );
+    assert_eq!(carry_forever_alibi.training.stream.state_decay, 1.0);
+    assert!(
+        carry_forever_alibi
+            .model
+            .output_dir
+            .ends_with("stage1-stream-tbptt-carry-forever-alibi")
+    );
     assert!(verified_lowlr_stream.model.ttt_checkpoint_path.is_some());
     assert!(verified_lowlr_stream.training.learning_rate < verified_stream.training.learning_rate);
     assert_eq!(verified_lowlr_stream.training.max_steps, 96);
@@ -364,6 +431,35 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
     assert_eq!(
         sigreg_long_eval.training.stream.reset_interval_steps,
         verylong_eval.training.stream.reset_interval_steps
+    );
+    assert_eq!(
+        carry_forever_cactus_eval.ttt.memory_dynamics,
+        TttMemoryDynamics::MemoryAlibi
+    );
+    assert_eq!(
+        carry_forever_cactus_eval
+            .training
+            .stream
+            .reset_interval_steps,
+        0
+    );
+    assert!(
+        !carry_forever_cactus_eval
+            .training
+            .stream
+            .reset_on_scene_change
+    );
+    assert_eq!(carry_forever_cactus_eval.training.eval_steps, 1088);
+    assert_eq!(
+        carry_forever_adversarial_eval.dataset.repeat_mode,
+        burn_jepa::JepaDatasetRepeatMode::AdversarialStitchedStream
+    );
+    assert_eq!(
+        carry_forever_adversarial_eval
+            .training
+            .stream
+            .reset_interval_steps,
+        0
     );
 
     assert_eq!(stage2.ttt.layers, vec![3, 7, 11]);
@@ -857,6 +953,63 @@ fn ttt_zero_initialized_adapter_preserves_video_encoder_output() {
 }
 
 #[test]
+fn ttt_memory_alibi_adapter_preserves_input_and_updates_banked_state() {
+    let device = Default::default();
+    let layer = VJepaTttLayer::<B>::new(
+        4,
+        &TttEncoderConfig {
+            chunk_tokens: 2,
+            memory_dynamics: TttMemoryDynamics::MemoryAlibi,
+            memory_alibi_half_lives: vec![2, 8, 32],
+            memory_alibi_read_weights: vec![0.5, 0.3, 0.2],
+            memory_alibi_update_weights: vec![1.0, 1.0, 1.0],
+            memory_clip_rms: 16.0,
+            ..TttEncoderConfig::default()
+        },
+        &device,
+    );
+    let input = Tensor::<B, 3>::from_data(
+        TensorData::new(
+            vec![
+                0.0, 0.1, 0.2, 0.3, //
+                0.4, 0.5, 0.6, 0.7, //
+                0.8, 0.9, 1.0, 1.1, //
+                1.2, 1.3, 1.4, 1.5,
+            ],
+            [1, 4, 4],
+        ),
+        &device,
+    );
+    let mut state = TttLayerState::empty();
+    let output = layer
+        .forward(input.clone(), None, &mut state)
+        .into_data()
+        .to_vec::<f32>()
+        .expect("output values");
+    let input = input.into_data().to_vec::<f32>().expect("input values");
+    let max_diff = input
+        .iter()
+        .zip(output.iter())
+        .map(|(lhs, rhs)| (lhs - rhs).abs())
+        .fold(0.0f32, f32::max);
+
+    assert!(
+        max_diff < 1.0e-5,
+        "zero-initialized Memory-ALiBi TTT adapter should preserve input, diff={max_diff}"
+    );
+    assert!(state.fast_weight.is_none());
+    assert_eq!(
+        state
+            .fast_weight_banks
+            .as_ref()
+            .expect("banked fast weights")
+            .shape()
+            .dims::<4>(),
+        [1, 3, 4, 4]
+    );
+}
+
+#[test]
 fn ttt_model_zero_init_matches_pretrained_video_encoder_and_stays_stable() {
     let device = Default::default();
     let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
@@ -915,6 +1068,271 @@ fn ttt_model_zero_init_matches_pretrained_video_encoder_and_stays_stable() {
         expected,
         second,
         1.0e-5,
+    );
+}
+
+#[test]
+fn ttt_in_place_mlp_zero_init_reuses_pretrained_mlp_and_matches_base_encoder() {
+    let device = Default::default();
+    let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
+    let base = VJepa2_1Model::<B>::new(&model_config, &device);
+    let student = VJepaTttModel::from_model(
+        base,
+        TttEncoderConfig {
+            insertion: TttInsertionMode::InPlaceMlp,
+            layer_placement: TttLayerPlacement::Explicit,
+            layers: vec![0, 1],
+            chunk_tokens: 4,
+            ..TttEncoderConfig::default()
+        },
+        &device,
+    )
+    .expect("in-place TTT wrapped model");
+    assert_eq!(
+        student.encoder.insertion_mode(),
+        TttInsertionMode::InPlaceMlp
+    );
+    assert_eq!(student.encoder.ttt_layer_indices(), &[0, 1]);
+    assert!(student.encoder.ttt_layers.is_empty());
+    assert_eq!(
+        student
+            .encoder
+            .inplace_ttt_layers
+            .as_ref()
+            .expect("in-place layers")
+            .len(),
+        2
+    );
+
+    let video = synthetic_video::<B>(1, model_config.in_channels, 4, 32, 32, &device);
+    let expected = student
+        .encoder
+        .base
+        .forward_video(video.clone(), None)
+        .tokens;
+    let mut state = student.fresh_state();
+    let actual = student
+        .encoder
+        .forward_video_with_state(video.clone(), None, Some(expected.clone()), &mut state)
+        .expect("stateful in-place TTT encode")
+        .tokens;
+
+    assert_tensor_close(
+        "zero-init in-place MLP TTT should preserve pretrained/base encoder",
+        expected.clone(),
+        actual,
+        1.0e-5,
+    );
+    assert!(
+        state.layers.iter().all(|layer| layer.fast_weight.is_some()),
+        "in-place MLP TTT should store per-layer down-proj delta fast weights"
+    );
+    assert_eq!(
+        state.layers[0]
+            .fast_weight
+            .as_ref()
+            .expect("in-place fast weight delta")
+            .shape()
+            .dims::<3>(),
+        [
+            1,
+            ((model_config.encoder.embed_dim as f32) * model_config.encoder.mlp_ratio).round()
+                as usize,
+            model_config.encoder.embed_dim,
+        ]
+    );
+
+    let second = student
+        .encoder
+        .forward_video_with_state(video, None, Some(expected.clone()), &mut state)
+        .expect("second in-place TTT encode")
+        .tokens;
+    assert_tensor_close(
+        "zero-init in-place MLP TTT should stay stable after cached updates",
+        expected,
+        second,
+        1.0e-5,
+    );
+}
+
+#[test]
+fn ttt_chunked_dense_rollout_matches_sequential_recurrence() {
+    let device = Default::default();
+    let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
+    let student = VJepaTttModel::from_model(
+        VJepa2_1Model::<B>::new(&model_config, &device),
+        TttEncoderConfig {
+            layers: vec![0, 1],
+            chunk_tokens: 2,
+            rollout_chunk_frames: 1,
+            ..TttEncoderConfig::default()
+        },
+        &device,
+    )
+    .expect("TTT wrapped model");
+    let video = synthetic_video::<B>(0, model_config.in_channels, 4, 32, 32, &device);
+    let teacher = student
+        .encoder
+        .base
+        .forward_video(video.clone(), None)
+        .tokens
+        .detach();
+
+    let mut sequential_state = student.fresh_state();
+    let sequential = student
+        .forward_single_frame_rollout_with_chunk_frames(
+            video.clone(),
+            Some(teacher.clone()),
+            &mut sequential_state,
+            1,
+        )
+        .expect("sequential rollout");
+    let mut chunked_state = student.fresh_state();
+    let chunked = student
+        .forward_single_frame_rollout_with_chunk_frames(video, Some(teacher), &mut chunked_state, 4)
+        .expect("chunked rollout");
+
+    assert_tensor_close(
+        "chunked dense rollout tokens should match sequential rollout",
+        sequential.tokens,
+        chunked.tokens,
+        1.0e-4,
+    );
+    assert_ttt_state_close(
+        "chunked dense rollout state should match sequential rollout",
+        &sequential_state,
+        &chunked_state,
+        1.0e-4,
+    );
+}
+
+#[test]
+fn ttt_memory_alibi_chunked_rollout_matches_sequential_recurrence() {
+    let device = Default::default();
+    let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
+    let student = VJepaTttModel::from_model(
+        VJepa2_1Model::<B>::new(&model_config, &device),
+        TttEncoderConfig {
+            layers: vec![0, 1],
+            chunk_tokens: 2,
+            rollout_chunk_frames: 1,
+            memory_dynamics: TttMemoryDynamics::MemoryAlibi,
+            memory_alibi_half_lives: vec![2, 8, 32],
+            memory_alibi_read_weights: vec![0.5, 0.3, 0.2],
+            memory_alibi_update_weights: vec![1.0, 1.0, 1.0],
+            ..TttEncoderConfig::default()
+        },
+        &device,
+    )
+    .expect("TTT wrapped model");
+    let video = synthetic_video::<B>(0, model_config.in_channels, 4, 32, 32, &device);
+    let teacher = student
+        .encoder
+        .base
+        .forward_video(video.clone(), None)
+        .tokens
+        .detach();
+
+    let mut sequential_state = student.fresh_state();
+    let sequential = student
+        .forward_single_frame_rollout_with_chunk_frames(
+            video.clone(),
+            Some(teacher.clone()),
+            &mut sequential_state,
+            1,
+        )
+        .expect("sequential rollout");
+    let mut chunked_state = student.fresh_state();
+    let chunked = student
+        .forward_single_frame_rollout_with_chunk_frames(video, Some(teacher), &mut chunked_state, 4)
+        .expect("chunked rollout");
+
+    assert_tensor_close(
+        "memory-alibi chunked rollout tokens should match sequential rollout",
+        sequential.tokens,
+        chunked.tokens,
+        1.0e-4,
+    );
+    assert_ttt_state_close(
+        "memory-alibi chunked rollout state should match sequential rollout",
+        &sequential_state,
+        &chunked_state,
+        1.0e-4,
+    );
+}
+
+#[test]
+fn ttt_chunked_sparse_batch_rollout_matches_sequential_recurrence() {
+    let device = Default::default();
+    let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
+    let student = VJepaTttModel::from_model(
+        VJepa2_1Model::<B>::new(&model_config, &device),
+        TttEncoderConfig {
+            layers: vec![0, 1],
+            chunk_tokens: 2,
+            rollout_chunk_frames: 1,
+            ..TttEncoderConfig::default()
+        },
+        &device,
+    )
+    .expect("TTT wrapped model");
+    let video = Tensor::cat(
+        vec![
+            synthetic_video::<B>(0, model_config.in_channels, 4, 32, 32, &device),
+            synthetic_video::<B>(1, model_config.in_channels, 4, 32, 32, &device),
+        ],
+        0,
+    );
+    let teacher = student
+        .encoder
+        .base
+        .forward_video(video.clone(), None)
+        .tokens
+        .detach();
+    let mask = SparseMaskBatch::<B>::from_rows(
+        vec![vec![0, 2, 4, 6], vec![1, 3, 5, 7]],
+        model_config.num_patches(),
+        &device,
+    )
+    .expect("fixed-width sparse mask batch");
+
+    let mut sequential_state = student.fresh_state();
+    let sequential = student
+        .forward_single_frame_rollout_sparse_batch_with_chunk_frames(
+            video.clone(),
+            &mask,
+            Some(teacher.clone()),
+            &mut sequential_state,
+            1,
+        )
+        .expect("sequential sparse rollout");
+    let mut chunked_state = student.fresh_state();
+    let chunked = student
+        .forward_single_frame_rollout_sparse_batch_with_chunk_frames(
+            video,
+            &mask,
+            Some(teacher),
+            &mut chunked_state,
+            4,
+        )
+        .expect("chunked sparse rollout");
+
+    assert_tensor_close(
+        "chunked sparse rollout tokens should match sequential rollout",
+        sequential.tokens,
+        chunked.tokens,
+        1.0e-4,
+    );
+    assert_int_tensor_equal(
+        "chunked sparse rollout token indices should match sequential rollout",
+        sequential.token_indices,
+        chunked.token_indices,
+    );
+    assert_ttt_state_close(
+        "chunked sparse rollout state should match sequential rollout",
+        &sequential_state,
+        &chunked_state,
+        1.0e-4,
     );
 }
 
@@ -1058,6 +1476,49 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
         report.final_loss
     );
     assert!(report.report_path.exists());
+}
+
+#[test]
+fn ttt_in_place_mlp_distillation_training_smoke_runs() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    config.ttt.insertion = TttInsertionMode::InPlaceMlp;
+    config.ttt.layer_placement = TttLayerPlacement::Explicit;
+    config.ttt.layers = vec![0, 1];
+    config.ttt.chunk_tokens = 2;
+    config.model.save_model = true;
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-in-place-train");
+    config.training.max_steps = 2;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 1;
+    config.training.learning_rate = 5.0e-3;
+    config.dataset.synthetic_len = 2;
+
+    let report =
+        train_ttt_distillation::<AB>(&config, &device).expect("in-place MLP TTT training smoke");
+    assert_eq!(report.steps, 2);
+    assert_eq!(report.memory.layers, vec![0, 1]);
+    assert!(report.final_loss.is_finite());
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
+    assert!(report.memory.fast_weight_bytes_f32 > 0);
+    assert!(report.memory.trainable_param_bytes_f32 > 0);
+
+    let model_path = report.model_path.expect("saved in-place TTT model path");
+    let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
+    let base = VJepa2_1Model::<AB>::new(&model_config, &device);
+    let loaded = VJepaTttModel::from_model(base, config.ttt.clone(), &device)
+        .expect("fresh in-place TTT model")
+        .load_file(
+            model_path,
+            &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
+            &device,
+        )
+        .expect("reload saved in-place TTT model");
+    assert_eq!(
+        loaded.encoder.insertion_mode(),
+        TttInsertionMode::InPlaceMlp
+    );
 }
 
 #[test]
@@ -2192,6 +2653,62 @@ fn assert_tensor_close<const D: usize>(
         max_diff <= tolerance,
         "{label}: max_diff={max_diff} tolerance={tolerance} shape={shape:?}"
     );
+}
+
+fn assert_int_tensor_equal<const D: usize>(
+    label: &str,
+    expected: Tensor<B, D, Int>,
+    actual: Tensor<B, D, Int>,
+) {
+    assert_eq!(
+        expected.shape(),
+        actual.shape(),
+        "{label}: tensor shapes differ"
+    );
+    let shape = expected.shape();
+    let expected = expected.into_data().to_vec::<i64>().expect("tensor values");
+    let actual = actual.into_data().to_vec::<i64>().expect("tensor values");
+    assert_eq!(
+        expected, actual,
+        "{label}: tensor values differ shape={shape:?}"
+    );
+}
+
+fn assert_ttt_state_close(
+    label: &str,
+    expected: &TttState<B>,
+    actual: &TttState<B>,
+    tolerance: f32,
+) {
+    assert_eq!(
+        expected.layers.len(),
+        actual.layers.len(),
+        "{label}: state layer count differs"
+    );
+    for (layer_index, (expected, actual)) in
+        expected.layers.iter().zip(actual.layers.iter()).enumerate()
+    {
+        match (&expected.fast_weight, &actual.fast_weight) {
+            (Some(expected), Some(actual)) => assert_tensor_close(
+                &format!("{label} layer {layer_index}"),
+                expected.clone(),
+                actual.clone(),
+                tolerance,
+            ),
+            (None, None) => {}
+            _ => panic!("{label}: fast-weight presence differs at layer {layer_index}"),
+        }
+        match (&expected.fast_weight_banks, &actual.fast_weight_banks) {
+            (Some(expected), Some(actual)) => assert_tensor_close(
+                &format!("{label} layer {layer_index} banks"),
+                expected.clone(),
+                actual.clone(),
+                tolerance,
+            ),
+            (None, None) => {}
+            _ => panic!("{label}: banked fast-weight presence differs at layer {layer_index}"),
+        }
+    }
 }
 
 fn tensor_values<const D: usize>(tensor: Tensor<B, D>) -> Vec<f32> {

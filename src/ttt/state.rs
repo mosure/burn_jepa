@@ -4,22 +4,32 @@ use burn::tensor::backend::Backend;
 #[derive(Clone, Debug)]
 pub struct TttLayerState<B: Backend> {
     pub fast_weight: Option<Tensor<B, 3>>,
+    pub fast_weight_banks: Option<Tensor<B, 4>>,
 }
 
 impl<B: Backend> TttLayerState<B> {
     pub fn empty() -> Self {
-        Self { fast_weight: None }
+        Self {
+            fast_weight: None,
+            fast_weight_banks: None,
+        }
     }
 
     pub fn detach(&mut self) {
         if let Some(weight) = self.fast_weight.take() {
             self.fast_weight = Some(weight.detach());
         }
+        if let Some(weight) = self.fast_weight_banks.take() {
+            self.fast_weight_banks = Some(weight.detach());
+        }
     }
 
     pub fn decay(&mut self, factor: f64) {
         if let Some(weight) = self.fast_weight.take() {
             self.fast_weight = Some(weight.mul_scalar(factor));
+        }
+        if let Some(weight) = self.fast_weight_banks.take() {
+            self.fast_weight_banks = Some(weight.mul_scalar(factor));
         }
     }
 }
@@ -49,7 +59,9 @@ impl<B: Backend> TttState<B> {
     }
 
     pub fn has_fast_weights(&self) -> bool {
-        self.layers.iter().any(|layer| layer.fast_weight.is_some())
+        self.layers
+            .iter()
+            .any(|layer| layer.fast_weight.is_some() || layer.fast_weight_banks.is_some())
     }
 
     pub fn select_rows(&self, rows: &[usize]) -> Self {
@@ -62,6 +74,10 @@ impl<B: Backend> TttState<B> {
                         .fast_weight
                         .as_ref()
                         .map(|weight| select_rows3(weight.clone(), rows)),
+                    fast_weight_banks: layer
+                        .fast_weight_banks
+                        .as_ref()
+                        .map(|weight| select_rows4(weight.clone(), rows)),
                 })
                 .collect(),
         }
@@ -78,6 +94,10 @@ impl<B: Backend> TttState<B> {
                             .fast_weight
                             .as_ref()
                             .map(|weight| weight.clone().slice_dim(0, row..row + 1)),
+                        fast_weight_banks: layer
+                            .fast_weight_banks
+                            .as_ref()
+                            .map(|weight| weight.clone().slice_dim(0, row..row + 1)),
                     })
                     .collect(),
             })
@@ -92,13 +112,13 @@ impl<B: Backend> TttState<B> {
             .unwrap_or(0);
         let layers = (0..layer_count)
             .map(|layer_index| {
-                let template = row_states.iter().find_map(|state| {
+                let fast_template = row_states.iter().find_map(|state| {
                     state
                         .layers
                         .get(layer_index)
                         .and_then(|layer| layer.fast_weight.as_ref())
                 });
-                let fast_weight = template.map(|template| {
+                let fast_weight = fast_template.map(|template| {
                     let [_, rows, cols] = template.shape().dims::<3>();
                     Tensor::cat(
                         row_states
@@ -117,7 +137,38 @@ impl<B: Backend> TttState<B> {
                         0,
                     )
                 });
-                TttLayerState { fast_weight }
+                let bank_template = row_states.iter().find_map(|state| {
+                    state
+                        .layers
+                        .get(layer_index)
+                        .and_then(|layer| layer.fast_weight_banks.as_ref())
+                });
+                let fast_weight_banks = bank_template.map(|template| {
+                    let [_, banks, rows, cols] = template.shape().dims::<4>();
+                    Tensor::cat(
+                        row_states
+                            .iter()
+                            .map(|state| {
+                                state
+                                    .layers
+                                    .get(layer_index)
+                                    .and_then(|layer| layer.fast_weight_banks.as_ref())
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        Tensor::<B, 4>::zeros(
+                                            [1, banks, rows, cols],
+                                            &template.device(),
+                                        )
+                                    })
+                            })
+                            .collect(),
+                        0,
+                    )
+                });
+                TttLayerState {
+                    fast_weight,
+                    fast_weight_banks,
+                }
             })
             .collect();
         Self { layers }
@@ -125,6 +176,15 @@ impl<B: Backend> TttState<B> {
 }
 
 fn select_rows3<B: Backend>(tensor: Tensor<B, 3>, rows: &[usize]) -> Tensor<B, 3> {
+    Tensor::cat(
+        rows.iter()
+            .map(|&row| tensor.clone().slice_dim(0, row..row + 1))
+            .collect(),
+        0,
+    )
+}
+
+fn select_rows4<B: Backend>(tensor: Tensor<B, 4>, rows: &[usize]) -> Tensor<B, 4> {
     Tensor::cat(
         rows.iter()
             .map(|&row| tensor.clone().slice_dim(0, row..row + 1))

@@ -1682,15 +1682,21 @@ fn metrics_overlay_updates_structured_fields_and_graph() {
         .iter(world)
         .map(|(_, text)| text.0.clone())
         .collect::<Vec<_>>();
-    assert!(rendered.iter().any(|line| line.contains("Tokens")));
     assert!(
         rendered
             .iter()
-            .any(|line| line.contains("write 64") && line.contains("encode 64"))
+            .any(|line| line.contains("Write") && line.contains("64/256"))
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("Encode") && line.contains("64/256"))
     );
     assert!(rendered.iter().any(|line| line.contains("JEPA")));
     assert!(rendered.iter().any(|line| line.contains("2.10 ms")));
     assert!(rendered.iter().any(|line| line.contains("Cache")));
+    assert!(rendered.iter().any(|line| line.contains("Grid view")));
+    assert!(!rendered.iter().any(|line| line.contains("Frames   in")));
     assert!(rendered.iter().any(|line| line.contains("Rolling")));
 
     let mut bar_query = world.query::<(&MetricGraphBar, &Node)>();
@@ -1699,6 +1705,72 @@ fn metrics_overlay_updates_structured_fields_and_graph() {
             .iter(world)
             .any(|(_, node)| matches!(node.height, Val::Px(height) if height > 1.0))
     );
+}
+
+#[test]
+fn metrics_text_clarifies_bucketed_encode_and_ttt_diagnostics() {
+    let config = BevyJepaConfig {
+        source: BevyJepaFrameSource::SyntheticLocalMotion,
+        encoder_source: BevyJepaEncoderSource::TrainedTtt,
+        ..tiny_viewer_config()
+    };
+    let metrics = BevyJepaMetrics {
+        frame_ready: true,
+        encoder_source: BevyJepaEncoderSource::TrainedTtt,
+        context_tokens: 12,
+        dense_tokens: 1024,
+        pca_sample_frames: 16,
+        pca_sample_window_frames: 16,
+        stage_metrics: FeatureFrameMetrics {
+            write_width: 12,
+            valid_write_tokens: 12,
+            encode_width: 256,
+            valid_encode_tokens: 256,
+            pca_sample_frames: 16,
+            pca_sample_window_frames: 16,
+            ..FeatureFrameMetrics::default()
+        },
+        ..BevyJepaMetrics::default()
+    };
+    let runtime = JepaRuntime::default();
+    let history = MetricsRollingState::default();
+
+    let write = metric_value_text(
+        &config,
+        &metrics,
+        &runtime,
+        &history,
+        MetricValueKind::Tokens,
+    );
+    let encode = metric_value_text(
+        &config,
+        &metrics,
+        &runtime,
+        &history,
+        MetricValueKind::EncodeTokens,
+    );
+    let ttt = metric_value_text(
+        &config,
+        &metrics,
+        &runtime,
+        &history,
+        MetricValueKind::StageTttStability,
+    );
+    let basis = metric_value_text(
+        &config,
+        &metrics,
+        &runtime,
+        &history,
+        MetricValueKind::StagePcaBasis,
+    );
+
+    assert!(write.contains("12/1024"));
+    assert!(write.contains("cache mask"));
+    assert!(encode.contains("256/1024"));
+    assert!(encode.contains("bucketed"));
+    assert!(ttt.contains("diag off"));
+    assert!(basis.contains("cached"));
+    assert!(basis.contains("@1f"));
 }
 
 #[test]

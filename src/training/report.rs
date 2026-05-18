@@ -1,6 +1,6 @@
 use crate::{
-    LearningRateScheduleConfig, LearningRateScheduleStats, TttBackpropMode, TttMemoryUpdateSource,
-    TttSupervisionMode, TttTargetMode,
+    LearningRateScheduleConfig, LearningRateScheduleStats, TttBackpropMode, TttInsertionMode,
+    TttMemoryDynamics, TttMemoryUpdateSource, TttSupervisionMode, TttTargetMode,
 };
 use anyhow::{Context, Result};
 use burn::tensor::Tensor;
@@ -33,7 +33,13 @@ pub struct TttMemoryMetrics {
     pub predictor_embed_dim: usize,
     pub batch_size: usize,
     pub chunk_tokens: usize,
+    pub rollout_chunk_frames: usize,
     pub ttt_lr: f32,
+    pub insertion: TttInsertionMode,
+    pub memory_dynamics: TttMemoryDynamics,
+    pub memory_banks: usize,
+    pub memory_alibi_half_lives: Vec<usize>,
+    pub memory_clip_rms: f32,
     pub fast_weight_elements: usize,
     pub fast_weight_bytes_f32: usize,
     pub trainable_param_elements: usize,

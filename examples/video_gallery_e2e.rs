@@ -4,9 +4,13 @@ use anyhow::{Context, Result, bail, ensure};
 use burn::backend::NdArray;
 use burn::tensor::{Tensor, TensorData};
 use burn_jepa::{
-    AnyUp, AnyUpAttentionMode, AnyUpConfig, AnyUpLoadOptions, FeatureFrameMeasureConfig,
-    FeatureFramePipeline, FeatureFramePipelineConfig, FeatureFrameRequest, FeaturePcaProjector,
-    FeaturePcaUpdateConfig, SparseTokenMask, TokenGridShape, VJepa2_1Model, VJepaConfig,
+    AnyUp, AnyUpAttentionMode, AnyUpConfig, AnyUpLoadOptions, BurnAnyUpPackageManifest,
+    BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, FeatureFrameJepaEncoder,
+    FeatureFrameMeasureConfig, FeatureFramePipeline, FeatureFramePipelineConfig,
+    FeatureFrameRequest, FeaturePcaProjector, FeaturePcaUpdateConfig, SparseTokenMask,
+    TokenGridShape, VJepa2_1Model, VJepaConfig, load_anyup_burnpack_parts, load_ttt_burnpack_parts,
+    load_vjepa_burnpack_parts, read_parts_manifest, resolve_package_manifest_entry_path,
+    resolve_part_entry_path,
 };
 use clap::Parser;
 use image::{ImageReader, RgbImage, imageops::FilterType};
@@ -20,6 +24,20 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type GalleryBackend = NdArray<f32>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GalleryJepaSource {
+    Tiny,
+    BurnpackBase,
+    BurnpackTtt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GalleryAnyUpSource {
+    Tiny,
+    Checkpoint,
+    Burnpack,
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Generate an E2E Burn sparse JEPA/AnyUp/PCA video gallery")]
@@ -39,9 +57,15 @@ struct Args {
     #[arg(long, default_value_t = 224)]
     image_size: usize,
     #[arg(long)]
+    model_manifest: Option<PathBuf>,
+    #[arg(long)]
     anyup_weights: Option<PathBuf>,
+    #[arg(long)]
+    anyup_model_manifest: Option<PathBuf>,
     #[arg(long, default_value_t = AnyUpAttentionMode::EfficientLocal)]
     anyup_attention_mode: AnyUpAttentionMode,
+    #[arg(long = "config", value_delimiter = ',')]
+    configs: Vec<String>,
     #[arg(long, default_value_t = 16)]
     pca_update_every: u64,
     #[arg(long, default_value_t = false)]
@@ -228,26 +252,25 @@ fn run(args: Args) -> Result<()> {
         args.frames,
         args.stride,
     )?;
+    let configs = selected_configs(&args)?;
     let device = Default::default();
-    let mut model_config = VJepaConfig::tiny_for_tests();
-    model_config.image_size = args.image_size;
-    model_config.num_frames = 2;
-    model_config.tubelet_size = 2;
+    let (encoder, model_config, jepa_source) =
+        build_gallery_encoder(&args, &device).context("initialize gallery V-JEPA encoder")?;
     let grid = TokenGridShape::new(
         1,
         args.image_size / model_config.patch_size,
         args.image_size / model_config.patch_size,
     );
-    let jepa = VJepa2_1Model::<GalleryBackend>::new(&model_config, &device);
-    let anyup = build_gallery_anyup(&args, &device)?;
+    let (anyup, anyup_source) =
+        build_gallery_anyup(&args, &device).context("initialize gallery AnyUp model")?;
     let pipeline_config = FeatureFramePipelineConfig {
         anyup_q_chunk_size: Some(16),
         pca_update: FeaturePcaUpdateConfig::rolling_low_res_every(args.pca_update_every.max(1)),
         measurement: FeatureFrameMeasureConfig::enabled(),
         ..FeatureFramePipelineConfig::default()
     };
-    let mut pipeline = FeatureFramePipeline::<GalleryBackend>::new(
-        jepa,
+    let mut pipeline = FeatureFramePipeline::<GalleryBackend>::new_with_encoder(
+        encoder,
         anyup,
         &model_config,
         pipeline_config,
@@ -261,8 +284,8 @@ fn run(args: Args) -> Result<()> {
             dataset: "UCSD Anomaly/Pedestrian dataset",
             dataset_url: DATASET_URL,
             sample_count: samples.len(),
-            config_count: CONFIGS.len(),
-            mp4_count: samples.len() * (1 + CONFIGS.len() * 3),
+            config_count: configs.len(),
+            mp4_count: samples.len() * (1 + configs.len() * 3),
             image_size: args.image_size,
             token_grid: grid.height,
             frames_per_sample: args.frames,
@@ -272,22 +295,26 @@ fn run(args: Args) -> Result<()> {
             mask_source: "burn_jepa_gallery_masks_full_autogaze_stream_patchdiff",
             burn_pipeline: "FeatureFramePipeline: image -> sparse mask -> V-JEPA encoder -> interframe feature cache -> PCA -> AnyUp high-res PCA",
             burn_backend: "ndarray",
-            model_source: if args.anyup_weights.is_some() {
+            model_source: if args.model_manifest.is_some() && args.anyup_model_manifest.is_some() {
+                "burnpack_vjepa2_1_and_burnpack_anyup"
+            } else if args.model_manifest.is_some()
+                && (args.anyup_model_manifest.is_some() || args.anyup_weights.is_some())
+            {
+                "burnpack_vjepa2_1_with_loaded_anyup"
+            } else if args.model_manifest.is_some() {
+                "burnpack_vjepa2_1_with_tiny_anyup"
+            } else if args.anyup_model_manifest.is_some() || args.anyup_weights.is_some() {
                 "tiny_vjepa_with_loaded_anyup"
             } else {
                 "tiny_for_tests_untrained"
             },
-            pipeline_note: if args.anyup_weights.is_some() {
-                "Low/high PCA artifacts are generated by the Burn FeatureFramePipeline e2e path with loaded AnyUp weights: V-JEPA encode, sparse feature-cache update, low-res PCA, AnyUp upsample, and high-res PCA."
-            } else {
-                "Low/high PCA artifacts are generated by the Burn FeatureFramePipeline e2e path with tiny untrained V-JEPA/AnyUp modules; high-res colors validate the data path, not pretrained AnyUp quality."
-            },
+            pipeline_note: pipeline_note(jepa_source, anyup_source),
             generated_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
         },
-        configs: CONFIGS.to_vec(),
+        configs: configs.clone(),
         samples: Vec::new(),
     };
 
@@ -296,7 +323,7 @@ fn run(args: Args) -> Result<()> {
         args.dataset_root.display(),
         discover_clip_count(&args.dataset_root)?,
         samples.len(),
-        CONFIGS.len(),
+        configs.len(),
         grid.height,
         grid.width
     );
@@ -317,7 +344,7 @@ fn run(args: Args) -> Result<()> {
             input_video,
             configs: BTreeMap::new(),
         };
-        for config in CONFIGS {
+        for config in configs.iter().copied() {
             reset_pipeline_state(&mut pipeline, &model_config, &device)?;
             let result = render_config(
                 &args.output,
@@ -341,10 +368,108 @@ fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+fn selected_configs(args: &Args) -> Result<Vec<GalleryConfig>> {
+    if args.configs.is_empty() {
+        return Ok(CONFIGS.to_vec());
+    }
+    args.configs
+        .iter()
+        .map(|id| {
+            CONFIGS
+                .iter()
+                .copied()
+                .find(|config| config.config_id == id)
+                .with_context(|| format!("unknown gallery config `{id}`"))
+        })
+        .collect()
+}
+
+fn build_gallery_encoder(
+    args: &Args,
+    device: &<GalleryBackend as burn::tensor::backend::BackendTypes>::Device,
+) -> Result<(
+    FeatureFrameJepaEncoder<GalleryBackend>,
+    VJepaConfig,
+    GalleryJepaSource,
+)> {
+    let Some(manifest_path) = &args.model_manifest else {
+        let mut model_config = VJepaConfig::tiny_for_tests();
+        model_config.image_size = args.image_size;
+        model_config.num_frames = 2;
+        model_config.tubelet_size = 2;
+        let model = VJepa2_1Model::<GalleryBackend>::new(&model_config, device);
+        return Ok((
+            FeatureFrameJepaEncoder::base(model),
+            model_config,
+            GalleryJepaSource::Tiny,
+        ));
+    };
+
+    let manifest_json = fs::read_to_string(manifest_path)
+        .with_context(|| format!("read V-JEPA package manifest `{}`", manifest_path.display()))?;
+    let mut manifest = BurnJepaPipelinePackageManifest::from_json_str(&manifest_json)
+        .with_context(|| {
+            format!(
+                "parse V-JEPA package manifest `{}`",
+                manifest_path.display()
+            )
+        })?;
+    let parts = read_package_parts(manifest_path, &manifest.parts_manifest)?;
+    let mut model_config = manifest.jepa_config.clone();
+    model_config.image_size = args.image_size;
+    match manifest.model_kind {
+        BurnJepaPackageModelKind::Base => {
+            let (model, report) =
+                load_vjepa_burnpack_parts::<GalleryBackend>(&model_config, &parts, device)?;
+            ensure_apply_report_ok(&report, "V-JEPA base")?;
+            Ok((
+                FeatureFrameJepaEncoder::base(model),
+                model_config,
+                GalleryJepaSource::BurnpackBase,
+            ))
+        }
+        BurnJepaPackageModelKind::Ttt => {
+            let ttt_config = manifest
+                .ttt_config
+                .take()
+                .context("TTT V-JEPA package manifest is missing ttt_config")?;
+            let (model, report) = load_ttt_burnpack_parts::<GalleryBackend>(
+                &model_config,
+                ttt_config,
+                &parts,
+                device,
+            )?;
+            ensure_apply_report_ok(&report, "TTT V-JEPA")?;
+            Ok((
+                FeatureFrameJepaEncoder::ttt(model),
+                model_config,
+                GalleryJepaSource::BurnpackTtt,
+            ))
+        }
+    }
+}
+
 fn build_gallery_anyup(
     args: &Args,
     device: &<GalleryBackend as burn::tensor::backend::BackendTypes>::Device,
-) -> Result<AnyUp<GalleryBackend>> {
+) -> Result<(AnyUp<GalleryBackend>, GalleryAnyUpSource)> {
+    if let Some(manifest_path) = &args.anyup_model_manifest {
+        let manifest_json = fs::read_to_string(manifest_path).with_context(|| {
+            format!("read AnyUp package manifest `{}`", manifest_path.display())
+        })?;
+        let mut manifest =
+            BurnAnyUpPackageManifest::from_json_str(&manifest_json).with_context(|| {
+                format!("parse AnyUp package manifest `{}`", manifest_path.display())
+            })?;
+        manifest.anyup_config.attention_mode = args.anyup_attention_mode;
+        manifest.anyup_config.input_dim = 3;
+        let parts = read_package_parts(manifest_path, &manifest.parts_manifest)?;
+        let (model, report) =
+            load_anyup_burnpack_parts::<GalleryBackend>(&manifest.anyup_config, &parts, device)?;
+        ensure_anyup_apply_report_ok(&report, "AnyUp")?;
+        return Ok((model, GalleryAnyUpSource::Burnpack));
+    }
+
     let config = if args.anyup_weights.is_some() {
         AnyUpConfig::default()
     } else {
@@ -356,8 +481,77 @@ fn build_gallery_anyup(
         AnyUpLoadOptions::default()
             .load_into(&mut anyup, path, device)
             .with_context(|| format!("load AnyUp gallery weights `{}`", path.display()))?;
+        return Ok((anyup, GalleryAnyUpSource::Checkpoint));
     }
-    Ok(anyup)
+    Ok((anyup, GalleryAnyUpSource::Tiny))
+}
+
+fn read_package_parts(manifest_path: &Path, parts_manifest: &str) -> Result<Vec<Vec<u8>>> {
+    let parts_manifest_path = resolve_package_manifest_entry_path(manifest_path, parts_manifest)?;
+    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
+    parts_manifest
+        .parts
+        .iter()
+        .map(|entry| {
+            let path = resolve_part_entry_path(&parts_manifest_path, &entry.path)?;
+            fs::read(&path).with_context(|| format!("read burnpack part `{}`", path.display()))
+        })
+        .collect()
+}
+
+fn ensure_apply_report_ok(report: &burn_jepa::BurnStoreApplyResult, label: &str) -> Result<()> {
+    if !report.errors.is_empty() {
+        bail!(
+            "{label} package load reported tensor errors: {:?}",
+            report.errors
+        );
+    }
+    ensure!(
+        !report.applied.is_empty(),
+        "{label} package load did not apply any tensors"
+    );
+    Ok(())
+}
+
+fn ensure_anyup_apply_report_ok(
+    report: &burn_jepa::BurnStoreApplyResult,
+    label: &str,
+) -> Result<()> {
+    ensure_apply_report_ok(report, label)?;
+    let loaded = |needle: &str| report.applied.iter().any(|path| path == needle);
+    for critical in [
+        "image_encoder.pre.weight",
+        "key_encoder.pre.weight",
+        "query_encoder.pre.weight",
+        "key_features_encoder.pre.basis",
+        "aggregation.pre.weight",
+        "cross_decode.conv.weight",
+        "cross_decode.cross_attn.q_proj.weight",
+        "cross_decode.cross_attn.k_proj.weight",
+    ] {
+        ensure!(
+            loaded(critical),
+            "{label} package did not load critical tensor `{critical}`"
+        );
+    }
+    Ok(())
+}
+
+fn pipeline_note(jepa_source: GalleryJepaSource, anyup_source: GalleryAnyUpSource) -> &'static str {
+    match (jepa_source, anyup_source) {
+        (GalleryJepaSource::Tiny, GalleryAnyUpSource::Tiny) => {
+            "Low/high PCA artifacts are generated by the Burn FeatureFramePipeline e2e path with tiny untrained V-JEPA/AnyUp modules; high-res colors validate the data path, not pretrained feature quality."
+        }
+        (GalleryJepaSource::Tiny, _) => {
+            "Low/high PCA artifacts are generated by the Burn FeatureFramePipeline e2e path with a tiny untrained V-JEPA encoder and loaded AnyUp weights; use --model-manifest for README-grade V-JEPA feature visuals."
+        }
+        (_, GalleryAnyUpSource::Tiny) => {
+            "Low/high PCA artifacts are generated by the Burn FeatureFramePipeline e2e path with loaded V-JEPA 2.1 weights and a tiny untrained AnyUp module; high-res PCA is diagnostic only."
+        }
+        _ => {
+            "Low/high PCA artifacts are generated by the Burn FeatureFramePipeline e2e path with loaded V-JEPA 2.1 and AnyUp weights: sparse mask, V-JEPA encode, sparse feature-cache update, rolling PCA, AnyUp upsample, and high-res PCA."
+        }
+    }
 }
 
 fn reset_pipeline_state(

@@ -524,6 +524,9 @@ impl InterframeJepaFeatureMemory<burn::backend::Wgpu<f32, i32>> {
         if self.config.update_mode != InterframeJepaFeatureUpdateMode::AssignLatest {
             return self.update_tokens(tokens, token_indices, grid);
         }
+        if cfg!(target_arch = "wasm32") {
+            return self.update_tokens(tokens, token_indices, grid);
+        }
         let (batch, token_count, _embed_dim) =
             self.validate_sparse_update_inputs(&tokens, &token_indices, grid)?;
         let output = crate::sparse_feature_memory::sparse_feature_memory_assign_latest_wgpu_fusion(
@@ -552,6 +555,9 @@ impl InterframeJepaFeatureMemory<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         grid: TokenGridShape,
     ) -> Result<InterframeJepaFeatureMemoryOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
         if self.config.update_mode != InterframeJepaFeatureUpdateMode::AssignLatest {
+            return self.update_tokens(tokens, token_indices, grid);
+        }
+        if cfg!(target_arch = "wasm32") {
             return self.update_tokens(tokens, token_indices, grid);
         }
         let (batch, token_count, _embed_dim) =

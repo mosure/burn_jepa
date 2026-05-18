@@ -3,6 +3,8 @@
 use std::{collections::VecDeque, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::tasks::{AsyncComputeTaskPool, block_on, futures_lite::future};
 use bevy::{
     app::AppExit,
     prelude::*,
@@ -10,7 +12,7 @@ use bevy::{
         RenderPlugin,
         settings::{RenderCreation, WgpuFeatures, WgpuSettings},
     },
-    tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
+    tasks::Task,
     ui::{RelativeCursorPosition, widget::ImageNode},
     window::PrimaryWindow,
 };
@@ -95,7 +97,7 @@ const CONTROL_SLIDER_WIDTH_PX: f32 = 206.0;
 const CONTROL_SLIDER_HEIGHT_PX: f32 = 18.0;
 const CONTROL_SLIDER_UPDATE_EPSILON: f32 = 0.001;
 const METRICS_TOP_WIDTH_PX: f32 = 560.0;
-const METRICS_STAGE_HEIGHT_PX: f32 = 118.0;
+const METRICS_STAGE_HEIGHT_PX: f32 = 138.0;
 const METRICS_GRAPH_BARS: usize = 64;
 const METRICS_GRAPH_HEIGHT_PX: f32 = 52.0;
 const DENSE_PIPELINE_FALLBACK_DENSITY: f32 = 0.0;
@@ -166,6 +168,39 @@ pub fn error(message: &str) {
 
     #[cfg(not(target_arch = "wasm32"))]
     eprintln!("error: {message}");
+}
+
+fn sync_measurements_enabled(config: &BevyJepaConfig) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = config;
+        false
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        config.sync_measurements
+    }
+}
+
+fn measurement_config(config: &BevyJepaConfig) -> burn_jepa::SparseJepaAnyUpPcaMeasurementConfig {
+    let mut measurement = config.measurement_config();
+    measurement.sync_backend = sync_measurements_enabled(config);
+    measurement
+}
+
+fn sync_bevy_backend(device: &JepaBevyDevice) -> Result<()> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = device;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        JepaBevyBackend::sync(device)?;
+        Ok(())
+    }
 }
 
 #[derive(Resource, Default)]
@@ -355,6 +390,7 @@ struct CachedStaticFrame {
     image: Tensor<JepaBevyBackend, 4>,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct AnyUpHighResRuntime {
     anyup: AnyUp<JepaBevyBackend>,
     anyup_image_grid: AnyUpImageGrid<JepaBevyBackend>,
@@ -363,6 +399,7 @@ struct AnyUpHighResRuntime {
     q_chunk_size: usize,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct HighResFrameInput {
     signature: RuntimePipelineSignature,
     id: FrameId,
@@ -373,6 +410,7 @@ struct HighResFrameInput {
     sync_measurements: bool,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct HighResAsyncTaskOutput {
     signature: RuntimePipelineSignature,
     runtime: AnyUpHighResRuntime,
@@ -469,6 +507,7 @@ enum MetricValueKind {
     Model,
     Grid,
     Tokens,
+    EncodeTokens,
     Queue,
     Error,
     FpsInput,
@@ -478,7 +517,8 @@ enum MetricValueKind {
     StageInputSource,
     StageInputQueue,
     StageMaskPolicy,
-    StageMaskGrid,
+    StageMaskWrite,
+    StageMaskEncode,
     StageEncodeLatency,
     StageEncodePath,
     StageTttStability,
@@ -692,7 +732,7 @@ impl JepaRuntime {
                 anyup_q_chunk_size: Some(config.anyup_q_chunk_size.max(1)),
                 update_pca_online: false,
                 pca_update: config.pca_update_config(),
-                measurement: config.measurement_config(),
+                measurement: measurement_config(config),
                 ttt_runtime: config.ttt_runtime,
                 ..FeatureFramePipelineConfig::default()
             };
@@ -808,6 +848,7 @@ impl JepaRuntime {
         Ok(())
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn enqueue_high_res_frame(
         &mut self,
         config: &BevyJepaConfig,
@@ -816,16 +857,43 @@ impl JepaRuntime {
     ) -> Result<()> {
         self.ensure_high_res_runtime(config, device)?;
         if self.high_res_task.is_none() {
-            let runtime = self
-                .high_res_runtime
-                .take()
-                .expect("high-res AnyUp runtime initialized");
-            self.high_res_task = Some(spawn_high_res_task(runtime, input));
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = input;
+                self.dropped_frames = self.dropped_frames.saturating_add(1);
+                bail!(
+                    "AnyUp high-res worker is disabled in the browser build; set high-res cadence to off"
+                );
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let runtime = self
+                    .high_res_runtime
+                    .take()
+                    .expect("high-res AnyUp runtime initialized");
+                self.high_res_task = Some(spawn_high_res_task(runtime, input));
+            }
         } else if self.pending_high_res.replace(input).is_some() {
             self.dropped_frames = self.dropped_frames.saturating_add(1);
             self.overwritten_frames = self.overwritten_frames.saturating_add(1);
         }
         Ok(())
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn run_high_res_frame_inline(
+        &mut self,
+        config: &BevyJepaConfig,
+        input: HighResFrameInput,
+        device: &JepaBevyDevice,
+    ) -> Result<HighResProcessedFrame> {
+        self.ensure_high_res_runtime(config, device)?;
+        let runtime = self
+            .high_res_runtime
+            .as_mut()
+            .expect("high-res AnyUp runtime initialized");
+        run_high_res_anyup_step(runtime, input)
     }
 
     fn record_input_frame(&mut self, sequence: u64) {
@@ -1069,6 +1137,7 @@ fn setup_metrics_overlay(mut commands: Commands, config: Res<BevyJepaConfig>) {
                 spawn_metric_value_line(card, MetricValueKind::Model);
                 spawn_metric_value_line(card, MetricValueKind::Grid);
                 spawn_metric_value_line(card, MetricValueKind::Tokens);
+                spawn_metric_value_line(card, MetricValueKind::EncodeTokens);
                 spawn_metric_value_line(card, MetricValueKind::Queue);
                 spawn_metric_value_line(card, MetricValueKind::Error);
             });
@@ -1154,7 +1223,8 @@ fn setup_metrics_overlay(mut commands: Commands, config: Res<BevyJepaConfig>) {
                 "Mask + JEPA",
                 &[
                     MetricValueKind::StageMaskPolicy,
-                    MetricValueKind::StageMaskGrid,
+                    MetricValueKind::StageMaskWrite,
+                    MetricValueKind::StageMaskEncode,
                     MetricValueKind::StageEncodePath,
                     MetricValueKind::StageEncodeLatency,
                     MetricValueKind::StageTttStability,
@@ -1235,12 +1305,12 @@ fn spawn_metric_value_line(builder: &mut ChildSpawnerCommands<'_>, kind: MetricV
         MetricValueText { kind },
         Text(String::new()),
         TextFont {
-            font_size: bevy::text::FontSize::Px(12.0),
+            font_size: bevy::text::FontSize::Px(11.0),
             ..default()
         },
         TextColor(Color::srgb(0.92, 0.94, 0.96)),
         Node {
-            height: Val::Px(15.0),
+            height: Val::Px(16.0),
             overflow: Overflow::clip(),
             ..default()
         },
@@ -1608,31 +1678,7 @@ fn process_jepa_frame(world: &mut World) {
         poll_high_res_task(&config, &mut runtime)
     };
     if let Some(completed) = high_res_completed {
-        match completed {
-            Ok(processed) => {
-                let mut metrics = world.resource::<BevyJepaMetrics>().clone();
-                {
-                    let mut runtime = world.resource_mut::<JepaRuntime>();
-                    runtime.record_high_res_completion();
-                    runtime.apply_high_res_timings(&processed);
-                    runtime.clear_error();
-                    runtime.apply_runtime_counts(&mut metrics);
-                }
-                metrics.frame_index = processed.id.sequence;
-                metrics.frame_ready = true;
-                metrics.last_error = None;
-                metrics.viewer_total_us = processed.total_us;
-                apply_high_res_panel_to_world(world, processed.panels, transfer);
-                *world.resource_mut::<BevyJepaMetrics>() = metrics;
-            }
-            Err(err) => {
-                {
-                    let mut runtime = world.resource_mut::<JepaRuntime>();
-                    runtime.set_error("AnyUp worker", err.clone());
-                }
-                world.resource_mut::<BevyJepaMetrics>().last_error = Some(err);
-            }
-        }
+        apply_high_res_completion_to_world(world, transfer, completed);
     }
 
     let completed = {
@@ -1640,37 +1686,7 @@ fn process_jepa_frame(world: &mut World) {
         poll_jepa_task(&config, &mut runtime, &device)
     };
     if let Some(completed) = completed {
-        match completed {
-            Ok(processed) => {
-                let mut metrics = processed.metrics.clone();
-                {
-                    let mut runtime = world.resource_mut::<JepaRuntime>();
-                    runtime.record_completion(processed.high_res_updated);
-                    let mut enqueue_error = None;
-                    if let Some(input) = processed.high_res_input
-                        && let Err(err) = runtime.enqueue_high_res_frame(&config, input, &device)
-                    {
-                        enqueue_error = Some(err.to_string());
-                    }
-                    if let Some(err) = enqueue_error.as_ref() {
-                        runtime.set_error("AnyUp enqueue", err.clone());
-                    } else {
-                        runtime.clear_error();
-                    }
-                    metrics.last_error = enqueue_error;
-                    runtime.apply_runtime_counts(&mut metrics);
-                }
-                apply_stage_panels_to_world(world, processed.panels, transfer);
-                *world.resource_mut::<BevyJepaMetrics>() = metrics;
-            }
-            Err(err) => {
-                {
-                    let mut runtime = world.resource_mut::<JepaRuntime>();
-                    runtime.set_error("JEPA worker", err.clone());
-                }
-                world.resource_mut::<BevyJepaMetrics>().last_error = Some(err);
-            }
-        }
+        apply_jepa_completion_to_world(world, &config, &device, transfer, completed);
     }
 
     let result = {
@@ -1680,6 +1696,7 @@ fn process_jepa_frame(world: &mut World) {
 
     match result {
         Ok(Some(input)) => {
+            let inline_stage = input.stage;
             apply_input_panel_to_world(world, input.panel, transfer);
             let mut metrics = world.resource::<BevyJepaMetrics>().clone();
             {
@@ -1694,6 +1711,9 @@ fn process_jepa_frame(world: &mut World) {
             metrics.display_transfer = config.display_transfer;
             world.resource_mut::<JepaRuntime>().clear_error();
             *world.resource_mut::<BevyJepaMetrics>() = metrics;
+            if let Some(completed) = inline_stage {
+                apply_jepa_completion_to_world(world, &config, &device, transfer, completed);
+            }
         }
         Ok(None) => {
             world.resource_mut::<JepaRuntime>().clear_error();
@@ -1723,6 +1743,97 @@ fn process_jepa_frame(world: &mut World) {
     }
 }
 
+fn apply_jepa_completion_to_world(
+    world: &mut World,
+    config: &BevyJepaConfig,
+    device: &JepaBevyDevice,
+    transfer: BevyJepaDisplayTransfer,
+    completed: Result<StageProcessedFrame, String>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    let mut high_res_completed = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let high_res_completed: Option<Result<HighResProcessedFrame, String>> = None;
+    match completed {
+        Ok(processed) => {
+            let mut metrics = processed.metrics.clone();
+            {
+                let mut runtime = world.resource_mut::<JepaRuntime>();
+                runtime.record_completion(processed.high_res_updated);
+                let mut enqueue_error = None;
+                if let Some(input) = processed.high_res_input {
+                    #[cfg(target_arch = "wasm32")]
+                    match runtime.run_high_res_frame_inline(config, input, device) {
+                        Ok(processed) => {
+                            high_res_completed = Some(Ok(processed));
+                        }
+                        Err(err) => {
+                            enqueue_error = Some(err.to_string());
+                        }
+                    }
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Err(err) = runtime.enqueue_high_res_frame(config, input, device) {
+                        enqueue_error = Some(err.to_string());
+                    }
+                }
+                if let Some(err) = enqueue_error.as_ref() {
+                    runtime.set_error("AnyUp enqueue", err.clone());
+                } else {
+                    runtime.clear_error();
+                }
+                metrics.last_error = enqueue_error;
+                runtime.apply_runtime_counts(&mut metrics);
+            }
+            apply_stage_panels_to_world(world, processed.panels, transfer);
+            *world.resource_mut::<BevyJepaMetrics>() = metrics;
+            if let Some(completed) = high_res_completed {
+                apply_high_res_completion_to_world(world, transfer, completed);
+            }
+        }
+        Err(err) => {
+            {
+                let mut runtime = world.resource_mut::<JepaRuntime>();
+                runtime.set_error("JEPA worker", err.clone());
+            }
+            world.resource_mut::<BevyJepaMetrics>().last_error = Some(err);
+        }
+    }
+}
+
+fn apply_high_res_completion_to_world(
+    world: &mut World,
+    transfer: BevyJepaDisplayTransfer,
+    completed: Result<HighResProcessedFrame, String>,
+) {
+    match completed {
+        Ok(processed) => {
+            let mut metrics = world.resource::<BevyJepaMetrics>().clone();
+            {
+                let mut runtime = world.resource_mut::<JepaRuntime>();
+                runtime.record_high_res_completion();
+                runtime.apply_high_res_timings(&processed);
+                runtime.clear_error();
+                runtime.apply_runtime_counts(&mut metrics);
+            }
+            metrics.frame_index = processed.id.sequence;
+            metrics.frame_ready = true;
+            metrics.last_error = None;
+            metrics.viewer_total_us = processed.total_us;
+            apply_high_res_panel_to_world(world, processed.panels, transfer);
+            *world.resource_mut::<BevyJepaMetrics>() = metrics;
+        }
+        Err(err) => {
+            {
+                let mut runtime = world.resource_mut::<JepaRuntime>();
+                runtime.set_error("AnyUp worker", err.clone());
+            }
+            world.resource_mut::<BevyJepaMetrics>().last_error = Some(err);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn poll_jepa_task(
     config: &BevyJepaConfig,
     runtime: &mut JepaRuntime,
@@ -1731,9 +1842,35 @@ fn poll_jepa_task(
     let task = runtime.active_task.as_mut()?;
     let output = block_on(future::poll_once(task))?;
     runtime.active_task = None;
+    finish_jepa_task_output(config, runtime, device, output)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_jepa_task(
+    _config: &BevyJepaConfig,
+    _runtime: &mut JepaRuntime,
+    _device: &JepaBevyDevice,
+) -> Option<Result<StageProcessedFrame, String>> {
+    None
+}
+
+fn finish_jepa_task_output(
+    config: &BevyJepaConfig,
+    runtime: &mut JepaRuntime,
+    device: &JepaBevyDevice,
+    output: JepaAsyncTaskOutput,
+) -> Option<Result<StageProcessedFrame, String>> {
     let current_signature = RuntimePipelineSignature::new(config, config.pipeline_image_size());
     if output.signature == current_signature {
         let pipeline = output.pipeline;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = device;
+            runtime.pending_stage = None;
+            runtime.pipeline = Some(pipeline);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(pending) = runtime.pending_stage.take() {
             if pending.signature == current_signature {
                 let Some(model_config) = runtime.model_config.clone() else {
@@ -1789,6 +1926,7 @@ fn poll_jepa_task(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn poll_high_res_task(
     config: &BevyJepaConfig,
     runtime: &mut JepaRuntime,
@@ -1820,6 +1958,14 @@ fn poll_high_res_task(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn poll_high_res_task(
+    _config: &BevyJepaConfig,
+    _runtime: &mut JepaRuntime,
+) -> Option<Result<HighResProcessedFrame, String>> {
+    None
+}
+
 fn process_runtime_source_frame(
     config: &BevyJepaConfig,
     runtime: &mut JepaRuntime,
@@ -1837,6 +1983,10 @@ fn process_runtime_source_frame(
     let frame_source = source.source;
     let camera_frame_received = source.camera_frame_received;
     let source_rgba = source.rgba;
+    #[cfg(target_arch = "wasm32")]
+    let mut stage = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let stage = None;
     if runtime.active_task.is_none() {
         let (pipeline, model_config, signature) = runtime.take_pipeline(config, device)?;
         let image = source_stage_image(
@@ -1852,22 +2002,45 @@ fn process_runtime_source_frame(
             capture_time_nanos: frame_index.saturating_mul(16_666_667),
         };
         let request = stage_request_for_frame(config, frame_index);
-        runtime.active_task = Some(spawn_admitted_jepa_task(
-            config.clone(),
-            signature,
-            pipeline,
-            image.clone(),
-            source_rgba.as_ref(),
-            runtime.prev_stage_image.as_ref(),
-            runtime.prev_stage_rgba.as_ref(),
-            &model_config,
-            id,
-            grid,
-            model_config.patch_size,
-            frame_source,
-            camera_frame_received,
-            request,
-        )?);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let output = run_admitted_jepa_task_inline(
+                config.clone(),
+                signature,
+                pipeline,
+                image.clone(),
+                source_rgba.as_ref(),
+                runtime.prev_stage_image.as_ref(),
+                runtime.prev_stage_rgba.as_ref(),
+                &model_config,
+                id,
+                grid,
+                model_config.patch_size,
+                frame_source,
+                camera_frame_received,
+                request,
+            )?;
+            stage = finish_jepa_task_output(config, runtime, device, output);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            runtime.active_task = Some(spawn_admitted_jepa_task(
+                config.clone(),
+                signature,
+                pipeline,
+                image.clone(),
+                source_rgba.as_ref(),
+                runtime.prev_stage_image.as_ref(),
+                runtime.prev_stage_rgba.as_ref(),
+                &model_config,
+                id,
+                grid,
+                model_config.patch_size,
+                frame_source,
+                camera_frame_received,
+                request,
+            )?);
+        }
         runtime.prev_stage_image = Some(image.clone());
         runtime.prev_stage_rgba = source_rgba.clone();
     } else if runtime.pipeline_signature.as_ref()
@@ -1916,47 +2089,39 @@ fn process_runtime_source_frame(
         sequence: frame_index,
         source: frame_source,
         camera_frame_received,
+        stage,
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_jepa_task(
-    config: BevyJepaConfig,
-    signature: RuntimePipelineSignature,
-    mut pipeline: FeatureFramePipeline<JepaBevyBackend>,
-    image: Tensor<JepaBevyBackend, 4>,
-    write_mask: SparseTokenMask,
-    encode_mask: SparseTokenMask,
-    id: FrameId,
-    grid: TokenGridShape,
-    patch_size: usize,
-    frame_source: BevyJepaFrameSource,
-    camera_frame_received: bool,
-    request: FeatureFrameRequest,
-) -> Task<JepaAsyncTaskOutput> {
-    AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::new).spawn(async move {
-        let result = run_stage_pipeline_step(
-            &config,
-            &mut pipeline,
-            image,
-            &write_mask,
-            &encode_mask,
-            id,
-            grid,
-            patch_size,
-            frame_source,
-            camera_frame_received,
-            request,
-        )
-        .map_err(|err| err.to_string());
-        JepaAsyncTaskOutput {
-            signature,
-            pipeline,
-            result,
-        }
-    })
+fn run_jepa_task_output(mut input: AdmittedJepaTaskInput) -> JepaAsyncTaskOutput {
+    let result = run_stage_pipeline_step(
+        &input.config,
+        &mut input.pipeline,
+        input.image,
+        &input.write_mask,
+        &input.encode_mask,
+        input.id,
+        input.grid,
+        input.patch_size,
+        input.frame_source,
+        input.camera_frame_received,
+        input.request,
+    )
+    .map_err(|err| err.to_string());
+    JepaAsyncTaskOutput {
+        signature: input.signature,
+        pipeline: input.pipeline,
+        result,
+    }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_jepa_task(input: AdmittedJepaTaskInput) -> Task<JepaAsyncTaskOutput> {
+    AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::new)
+        .spawn(async move { run_jepa_task_output(input) })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_high_res_task(
     mut runtime: AnyUpHighResRuntime,
     input: HighResFrameInput,
@@ -1973,7 +2138,7 @@ fn spawn_high_res_task(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_admitted_jepa_task(
+fn admitted_jepa_task_input(
     config: BevyJepaConfig,
     signature: RuntimePipelineSignature,
     mut pipeline: FeatureFramePipeline<JepaBevyBackend>,
@@ -1988,7 +2153,7 @@ fn spawn_admitted_jepa_task(
     frame_source: BevyJepaFrameSource,
     camera_frame_received: bool,
     request: FeatureFrameRequest,
-) -> Result<Task<JepaAsyncTaskOutput>> {
+) -> Result<AdmittedJepaTaskInput> {
     let masks = run_sparse_mask_node_with_refresh_state(
         &config,
         prev_stage_image,
@@ -1999,20 +2164,92 @@ fn spawn_admitted_jepa_task(
         grid,
         Some(pipeline.patch_diff_refresh_state_mut()),
     )?;
-    Ok(spawn_jepa_task(
+    Ok(AdmittedJepaTaskInput {
         config,
         signature,
         pipeline,
         image,
-        masks.write_mask,
-        masks.encode_mask,
+        write_mask: masks.write_mask,
+        encode_mask: masks.encode_mask,
         id,
         grid,
         patch_size,
         frame_source,
         camera_frame_received,
         request,
-    ))
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+fn spawn_admitted_jepa_task(
+    config: BevyJepaConfig,
+    signature: RuntimePipelineSignature,
+    pipeline: FeatureFramePipeline<JepaBevyBackend>,
+    image: Tensor<JepaBevyBackend, 4>,
+    rgba: Option<&RgbaImage>,
+    prev_stage_image: Option<&Tensor<JepaBevyBackend, 4>>,
+    prev_stage_rgba: Option<&RgbaImage>,
+    model_config: &VJepaConfig,
+    id: FrameId,
+    grid: TokenGridShape,
+    patch_size: usize,
+    frame_source: BevyJepaFrameSource,
+    camera_frame_received: bool,
+    request: FeatureFrameRequest,
+) -> Result<Task<JepaAsyncTaskOutput>> {
+    Ok(spawn_jepa_task(admitted_jepa_task_input(
+        config,
+        signature,
+        pipeline,
+        image,
+        rgba,
+        prev_stage_image,
+        prev_stage_rgba,
+        model_config,
+        id,
+        grid,
+        patch_size,
+        frame_source,
+        camera_frame_received,
+        request,
+    )?))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
+fn run_admitted_jepa_task_inline(
+    config: BevyJepaConfig,
+    signature: RuntimePipelineSignature,
+    pipeline: FeatureFramePipeline<JepaBevyBackend>,
+    image: Tensor<JepaBevyBackend, 4>,
+    rgba: Option<&RgbaImage>,
+    prev_stage_image: Option<&Tensor<JepaBevyBackend, 4>>,
+    prev_stage_rgba: Option<&RgbaImage>,
+    model_config: &VJepaConfig,
+    id: FrameId,
+    grid: TokenGridShape,
+    patch_size: usize,
+    frame_source: BevyJepaFrameSource,
+    camera_frame_received: bool,
+    request: FeatureFrameRequest,
+) -> Result<JepaAsyncTaskOutput> {
+    Ok(run_jepa_task_output(admitted_jepa_task_input(
+        config,
+        signature,
+        pipeline,
+        image,
+        rgba,
+        prev_stage_image,
+        prev_stage_rgba,
+        model_config,
+        id,
+        grid,
+        patch_size,
+        frame_source,
+        camera_frame_received,
+        request,
+    )?))
 }
 
 fn process_runtime_frame(
@@ -2116,6 +2353,7 @@ struct SourcePreviewFrame {
     sequence: u64,
     source: BevyJepaFrameSource,
     camera_frame_received: bool,
+    stage: Option<Result<StageProcessedFrame, String>>,
 }
 
 struct StageFrame {
@@ -2140,11 +2378,27 @@ fn high_res_scheduled_for_frame(config: &BevyJepaConfig, frame_index: u64) -> bo
     config.high_res_pca_every > 0 && frame_index.is_multiple_of(config.high_res_pca_every)
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct PendingStageFrame {
     config: BevyJepaConfig,
     signature: RuntimePipelineSignature,
     image: Option<Tensor<JepaBevyBackend, 4>>,
     rgba: Option<RgbaImage>,
+    id: FrameId,
+    grid: TokenGridShape,
+    patch_size: usize,
+    frame_source: BevyJepaFrameSource,
+    camera_frame_received: bool,
+    request: FeatureFrameRequest,
+}
+
+struct AdmittedJepaTaskInput {
+    config: BevyJepaConfig,
+    signature: RuntimePipelineSignature,
+    pipeline: FeatureFramePipeline<JepaBevyBackend>,
+    image: Tensor<JepaBevyBackend, 4>,
+    write_mask: SparseTokenMask,
+    encode_mask: SparseTokenMask,
     id: FrameId,
     grid: TokenGridShape,
     patch_size: usize,
@@ -2285,7 +2539,7 @@ fn prewarm_feature_frame_shapes(
         )?;
         token_widths.push(measured.metrics.sparse_width);
     }
-    JepaBevyBackend::sync(device)?;
+    sync_bevy_backend(device)?;
     let total_us = viewer_elapsed_us(started);
     pipeline.reset_visualization_state()?;
     Ok(Some(ShapePrewarmReport {
@@ -2444,7 +2698,7 @@ fn run_pipeline_step(
     match config.display_transfer {
         BevyJepaDisplayTransfer::Gpu => {
             let _gpu_display_tensors = (input_rgba, mask_rgba, low_res_rgba, high_res_rgba);
-            JepaBevyBackend::sync(&display_device)?;
+            sync_bevy_backend(&display_device)?;
         }
         BevyJepaDisplayTransfer::Cpu => {
             let _host_display_buffers = (
@@ -2455,8 +2709,9 @@ fn run_pipeline_step(
             );
         }
     }
-    if config.display_transfer == BevyJepaDisplayTransfer::Cpu && config.sync_measurements {
-        JepaBevyBackend::sync(&display_device)?;
+    if config.display_transfer == BevyJepaDisplayTransfer::Cpu && sync_measurements_enabled(config)
+    {
+        sync_bevy_backend(&display_device)?;
     }
     let display_tensor_us = viewer_elapsed_us(display_start);
     let viewer_total_us = stage.wall_us.saturating_add(display_tensor_us);
@@ -2511,7 +2766,7 @@ fn run_stage_pipeline_step(
             low_res_features: output.low_res.features.clone(),
             pca: pipeline.pca().clone(),
             display_transfer: config.display_transfer,
-            sync_measurements: config.sync_measurements,
+            sync_measurements: sync_measurements_enabled(config),
         });
     let low_res_pca = low_res_pca_or_features(output.low_res)?;
     let high_res_pca = output.high_res.and_then(|high_res| high_res.pca_display);
@@ -2526,8 +2781,8 @@ fn run_stage_pipeline_step(
     let high_res_rgba = high_res_pca
         .map(|pca| nchw_to_rgba_tensor(resize_nchw(pca, image_size)))
         .transpose()?;
-    if config.sync_measurements {
-        JepaBevyBackend::sync(&image.device())?;
+    if sync_measurements_enabled(config) {
+        sync_bevy_backend(&image.device())?;
     }
     let display_tensor_us = viewer_elapsed_us(display_start);
     let viewer_total_us = stage.wall_us.saturating_add(display_tensor_us);
@@ -2568,6 +2823,7 @@ fn run_stage_pipeline_step(
     })
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn run_high_res_anyup_step(
     runtime: &mut AnyUpHighResRuntime,
     input: HighResFrameInput,
@@ -2583,14 +2839,14 @@ fn run_high_res_anyup_step(
         [runtime.grid.height, runtime.grid.width],
     );
     if input.sync_measurements {
-        JepaBevyBackend::sync(&device)?;
+        sync_bevy_backend(&device)?;
     }
     let anyup_context_us = viewer_elapsed_us(context_start);
 
     let pca_start = viewer_now();
     let pca_values = input.pca.project_nchw(input.low_res_features.clone())?;
     if input.sync_measurements {
-        JepaBevyBackend::sync(&device)?;
+        sync_bevy_backend(&device)?;
     }
     let low_res_pca_us = viewer_elapsed_us(pca_start);
 
@@ -2602,21 +2858,21 @@ fn run_high_res_anyup_step(
         Some(runtime.q_chunk_size),
     );
     if input.sync_measurements {
-        JepaBevyBackend::sync(&device)?;
+        sync_bevy_backend(&device)?;
     }
     let anyup_decode_us = viewer_elapsed_us(decode_start);
 
     let display_pca_start = viewer_now();
     let high_res_pca = input.pca.display_nchw(pca_values)?;
     if input.sync_measurements {
-        JepaBevyBackend::sync(&device)?;
+        sync_bevy_backend(&device)?;
     }
     let high_res_pca_us = low_res_pca_us.saturating_add(viewer_elapsed_us(display_pca_start));
 
     let display_start = viewer_now();
     let high_res_rgba = nchw_to_rgba_tensor(resize_nchw(high_res_pca, runtime.image_size))?;
     if input.sync_measurements {
-        JepaBevyBackend::sync(&device)?;
+        sync_bevy_backend(&device)?;
     }
     let display_tensor_us = viewer_elapsed_us(display_start);
     let panels = match input.display_transfer {
@@ -2809,6 +3065,7 @@ fn source_stage_image(
     rgba_image_to_tensor(rgba.clone(), image_size, device)
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn pending_stage_image(
     pending: &PendingStageFrame,
     image_size: usize,
@@ -3147,28 +3404,21 @@ fn metric_value_text(
             )
         }
         MetricValueKind::Grid => format!(
-            "Grid     {}x{} tokens, patch {}, input {}px",
+            "Grid     {}x{} @ {}px  p{}",
             metrics.grid_height,
             metrics.grid_width,
+            config.pipeline_image_size(),
             metrics.patch_size,
-            config.pipeline_image_size()
         ),
         MetricValueKind::Tokens => format!(
-            "Tokens   write {} ({})  encode {} ({}) / {}",
-            metrics.context_tokens,
-            format_metric_percent(metrics.density()),
-            metrics
-                .stage_metrics
-                .encode_width
-                .max(metrics.context_tokens),
-            format_metric_percent(
-                metrics
-                    .stage_metrics
-                    .encode_width
-                    .max(metrics.context_tokens) as f64
-                    / metrics.dense_tokens.max(1) as f64
-            ),
-            metrics.dense_tokens
+            "Write    {}  {}",
+            format_metric_token_ratio(metric_write_tokens(metrics), metrics.dense_tokens),
+            metric_write_label(metrics),
+        ),
+        MetricValueKind::EncodeTokens => format!(
+            "Encode   {}  {}",
+            format_metric_token_ratio(metric_encode_tokens(metrics), metrics.dense_tokens),
+            metric_encode_label(metrics),
         ),
         MetricValueKind::Queue => format!(
             "Queue    active {}  overwritten {}  stale {}",
@@ -3194,8 +3444,8 @@ fn metric_value_text(
             metrics_source_status(config, metrics)
         ),
         MetricValueKind::StageInputQueue => format!(
-            "Frames   in {}  low {}  high {}",
-            metrics.input_frames_seen, metrics.completed_frames, metrics.high_res_frames
+            "Queue    active {}  ovw {}  stale {}",
+            metrics.in_flight_frames, metrics.queue_overwritten_frames, metrics.stale_completions
         ),
         MetricValueKind::StageMaskPolicy => {
             format!(
@@ -3204,22 +3454,15 @@ fn metric_value_text(
                 on_off(config.patch_diff_refresh.enabled)
             )
         }
-        MetricValueKind::StageMaskGrid => format!(
-            "Tokens   write {} ({})  encode {} ({}) / {}",
-            metrics.context_tokens,
-            format_metric_percent(metrics.density()),
-            metrics
-                .stage_metrics
-                .encode_width
-                .max(metrics.context_tokens),
-            format_metric_percent(
-                metrics
-                    .stage_metrics
-                    .encode_width
-                    .max(metrics.context_tokens) as f64
-                    / metrics.dense_tokens.max(1) as f64
-            ),
-            metrics.dense_tokens,
+        MetricValueKind::StageMaskWrite => format!(
+            "Write    {}  {}",
+            format_metric_token_ratio(metric_write_tokens(metrics), metrics.dense_tokens),
+            metric_write_label(metrics),
+        ),
+        MetricValueKind::StageMaskEncode => format!(
+            "Encode   {}  {}",
+            format_metric_token_ratio(metric_encode_tokens(metrics), metrics.dense_tokens),
+            metric_encode_label(metrics),
         ),
         MetricValueKind::StageEncodeLatency => {
             format!(
@@ -3232,37 +3475,17 @@ fn metric_value_text(
             "Route    {} / {}",
             metrics.encode_path, config.sparse_encode_mode
         ),
-        MetricValueKind::StageTttStability => format!(
-            "TTT      collapse {}  cos {}  guard {}",
-            metrics
-                .ttt_collapse_score
-                .map(|value| format!("{value:.2}"))
-                .unwrap_or_else(|| "--".to_string()),
-            metrics
-                .ttt_mean_pairwise_token_cosine
-                .map(|value| format!("{value:.2}"))
-                .unwrap_or_else(|| "--".to_string()),
-            metrics.ttt_collapse_guard_triggers
-        ),
+        MetricValueKind::StageTttStability => format_ttt_stability_line(config, metrics),
         MetricValueKind::StageCacheLatency => {
             format!("Cache    {}", format_metric_ms(metrics.cache_update_us))
         }
         MetricValueKind::StageTokenViewLatency => {
-            format!("Grid PCA {}", format_metric_ms(metrics.token_view_us))
+            format!("Grid view {}", format_metric_ms(metrics.token_view_us))
         }
         MetricValueKind::StageLowResPcaLatency => {
             format!("Project  {}", format_metric_ms(metrics.low_res_pca_us))
         }
-        MetricValueKind::StagePcaBasis => format!(
-            "Basis    {}  {}/{} frames",
-            if metrics.pca_update_applied {
-                "update"
-            } else {
-                "cached"
-            },
-            metrics.pca_sample_frames,
-            metrics.pca_sample_window_frames
-        ),
+        MetricValueKind::StagePcaBasis => format_pca_basis_line(config, metrics),
         MetricValueKind::StageAnyUpLatency => format!(
             "Decode   ctx {}  up {}",
             format_metric_ms(metrics.anyup_context_us),
@@ -3272,6 +3495,102 @@ fn metric_value_text(
             format!("Display  {}", format_metric_ms(metrics.display_tensor_us))
         }
     }
+}
+
+fn metric_write_tokens(metrics: &BevyJepaMetrics) -> usize {
+    let stage = &metrics.stage_metrics;
+    if stage.valid_write_tokens > 0 {
+        stage.valid_write_tokens
+    } else if stage.write_width > 0 {
+        stage.write_width
+    } else {
+        metrics.context_tokens
+    }
+}
+
+fn metric_encode_tokens(metrics: &BevyJepaMetrics) -> usize {
+    let stage = &metrics.stage_metrics;
+    if stage.valid_encode_tokens > 0 {
+        stage.valid_encode_tokens
+    } else if stage.encode_width > 0 {
+        stage.encode_width
+    } else {
+        metric_write_tokens(metrics)
+    }
+}
+
+fn metric_write_label(metrics: &BevyJepaMetrics) -> &'static str {
+    if metric_write_tokens(metrics) >= metrics.dense_tokens.max(1) {
+        "dense"
+    } else {
+        "cache mask"
+    }
+}
+
+fn metric_encode_label(metrics: &BevyJepaMetrics) -> &'static str {
+    let write = metric_write_tokens(metrics);
+    let encode = metric_encode_tokens(metrics);
+    if encode >= metrics.dense_tokens.max(1) {
+        "dense"
+    } else if encode > write {
+        "bucketed"
+    } else {
+        "exact"
+    }
+}
+
+fn format_metric_token_ratio(tokens: usize, dense_tokens: usize) -> String {
+    let dense_tokens = dense_tokens.max(1);
+    format!(
+        "{tokens}/{dense_tokens} {}",
+        format_metric_percent_compact(tokens as f64 / dense_tokens as f64)
+    )
+}
+
+fn format_ttt_stability_line(config: &BevyJepaConfig, metrics: &BevyJepaMetrics) -> String {
+    if metrics.encoder_source != BevyJepaEncoderSource::TrainedTtt {
+        return "TTT      n/a for base".to_string();
+    }
+    if !config.ttt_runtime.enabled {
+        return "TTT      memory off".to_string();
+    }
+    if let (Some(collapse), Some(cosine)) = (
+        metrics.ttt_collapse_score,
+        metrics.ttt_mean_pairwise_token_cosine,
+    ) {
+        return format!(
+            "TTT      col {collapse:.2}  cos {cosine:.2}  g{}",
+            metrics.ttt_collapse_guard_triggers
+        );
+    }
+    if config.ttt_runtime.metrics_interval_frames == 0 {
+        return format!(
+            "TTT      mem on  diag off  g{}",
+            metrics.ttt_collapse_guard_triggers
+        );
+    }
+    format!(
+        "TTT      waiting {}f  g{}",
+        config.ttt_runtime.metrics_interval_frames, metrics.ttt_collapse_guard_triggers
+    )
+}
+
+fn format_pca_basis_line(config: &BevyJepaConfig, metrics: &BevyJepaMetrics) -> String {
+    if metrics.pca_sample_window_frames == 0 {
+        return "Basis   off".to_string();
+    }
+    let status = if metrics.pca_update_applied {
+        "fit"
+    } else {
+        "cached"
+    };
+    format!(
+        "Basis   {status} {}  {}/{} @{}f",
+        format_metric_ms(metrics.pca_update_us),
+        metrics.pca_sample_frames,
+        metrics.pca_sample_window_frames,
+        config.pca_update_every.max(1)
+    )
 }
 
 fn rolling_fps(history: &MetricsRollingState) -> f64 {
@@ -3332,8 +3651,8 @@ fn format_metric_ms(value_us: u64) -> String {
     format!("{:>6.2} ms", micros_to_ms(value_us))
 }
 
-fn format_metric_percent(value: f64) -> String {
-    format!("{:>5.1}%", value * 100.0)
+fn format_metric_percent_compact(value: f64) -> String {
+    format!("{:.1}%", value * 100.0)
 }
 
 fn truncate_metric_text(value: &str, max_chars: usize) -> String {

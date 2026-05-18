@@ -76,6 +76,7 @@ pub(crate) enum StagePanelData {
     },
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) enum HighResPanelData {
     Tensor {
         width: u32,

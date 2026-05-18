@@ -27,6 +27,13 @@ if (!modelManifestUrl && !fs.existsSync(path.join(modelDir, "manifest.json"))) {
 }
 
 const expectedEmbedDim = await readExpectedEmbedDim(modelManifestUrl, modelDir);
+const badConsoleNeedles = [
+  "condvar wait not supported",
+  "cannot recursively acquire mutex",
+  "usage (Storage(read-write)|Storage(read-only))",
+  "CubeCL Tasks Encoder",
+  "Invalid CommandBuffer",
+];
 
 const server = http.createServer((request, response) => {
   const url = new URL(request.url || "/", "http://127.0.0.1");
@@ -52,8 +59,13 @@ const browser = await chromium.launch({ args: ["--enable-unsafe-webgpu"] });
 try {
   const page = await browser.newPage();
   const pageErrors = [];
+  const consoleLines = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
-  page.on("console", (message) => console.log(`browser: ${message.text()}`));
+  page.on("console", (message) => {
+    const line = message.text();
+    consoleLines.push(line);
+    console.log(`browser: ${line}`);
+  });
 
   await page.goto(`http://127.0.0.1:${port}/out/burn_jepa.js`, {
     waitUntil: "domcontentloaded",
@@ -105,6 +117,7 @@ try {
   if (pageErrors.length > 0) {
     throw new Error(`wasm page errors: ${pageErrors.join("; ")}`);
   }
+  assertNoBadConsole(consoleLines, pageErrors);
   assertArrayEqual(summary.shape, [1, 8, summary.expectedEmbedDim], "summary.shape");
   assertArrayEqual(summary.grid, [2, 2, 2], "summary.grid");
   if (summary.sample_count <= 0 || !Number.isFinite(summary.sample_mean)) {
@@ -143,6 +156,15 @@ function assertArrayEqual(actual, expected, label) {
     actual.some((value, index) => value !== expected[index])
   ) {
     throw new Error(`${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+function assertNoBadConsole(consoleLines, pageErrors) {
+  const output = `${consoleLines.join("\n")}\n${pageErrors.join("\n")}`;
+  for (const needle of badConsoleNeedles) {
+    if (output.includes(needle)) {
+      throw new Error(`unexpected wasm/browser error containing ${JSON.stringify(needle)}`);
+    }
   }
 }
 

@@ -1,20 +1,24 @@
 # TTT Training Protocol
 
-The TTT path trains an added recurrent adapter to make single-frame JEPA
+The TTT path trains recurrent fast-weight updates to make single-frame JEPA
 rollouts approximate the pretrained 3D/tubelet V-JEPA encoder.
 
 ## Model Shape
 
 - Teacher: the loaded V-JEPA 2.1 encoder runs the normal 3D patch/tubelet path.
 - Student: the same V-JEPA encoder receives one frame at a time through the
-  image patch path, with `VJepaTttLayer` adapters inserted after configured
-  transformer blocks.
-- Adapter state: each TTT layer keeps a `[batch, dim, dim]` fast-weight tensor.
-  Tokens are processed in `ttt.chunk_tokens` chunks so updates can roll through
-  a frame/window without materializing a dense temporal block.
-- Initialization: adapter output projection is zero-initialized, so inserting a
-  layer starts as a no-op residual path. The temporal target projection starts as
-  an identity-style depthwise 1D filter plus optional identity linear projection.
+  image patch path. `ttt.insertion = "adapter"` inserts the historical
+  zero-init residual `VJepaTttLayer` after configured transformer blocks.
+  `ttt.insertion = "in_place_mlp"` instead wraps the selected block MLP and
+  reuses its pretrained `fc2`/down-projection as the base fast weight.
+- Fast state: adapter mode keeps `[batch, dim, dim]` fast-weight tensors.
+  In-place MLP mode keeps a delta over the existing MLP down-projection with
+  shape `[batch, mlp_hidden, dim]`, or banked variants of that shape when
+  `memory_dynamics = "memory_alibi"`.
+- Initialization: adapter mode zero-initializes the output projection, so the
+  residual path starts as a no-op. In-place MLP mode zero-initializes the
+  temporal update generator, so selected MLPs initially match the pretrained
+  encoder exactly while still allocating a per-context down-projection delta.
 - Memory update source: `ttt.memory_update = "self_hidden"` is the deployable
   default and updates fast weights from detached current hidden states.
   `ttt.memory_update = "teacher_forced_diagnostic"` is privileged and should be
@@ -25,19 +29,20 @@ rollouts approximate the pretrained 3D/tubelet V-JEPA encoder.
   `ttt.supervision = "hybrid"` runs layer-local training before a shorter final
   teacher finetune controlled by `ttt.hybrid_final_steps`.
 
-This is intentionally a Burn-native adapter instead of a literal mutation of an
-existing dense matrix. In-Place TTT's LLM recipe updates fast weights in the MLP
-down-projection and chunks long sequences. The JEPA adaptation keeps the same
-compatibility constraints: preserve pretrained weights, add/update only a small
-fast-weight path by default, and roll chunks through a sequence without external
-memory modules.
+The default remains `adapter` for checkpoint compatibility with the existing
+SC-TTT runs. The new `in_place_mlp` mode exists to directly ablate the
+In-Place TTT design: selected MLP down-projections are reused as the base fast
+weight, while the learned update machinery remains small and zero-effect at
+initialization. More MLP layers can be converted by increasing `ttt.layers`,
+but memory scales with `mlp_hidden * dim` per selected layer rather than
+`dim * dim`.
 
 ## Code Organization
 
-- `src/ttt/config.rs`: adapter placement, rollout, memory-update source,
+- `src/ttt/config.rs`: insertion mode, layer placement, rollout, memory-update source,
   supervision mode, backprop-mode, and freeze config.
 - `src/ttt/state.rs`: per-layer fast-weight state and detach behavior.
-- `src/ttt/layer.rs`: zero-init TTT adapter layer and fast-weight update.
+- `src/ttt/layer.rs`: zero-init adapter TTT and in-place MLP fast-weight update.
 - `src/ttt/encoder.rs`: V-JEPA encoder wrapper and single-frame rollout path.
 - `src/ttt/model.rs`: pretrained/base model wrapping plus sparse predictor
   entrypoints.
@@ -243,6 +248,46 @@ JSONL files. Set `dataset.repeat_count > 1` and choose
 `"adversarial_stitched_stream"` for worst-case scene ordering. `sample_limit`
 can isolate the first N rows of a manifest, for example the current cactus-only
 8x repeat gate.
+
+## Carry-Forever Memory-ALiBi
+
+The carry-forever line is separate from the reset16 production fallback. Its
+goal is one persistent TTT state per stream with no hard reset after stream
+creation:
+
+```toml
+[ttt]
+memory_dynamics = "memory_alibi"
+memory_alibi_half_lives = [8, 64, 512]
+memory_alibi_read_weights = [0.45, 0.35, 0.20]
+memory_alibi_update_weights = [1.0, 1.0, 1.0]
+memory_clip_rms = 16.0
+
+[training.stream]
+enabled = true
+detach_between_steps = true
+reset_on_scene_change = false
+reset_on_non_monotonic_start = false
+reset_interval_steps = 0
+state_decay = 1.0
+```
+
+This does not modify V-JEPA 2.1 attention or positional encoding. The ALiBi
+idea is applied only to the added TTT memory: each TTT layer keeps multiple
+fast-weight banks with log-spaced half-lives, reads a weighted mixture of those
+banks, and updates each bank with its own decay. The state object persists
+forever, while the banks provide time-scale-aware forgetting without an
+external reset. Default `ttt.memory_dynamics = "ema"` preserves the historical
+single fast-weight matrix and old checkpoint shape.
+
+Use
+`configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml`
+to train from the latest reset16 checkpoint into the no-reset Memory-ALiBi
+candidate. Use the matching long-rollout configs with `carry-forever-alibi` in
+the filename for 1024+ window same-scene and adversarial stitched no-reset
+gates. A carry-forever checkpoint should not replace the reset16 fallback until
+it beats base sparse V-JEPA, the current no-reset EMA TTT path, and the reset16
+checkpoint on the documented no-hard-reset gates.
 
 The live image pipeline now has an explicit deployment-side TTT runtime policy
 (`TttRuntimeStateConfig`) instead of carrying fast weights forever. The default
@@ -465,6 +510,14 @@ detaches state after every produced tubelet block; higher values keep gradients
 through more temporal blocks before detaching. This keeps long clips trainable
 without forcing the entire stream history into one autodiff graph.
 
+`ttt.rollout_chunk_frames` controls the recurrence-preserving chunked rollout
+scheduler. The default `16` batches patch embedding and transformer block work
+across adjacent single-frame updates, but still applies every TTT fast-weight
+update in frame order. Set it to `1` to force the old per-frame execution path
+for debugging or exact performance ablations. CUDA sparse-patchify training uses
+the same chunk scheduler for fixed-width/uniform masks; ragged masks still route
+through bucketed exact-token batches.
+
 `ttt.backprop_mode` makes the backward/runtime tradeoff explicit:
 
 - `final_feature`: default full final-feature distillation objective.
@@ -492,8 +545,12 @@ cache hit/miss/eviction counts in train/eval stage metrics.
 
 ## TTT Layer Placement
 
-`ttt.layer_placement` controls where recurrent TTT adapters are inserted in the
-JEPA encoder. Supported placements are `first`, `middle`, `last`,
+`ttt.insertion` controls the fast-weight architecture. Use `adapter` to keep
+the existing residual TTT adapters. Use `in_place_mlp` to convert selected
+existing encoder MLPs into In-Place-style adaptive MLPs that reuse the
+pretrained down-projection as the base fast weight. `ttt.layer_placement`
+controls which encoder layers are selected. Supported placements are `first`,
+`middle`, `last`,
 `first_last`, `thirds`, and `explicit`. `explicit` uses `ttt.layers` directly.
 The default is `first_last`, which resolves to `[0, 11]` for a 12-layer ViT-B
 encoder. It was selected as the smoke/training default because the real V-JEPA
@@ -501,6 +558,29 @@ encoder. It was selected as the smoke/training default because the real V-JEPA
 the much larger backward cost of the three-adapter preset. Use `thirds` for the
 higher-capacity `[3, 7, 11]` ViT-B preset when longer quality-focused runs can
 afford the extra backward time.
+
+For the in-place MLP ablation, compare at least matched `thirds` layers
+(`[3, 7, 11]`) against `adapter` before trying higher coverage such as
+`[1, 3, 5, 7, 9, 11]`. The latter is plausible because it reuses existing MLP
+projections rather than adding separate residual blocks, but it also increases
+fast-state memory by the MLP ratio and can increase backward cost.
+
+Bounded real-checkpoint CUDA smoke results from 2026-05-18 used the V-JEPA 2.1
+ViT-B checkpoint, 256px real manifest windows, manifest AutoGaze masks, and a
+16-step budget unless noted:
+
+| Insertion | Layers | Steps | Eval loss | Eval cosine | Samples/sec | Fast memory | Trainable |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| adapter | 3/7/11 | 16 | 0.3961 | 0.8301 | 0.1715 | 40.5 MiB | 13.5 MiB |
+| in_place_mlp | 3/7/11 | 16 | 0.3981 | 0.8293 | 0.0901 | 162.0 MiB | 6.8 MiB |
+| in_place_mlp | 1/3/5/7/9/11 | 4 | 0.4248 | 0.8197 | 0.0885 | 324.0 MiB | 13.6 MiB |
+
+This is not a promotion-quality training run, but it is enough to avoid a bad
+assumption: in-place MLP is architecturally sane and uses fewer trainable helper
+parameters at matched layer count, but its per-context fast state is larger and
+current Burn autodiff backward is slower. Keep `adapter` as the production
+default until a longer in-place run beats it on held-out free-run quality at
+matched wall-clock or an analytical/fused backward path changes the cost curve.
 
 Production training should keep `ttt.predictor_layers = []`. The predictor
 remains available as the normal JEPA prediction head for parity and auxiliary

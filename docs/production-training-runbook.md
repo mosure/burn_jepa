@@ -44,16 +44,28 @@ in the latest packed launch smoke.
   config uses `data.autogaze_masks.streaming = true`, so mask preparation keeps
   AutoGaze state per clip/source stream and resets at train/eval split
   boundaries or non-monotonic `start_frame`s.
-- `configs/production/vjepa21-ttt-stage1-stream-tbptt-longstable-cuda.toml` is
-  the current selected production run: it continues from the SIGReg checkpoint
-  with a reset curriculum ending at 16 windows, matching the runtime stability
-  gate. It keeps frozen pretrained V-JEPA, encoder TTT layers
+- `configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml`
+  is the current selected carry-forever candidate: it continues from the
+  reset16 `longstable` checkpoint, disables hard stream resets and stream-level
+  decay, and uses three Memory-ALiBi fast-weight banks with half-lives
+  `[8, 64, 512]`. It keeps frozen pretrained V-JEPA, encoder TTT layers
   `[3, 7, 11]`, sparse context rollout, frozen sparse patchify, real manifest
-  masks, packed-stream TBPTT batches, state decay, dense all-token sample steps,
+  masks, packed-stream TBPTT batches, dense all-token sample steps,
   final-teacher supervision, warmup/cosine LR, and a low-weight
   LeJEPA/SIGReg-style latent Gaussian regularizer. The dense sample warmup and
   periodic dense steps are there so the shipped encoder-only student learns both
   full-frame initialization and sparse carried-state updates.
+- `configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-thirds-cuda.toml`
+  and
+  `configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-every-other-cuda.toml`
+  are In-Place TTT ablation configs. They reuse selected encoder MLP
+  down-projections as the TTT fast weight. They are not the production default:
+  the first CUDA smoke showed correct zero-init behavior but worse backward
+  cost than adapter TTT at matched thirds layers.
+- `configs/production/vjepa21-ttt-stage1-stream-tbptt-longstable-cuda.toml` is
+  the bounded-horizon fallback. It continues from the SIGReg checkpoint with a
+  reset curriculum ending at 16 windows, state decay, and runtime reset/refresh
+  gates.
 - `configs/production/vjepa21-ttt-stage1-stream-tbptt-cuda.toml` and
   `configs/production/vjepa21-ttt-stage1-stream-tbptt-verified-cuda.toml` are
   retained as unregularized baselines.
@@ -101,7 +113,7 @@ Train the encoder-only sparse TTT adapter:
 BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- train-ttt \
-  --config configs/production/vjepa21-ttt-stage1-stream-tbptt-longstable-cuda.toml
+  --config configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml
 ```
 
 Run a launch smoke without the expensive pre/post eval pass:
@@ -120,31 +132,31 @@ Evaluate the stage-1 checkpoint:
 BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
+  --config configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-cactus-64x-cuda.toml \
+  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk \
+  --steps 1088 --batch-size 1 --no-full-grid
+```
+
+Evaluate adversarial no-reset scene-switch recovery:
+
+```sh
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- eval-ttt \
+  --config configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-adversarial-8x-cuda.toml \
+  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk \
+  --steps 512 --batch-size 1 --no-full-grid
+```
+
+Evaluate the bounded-horizon reset16 fallback:
+
+```sh
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-long-rollout-cactus-repeat-reset16-cuda.toml \
   --model target/burn-jepa-production-final-256/stage1-stream-tbptt-longstable/ttt-model.mpk \
   --steps 136 --batch-size 1 --no-full-grid
-```
-
-Evaluate scene-switch recovery:
-
-```sh
-BURN_JEPA_TRAIN_CUDA_FORCE=1 \
-cargo run --no-default-features --features cuda,sparse-patchify-cuda \
-  --bin burn-jepa -- eval-ttt \
-  --config configs/production/vjepa21-ttt-long-rollout-stitched-reset-4x-cuda.toml \
-  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-longstable/ttt-model.mpk \
-  --steps 64 --batch-size 1 --no-full-grid
-```
-
-Evaluate adversarial scene-switch recovery:
-
-```sh
-BURN_JEPA_TRAIN_CUDA_FORCE=1 \
-cargo run --no-default-features --features cuda,sparse-patchify-cuda \
-  --bin burn-jepa -- eval-ttt \
-  --config configs/production/vjepa21-ttt-long-rollout-adversarial-stitch-reset-4x-cuda.toml \
-  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-longstable/ttt-model.mpk \
-  --steps 64 --batch-size 1 --no-full-grid
 ```
 
 Run the slower diagnostic eval after the fast streamed gate improves:

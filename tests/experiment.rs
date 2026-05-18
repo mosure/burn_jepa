@@ -2,7 +2,7 @@
 
 use burn_jepa::{
     ExperimentConfig, ExperimentMaskPolicy, ExperimentModelVariant, JepaDatasetKind,
-    JepaSampleKind, TttLayerPlacement, prepare_experiment_data, run_experiment,
+    JepaSampleKind, TttInsertionMode, TttLayerPlacement, prepare_experiment_data, run_experiment,
     write_experiment_plan,
 };
 
@@ -23,12 +23,14 @@ fn experiment_config_plans_trial_matrix() {
     config.ttt_layer_sets = vec![
         burn_jepa::ExperimentTttLayerSet {
             name: "first".to_string(),
+            insertion: None,
             placement: Some(TttLayerPlacement::First),
             encoder_layers: Vec::new(),
             predictor_layers: Vec::new(),
         },
         burn_jepa::ExperimentTttLayerSet {
             name: "last".to_string(),
+            insertion: Some(TttInsertionMode::InPlaceMlp),
             placement: Some(TttLayerPlacement::Last),
             encoder_layers: Vec::new(),
             predictor_layers: Vec::new(),
@@ -52,6 +54,7 @@ fn experiment_config_accepts_predictor_layer_sets() {
     config.mask_policies = vec![ExperimentMaskPolicy::PrecomputedMasks];
     config.ttt_layer_sets = vec![burn_jepa::ExperimentTttLayerSet {
         name: "predictor_last".to_string(),
+        insertion: None,
         placement: None,
         encoder_layers: Vec::new(),
         predictor_layers: vec![1],

@@ -89,6 +89,10 @@ is enabled, AnyUp prefers the sharded f16 `.bpk` package path; the legacy
 local parity work. Use `--anyup-attention-mode upstream-masked` for exact parity
 with upstream Python's default AnyUp path, or `efficient-local` for the portable
 NATTEN-style path used by the real-time pipeline.
+If high-res PCA looks nearly uniform, first verify that the viewer loaded a real
+AnyUp package or checkpoint; `--encoder-source tiny-test`, missing AnyUp
+manifests, and tiny smoke modules are useful for wiring tests but are not
+representative visualizations.
 
 `--mask-source autogaze` is reserved for a real model-backed AutoGaze node. The
 viewer now fails clearly instead of synthesizing an AutoGaze-looking moving

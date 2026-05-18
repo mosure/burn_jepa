@@ -276,12 +276,20 @@ fn state_l2_penalty<B: Backend>(state: &TttState<B>, width: usize) -> Option<Ten
         state
             .layers
             .iter()
-            .filter_map(|layer| layer.fast_weight.as_ref())
-            .map(|weight| {
-                regularization_view(weight.clone(), width)
-                    .powf_scalar(2.0)
-                    .mean()
-            }),
+            .flat_map(|layer| {
+                layer
+                    .fast_weight
+                    .clone()
+                    .map(regularization_tensor_from_fast_weight)
+                    .into_iter()
+                    .chain(
+                        layer
+                            .fast_weight_banks
+                            .clone()
+                            .map(regularization_tensor_from_fast_weight_banks),
+                    )
+            })
+            .map(|weight| regularization_view(weight, width).powf_scalar(2.0).mean()),
     )
 }
 
@@ -295,15 +303,41 @@ fn state_update_l2_penalty<B: Backend>(
             .layers
             .iter()
             .zip(after.layers.iter())
-            .filter_map(|(before, after)| {
-                let after = after.fast_weight.as_ref()?;
-                let delta = match before.fast_weight.as_ref() {
-                    Some(before) => after.clone() - before.clone(),
-                    None => after.clone(),
-                };
-                Some(regularization_view(delta, width).powf_scalar(2.0).mean())
+            .flat_map(|(before, after)| {
+                let mut penalties = Vec::new();
+                if let Some(after_weight) = after.fast_weight.as_ref() {
+                    let delta = match before.fast_weight.as_ref() {
+                        Some(before_weight) => after_weight.clone() - before_weight.clone(),
+                        None => after_weight.clone(),
+                    };
+                    penalties.push(regularization_view(delta, width).powf_scalar(2.0).mean());
+                }
+                if let Some(after_weight) = after.fast_weight_banks.as_ref() {
+                    let delta = match before.fast_weight_banks.as_ref() {
+                        Some(before_weight) => after_weight.clone() - before_weight.clone(),
+                        None => after_weight.clone(),
+                    };
+                    penalties.push(
+                        regularization_view(
+                            regularization_tensor_from_fast_weight_banks(delta),
+                            width,
+                        )
+                        .powf_scalar(2.0)
+                        .mean(),
+                    );
+                }
+                penalties
             }),
     )
+}
+
+fn regularization_tensor_from_fast_weight<B: Backend>(tensor: Tensor<B, 3>) -> Tensor<B, 3> {
+    tensor
+}
+
+fn regularization_tensor_from_fast_weight_banks<B: Backend>(tensor: Tensor<B, 4>) -> Tensor<B, 3> {
+    let [batch, banks, rows, cols] = tensor.shape().dims::<4>();
+    tensor.reshape([batch * banks, rows, cols])
 }
 
 fn regularization_view<B: Backend>(tensor: Tensor<B, 3>, width: usize) -> Tensor<B, 3> {

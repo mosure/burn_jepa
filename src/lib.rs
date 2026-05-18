@@ -181,9 +181,10 @@ pub use training::{
     evaluate_ttt_model_file, train_dense_jepa, train_ttt_distillation,
 };
 pub use ttt::{
-    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState, TttMemoryUpdateSource,
-    TttState, TttStateResetMode, TttSupervisionMode, TttTargetMode, VJepaTttEncoder, VJepaTttLayer,
-    VJepaTttLayerProbe, VJepaTttLayerProbeRecord, VJepaTttModel,
+    TttBackpropMode, TttEncoderConfig, TttInsertionMode, TttLayerPlacement, TttLayerState,
+    TttMemoryDynamics, TttMemoryUpdateSource, TttState, TttStateResetMode, TttSupervisionMode,
+    TttTargetMode, VJepaInPlaceTttMlp, VJepaTttEncoder, VJepaTttLayer, VJepaTttLayerProbe,
+    VJepaTttLayerProbeRecord, VJepaTttModel,
 };
 pub use viewer::{
     DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CONTEXT_DENSITY,

@@ -16,7 +16,8 @@ sparse-patchify-wgpu = ["burn_jepa/sparse-patchify-wgpu"]
 
 [dependencies]
 anyhow = "1"
-burn = { version = "0.21.0", default-features = false, features = ["fusion", "std", "webgpu"] }
+# Keep WGPU fusion target-specific: browser WebGPU validation rejects some fused command scopes.
+burn = { version = "0.21.0", default-features = false, features = ["std", "webgpu"] }
 burn_jepa = { path = "../..", default-features = false, features = ["autogaze-webgpu", "wasm", "webgpu"] }
 bevy_burn = { git = "https://github.com/mosure/bevy_burn", rev = "6875d23ed22d341767e37f0e3b02897e7ff3a1cd" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -51,6 +52,7 @@ features = [
 ]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["fusion", "std", "webgpu"] }
 clap = { version = "4.6", features = ["derive"] }
 nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
 

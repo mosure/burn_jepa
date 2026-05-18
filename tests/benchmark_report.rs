@@ -196,6 +196,13 @@ fn ttt_training_benchmark_has_sparse_density_training_step_matrix() {
         "TTT Criterion benches should expose an explicit sparsity sweep group"
     );
     assert!(
+        bench.contains("dense_seq_b{batch_size}")
+            && bench.contains("dense_chunked_b{batch_size}")
+            && bench.contains("fixed_width_sparse_seq_b{batch_size}")
+            && bench.contains("fixed_width_sparse_chunked_b{batch_size}"),
+        "TTT training-step benches should compare sequential vs chunked recurrent rollout"
+    );
+    assert!(
         bench.contains("Throughput::Elements"),
         "Criterion output should include sample-throughput context"
     );

@@ -87,6 +87,21 @@ impl<B: Backend> VJepaTttModel<B> {
             .forward_single_frame_rollout(video, target_tokens, state)
     }
 
+    pub fn forward_single_frame_rollout_with_chunk_frames(
+        &self,
+        video: Tensor<B, 5>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        chunk_frames: usize,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.encoder.forward_single_frame_rollout_with_chunk_frames(
+            video,
+            target_tokens,
+            state,
+            chunk_frames,
+        )
+    }
+
     pub fn forward_single_frame_rollout_sparse(
         &self,
         video: Tensor<B, 5>,
@@ -98,6 +113,24 @@ impl<B: Backend> VJepaTttModel<B> {
             .forward_single_frame_rollout_sparse(video, mask, target_tokens, state)
     }
 
+    pub fn forward_single_frame_rollout_sparse_with_chunk_frames(
+        &self,
+        video: Tensor<B, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        chunk_frames: usize,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.encoder
+            .forward_single_frame_rollout_sparse_with_chunk_frames(
+                video,
+                mask,
+                target_tokens,
+                state,
+                chunk_frames,
+            )
+    }
+
     pub fn forward_single_frame_rollout_sparse_batch(
         &self,
         video: Tensor<B, 5>,
@@ -107,6 +140,24 @@ impl<B: Backend> VJepaTttModel<B> {
     ) -> Result<VJepaEncoderOutput<B>> {
         self.encoder
             .forward_single_frame_rollout_sparse_batch(video, mask, target_tokens, state)
+    }
+
+    pub fn forward_single_frame_rollout_sparse_batch_with_chunk_frames(
+        &self,
+        video: Tensor<B, 5>,
+        mask: &SparseMaskBatch<B>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        chunk_frames: usize,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.encoder
+            .forward_single_frame_rollout_sparse_batch_with_chunk_frames(
+                video,
+                mask,
+                target_tokens,
+                state,
+                chunk_frames,
+            )
     }
 
     pub fn encode_image_batch_with_state(

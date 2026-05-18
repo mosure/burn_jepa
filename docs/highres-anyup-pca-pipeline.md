@@ -47,6 +47,17 @@ loaded upstream AnyUp checkpoint and `AnyUpAttentionMode::UpstreamMasked` for
 exact upstream Python parity, or `EfficientLocal` for the portable NATTEN-style
 path used in performance runs.
 
+README and paper-gallery visuals should be generated from real package
+manifests, not the tiny smoke modules. The gallery example supports
+`--model-manifest` for the V-JEPA 2.1 package, `--anyup-model-manifest` for the
+AnyUp package, and `--config` to render a single representative lane. The
+current README frame was generated from `patchdiff_50` at 256px with
+`AnyUpAttentionMode::UpstreamMasked`, so low-res PCA comes from real V-JEPA 2.1
+token-cache features and high-res PCA comes from the same PCA components after
+the real AnyUp upsampler. The high-res display should be texture-aligned but
+smoother than the token grid because AnyUp is still a dense full-resolution
+upsampling stage from low-resolution patch features.
+
 The sparse update and PCA projection stay in tensor ops. There are no
 backend-to-host reads in `FeatureFramePipeline::step_image_with_mask`;
 host conversion belongs at the UI/display boundary.

@@ -25,11 +25,30 @@ cargo run --example video_gallery_e2e --no-default-features --features ndarray -
   --samples 16 \
   --frames 40 \
   --image-size 224 \
-  --anyup-weights /path/to/anyup_multi_backbone.pth \
+  --model-manifest target/burn-jepa-web/model/vjepa2_1_base/manifest.json \
+  --anyup-model-manifest target/burn_anyup/anyup_multi_backbone/manifest.json \
   --anyup-attention-mode upstream-masked \
   --force
 ```
 
-Omit `--anyup-weights` only for fast path smoke tests. In that mode the gallery
-uses the tiny untrained AnyUp module, so high-resolution PCA frames validate the
-Burn pipeline wiring rather than pretrained AnyUp visual quality.
+Use real V-JEPA and AnyUp package manifests for README or paper assets. Omitting
+`--model-manifest` or `--anyup-model-manifest` is only for fast path smoke
+tests; the tiny untrained modules validate Burn pipeline wiring rather than
+pretrained feature or AnyUp visual quality.
+
+For a quick README-frame regeneration from one sparse lane:
+
+```bash
+python3 tools/video_feature_gallery.py \
+  --dataset-root target/burn-jepa-video-gallery/source/UCSD_Anomaly_Dataset.v1p2 \
+  --output target/burn-jepa-video-gallery-readme-real \
+  --samples 1 \
+  --frames 4 \
+  --image-size 256 \
+  --config patchdiff_50 \
+  --model-manifest target/burn-jepa-web/model/vjepa2_1_base/manifest.json \
+  --anyup-model-manifest target/burn_anyup/anyup_multi_backbone/manifest.json \
+  --anyup-attention-mode upstream-masked \
+  --pca-update-every 1 \
+  --force
+```

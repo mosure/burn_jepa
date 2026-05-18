@@ -1,8 +1,8 @@
 use crate::{
     BurnJepaTrainConfig, JepaDataset, JepaDatasetConfig, JepaDatasetKind, JepaManifestRow,
-    JepaTensorBatch, JepaTrainBackend, SparseTokenMask, TokenGridShape, TttLayerPlacement,
-    TttMemoryUpdateSource, TttTargetMode, VJepa2_1Model, VJepaConfig, VJepaLoadOptions,
-    VJepaTttModel, apply_token_mask, dataset_from_config, load_jepa_tensor_batch,
+    JepaTensorBatch, JepaTrainBackend, SparseTokenMask, TokenGridShape, TttInsertionMode,
+    TttLayerPlacement, TttMemoryUpdateSource, TttTargetMode, VJepa2_1Model, VJepaConfig,
+    VJepaLoadOptions, VJepaTttModel, apply_token_mask, dataset_from_config, load_jepa_tensor_batch,
     train_ttt_distillation, video_token_grid,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -269,6 +269,8 @@ pub enum ExperimentMaskPolicy {
 pub struct ExperimentTttLayerSet {
     pub name: String,
     #[serde(default)]
+    pub insertion: Option<TttInsertionMode>,
+    #[serde(default)]
     pub placement: Option<TttLayerPlacement>,
     #[serde(default)]
     pub encoder_layers: Vec<usize>,
@@ -280,6 +282,7 @@ impl ExperimentTttLayerSet {
     pub fn encoder_first_last() -> Self {
         Self {
             name: "encoder_first_last".to_string(),
+            insertion: None,
             placement: Some(TttLayerPlacement::FirstLast),
             encoder_layers: Vec::new(),
             predictor_layers: Vec::new(),
@@ -289,6 +292,7 @@ impl ExperimentTttLayerSet {
     pub fn encoder_thirds() -> Self {
         Self {
             name: "encoder_thirds".to_string(),
+            insertion: None,
             placement: Some(TttLayerPlacement::Thirds),
             encoder_layers: Vec::new(),
             predictor_layers: Vec::new(),
@@ -296,6 +300,9 @@ impl ExperimentTttLayerSet {
     }
 
     fn apply_to(&self, config: &mut BurnJepaTrainConfig) {
+        if let Some(insertion) = self.insertion {
+            config.ttt.insertion = insertion;
+        }
         if let Some(placement) = self.placement {
             config.ttt.layer_placement = placement;
         } else {

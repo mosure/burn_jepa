@@ -10,11 +10,81 @@ external parity/data requirements.
 - Base V-JEPA fixture:
   `/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/model.pt`
 - TTT adapter:
-  `target/burn-jepa-production-final-256/stage1-stream-tbptt-longstable/ttt-model.mpk`
+  `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk`
 - Sparse policy: AutoGaze-style sparse context masks, 410 / 2048 context
   tokens, 103 / 2048 target tokens at 256px / 16 frames.
 - Eval split: 164 held-out open-set windows from
   `target/burn-jepa-production-final-256/data/eval-real-autogaze.jsonl`.
+
+In-Place TTT support is implemented as an ablation, but the active candidate is
+still the adapter/Memory-ALiBi model above. A bounded real-checkpoint CUDA
+smoke found `in_place_mlp` thirds had similar initial quality but about 4x fast
+state memory and slower backward/optimizer throughput than adapter thirds, so
+it is not promoted without a longer positive quality result or a lower-overhead
+backward path.
+
+## 2026-05-18 Memory-ALiBi Candidate Gate
+
+The carry-forever Memory-ALiBi run is now the active candidate.  It was trained
+as a continuation from the reset16 `longstable` checkpoint, but disables hard
+runtime resets: no clip-change reset, no scene-change reset, no non-monotonic
+reset, no periodic reset, and no stream-level state decay.  The added TTT fast
+memory uses three ALiBi-style banks with half-lives `[8, 64, 512]` windows.
+
+Training command:
+
+```sh
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- train-ttt \
+  --config configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml
+```
+
+Training result:
+
+- Saved model:
+  `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk`.
+- 512 optimizer steps, 1024 samples, 20.0% sparse context density.
+- Loss trace: initial `0.2566`, best `0.2106`, final `0.2771`.
+- Runtime: `956.2 s`, `1.071 samples/s`.
+- Backward/optimizer remains the training bottleneck:
+  `777.6 s` backward plus `20.9 s` optimizer.
+- Stream mix: `952` carried windows, `72` reset windows, no stream decay, no
+  periodic reset.
+- Dense stabilization samples remained enabled: `71` dense steps and `441`
+  sparse steps.
+
+Matched CUDA evals:
+
+| Lane | Windows | Runtime resets | Loss | Cosine | Late-early loss |
+|---|---:|---:|---:|---:|---:|
+| Base sparse V-JEPA 2.1, same-stream cactus repeat | 1088 | 1 | 0.4799 | 0.7989 | 0.0000 |
+| Reset16 EMA TTT, same-stream cactus repeat | 136 | 9 | 0.3270 | 0.8666 | +0.0049 |
+| Memory-ALiBi TTT, same-stream cactus repeat | 1088 | 1 | 0.3237 | 0.8661 | -0.0009 |
+| Reset-scene EMA TTT, adversarial stitched stream | 64 | 64 | 0.4209 | 0.8215 | -0.0338 |
+| Memory-ALiBi TTT, adversarial stitched stream | 512 | 1 | 0.2837 | 0.8812 | -0.0223 |
+
+The important change is not just aggregate loss.  The 1088-window same-stream
+run carried state for `1087` consecutive windows and stayed flat across the
+four 272-window segments (`0.3244 -> 0.3235` loss).  The adversarial stitched
+run carried through `502` scene switches without explicit reset and improved
+from first to last quarter (`0.2952 -> 0.2729` loss).
+
+Promotion decision: Memory-ALiBi replaces the reset16 `longstable` checkpoint as
+the current candidate for carry-forever sparse temporal V-JEPA 2.1.  The
+reset16 checkpoint remains a fallback for bounded-horizon deployments because it
+uses one-third of the fast-memory bytes, but it is no longer the best
+long-rollout candidate. The deploy/export config now points at this checkpoint
+and includes the Memory-ALiBi TTT shape.
+
+Artifact reports:
+
+- `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-report.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-candidate.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-base-sparse.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-adversarial-8x/ttt-eval-report-candidate.json`
+- `target/burn-jepa-production-final-256/long-rollout-cactus-repeat-reset16/ttt-eval-report-longstable-reset16.json`
+- `target/burn-jepa-production-final-256/long-rollout-adversarial-stitch-reset-4x/ttt-eval-report-longstable-reset-scene.json`
 
 ## 2026-05-18 Long-Rollout Stability Gate
 
@@ -37,10 +107,10 @@ drifted from first-quarter loss/cosine `0.3786 / 0.8489` to final-quarter
 stitching also failed without recovery: 64 stitched windows degraded from
 `0.3274 / 0.8669` to `0.5399 / 0.7876`.
 
-The production policy is therefore bounded-horizon state, not unbounded memory:
+Before Memory-ALiBi, the production policy was bounded-horizon state:
 reset/refresh every 16 windows and reset immediately when the scene identity
 changes.  A continuation trained from the SIGReg checkpoint with a reset
-curriculum ending at 16 windows produced the current candidate:
+curriculum ending at 16 windows produced the previous candidate:
 
 ```sh
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
@@ -54,8 +124,8 @@ Result:
   `target/burn-jepa-production-final-256/stage1-stream-tbptt-longstable/ttt-model.mpk`.
 - 128 optimizer steps, 256 samples, final reset horizon 16 windows.
 - Loss trace: initial `0.1950`, best `0.1653`, final `0.2479`.
-- Runtime: `303.4 s`, `0.845 samples/s`; backward+optimizer remained dominant
-  at `241.7 s`.
+- Runtime: `287.1 s`, `0.892 samples/s`; backward+optimizer remained dominant
+  at `230.2 s`.
 
 Stress evals with the longstable checkpoint:
 
@@ -65,11 +135,55 @@ Stress evals with the longstable checkpoint:
 | Scene-stitched stream, scene reset | 64 | 11 | 0.2896 | 0.8783 | -0.0675 |
 | Adversarial stitched stream, scene reset | 64 | 64 | 0.4209 | 0.8215 | -0.0338 |
 
-This resolves the old paper caveat in a narrower, production-relevant sense:
+Matched 164-window sparse long-rollout comparison:
+
+| Lane | Carried windows | Resets | Loss | Cosine | Samples/s |
+|---|---:|---:|---:|---:|---:|
+| Base sparse V-JEPA 2.1 | 145 | 19 | 0.4273 | 0.8187 | 3.28 |
+| TTT reset each window | 0 | 164 | 0.3965 | 0.8319 | 3.57 |
+| TTT carried state | 145 | 19 | 0.3140 | 0.8694 | 3.64 |
+
+This resolved the old paper caveat in a narrower, production-relevant sense:
 arbitrary-duration streams are stable when the runtime uses the trained
 bounded-horizon refresh policy.  It does not show that a single fast state can
 be carried forever without reset; that mode is explicitly measured as a
-failure case.
+failure case for the earlier EMA TTT memory.
+
+Current Memory-ALiBi deployment bundle:
+
+- Upload directory:
+  `target/burn-jepa-cdn-upload/vjepa2_1_ttt`.
+- Manifest URL after upload:
+  `https://aberration.technology/model/burn_jepa/vjepa2_1_ttt/manifest.json`.
+- Record dtype: f16-only, 12 shards, 226,540,288 total shard bytes.
+- Verified with `burn-jepa verify-bpk --manifest ...`; the clean
+  `burn_store::BurnpackStore + ModuleSnapshot::load_from` path applied all 329
+  tensors with no missing, skipped, unused, or errored records.
+- Package manifest includes `ttt_config.memory_dynamics = "memory_alibi"`,
+  half-lives `[8, 64, 512]`, and `memory_clip_rms = 16.0`.
+
+## Carry-Forever Workstream
+
+The no-hard-reset workstream now has a separate Memory-ALiBi TTT mode. It keeps
+the frozen V-JEPA 2.1 attention/position path unchanged and applies the
+ALiBi-style recency prior only to the added TTT fast memory. Each TTT layer uses
+three log-spaced fast-weight banks by default (`8`, `64`, and `512` window
+half-lives), with no external stream reset or stream-level decay in the new
+carry-forever configs.
+
+Entry points:
+
+- Train:
+  `configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml`.
+- Same-scene 1024+ window eval:
+  `configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-cactus-64x-cuda.toml`.
+- Adversarial stitched no-reset eval:
+  `configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-adversarial-8x-cuda.toml`.
+
+This workstream has passed the first carry-forever promotion gate and is now
+the active candidate. Keep the reset16 checkpoint as the bounded-horizon
+fallback until the Memory-ALiBi package has broader cross-domain eval beyond the
+same-stream and adversarial stitched gates above.
 
 ## 2026-05-18 LeJEPA-Style Stability Regularization Update
 

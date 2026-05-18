@@ -1,7 +1,8 @@
 use burn::tensor::Tensor;
 use burn_jepa::{
-    SparseMaskBatch, SparseTokenMask, TttEncoderConfig, TttSparsePatchifyTrainingBackend, TttState,
-    VJepa2_1Model, VJepaTttModel, apply_mask_batch, synthetic_video,
+    SparseMaskBatch, SparseTokenMask, TttEncoderConfig, TttInsertionMode, TttSparsePatchifyBackend,
+    TttSparsePatchifyTrainingBackend, TttState, VJepa2_1Model, VJepaTttModel, apply_mask_batch,
+    synthetic_video,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -110,6 +111,25 @@ fn training_step_bench_config() -> burn_jepa::VJepaConfig {
     config
 }
 
+fn ttt_training_step_config(chunk_frames: usize) -> TttEncoderConfig {
+    TttEncoderConfig {
+        layers: vec![0],
+        chunk_tokens: 2,
+        rollout_chunk_frames: chunk_frames.max(1),
+        ..TttEncoderConfig::default()
+    }
+}
+
+fn ttt_training_step_config_with_insertion(
+    chunk_frames: usize,
+    insertion: TttInsertionMode,
+) -> TttEncoderConfig {
+    TttEncoderConfig {
+        insertion,
+        ..ttt_training_step_config(chunk_frames)
+    }
+}
+
 fn keep_count_for_density(dense_tokens: usize, density: f32) -> usize {
     ((dense_tokens as f32) * density)
         .ceil()
@@ -166,24 +186,21 @@ fn bench_ttt_training_step_matrix_with_device<B, MakeDevice>(
         let device = make_device();
         let config = training_step_bench_config();
         let teacher = VJepa2_1Model::<B>::new(&config, &device).no_grad();
-        let student = VJepaTttModel::from_model(
-            VJepa2_1Model::<B>::new(&config, &device),
-            TttEncoderConfig {
-                layers: vec![0],
-                chunk_tokens: 2,
-                ..TttEncoderConfig::default()
-            },
-            &device,
-        )
-        .expect("ttt model");
         let video = synthetic_video_batch::<B>(&config, batch_size, &device);
         let teacher_tokens = teacher.encode_video(video.clone(), None).tokens.detach();
-        let mut model = Some(student);
-        let mut optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
 
-        group.bench_function(format!("dense_b{batch_size}"), |bench| {
+        let mut sequential_model = Some(
+            VJepaTttModel::from_model(
+                VJepa2_1Model::<B>::new(&config, &device),
+                ttt_training_step_config(1),
+                &device,
+            )
+            .expect("sequential dense ttt model"),
+        );
+        let mut sequential_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+        group.bench_function(format!("dense_seq_b{batch_size}"), |bench| {
             bench.iter(|| {
-                let current = model.take().expect("model available");
+                let current = sequential_model.take().expect("model available");
                 let mut state = current.fresh_state();
                 let student = current
                     .forward_single_frame_rollout(
@@ -196,10 +213,74 @@ fn bench_ttt_training_step_matrix_with_device<B, MakeDevice>(
                     .powf_scalar(2.0)
                     .mean();
                 let grads = GradientsParams::from_grads(loss.backward(), &current);
-                let next = optim.step(1.0e-3, current, grads);
-                model = Some(next);
+                let next = sequential_optim.step(1.0e-3, current, grads);
+                sequential_model = Some(next);
             });
         });
+
+        let mut chunked_model = Some(
+            VJepaTttModel::from_model(
+                VJepa2_1Model::<B>::new(&config, &device),
+                ttt_training_step_config(config.num_frames),
+                &device,
+            )
+            .expect("chunked dense ttt model"),
+        );
+        let mut chunked_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+        group.bench_function(format!("dense_chunked_b{batch_size}"), |bench| {
+            bench.iter(|| {
+                let current = chunked_model.take().expect("model available");
+                let mut state = current.fresh_state();
+                let student = current
+                    .forward_single_frame_rollout(
+                        black_box(video.clone()),
+                        Some(teacher_tokens.clone()),
+                        &mut state,
+                    )
+                    .expect("dense rollout");
+                let loss = (student.tokens - teacher_tokens.clone())
+                    .powf_scalar(2.0)
+                    .mean();
+                let grads = GradientsParams::from_grads(loss.backward(), &current);
+                let next = chunked_optim.step(1.0e-3, current, grads);
+                chunked_model = Some(next);
+            });
+        });
+
+        let mut inplace_chunked_model = Some(
+            VJepaTttModel::from_model(
+                VJepa2_1Model::<B>::new(&config, &device),
+                ttt_training_step_config_with_insertion(
+                    config.num_frames,
+                    TttInsertionMode::InPlaceMlp,
+                ),
+                &device,
+            )
+            .expect("in-place chunked dense ttt model"),
+        );
+        let mut inplace_chunked_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+        group.bench_function(
+            format!("dense_chunked_inplace_mlp_b{batch_size}"),
+            |bench| {
+                bench.iter(|| {
+                    let current = inplace_chunked_model.take().expect("model available");
+                    let mut state = current.fresh_state();
+                    let student = current
+                        .forward_single_frame_rollout(
+                            black_box(video.clone()),
+                            Some(teacher_tokens.clone()),
+                            &mut state,
+                        )
+                        .expect("dense in-place rollout");
+                    let loss = (student.tokens - teacher_tokens.clone())
+                        .powf_scalar(2.0)
+                        .mean();
+                    let grads = GradientsParams::from_grads(loss.backward(), &current);
+                    let next = inplace_chunked_optim.step(1.0e-3, current, grads);
+                    inplace_chunked_model = Some(next);
+                });
+            },
+        );
 
         let mask = SparseMaskBatch::<B>::from_rows(
             density_rows(config.num_patches(), batch_size, 0.5),
@@ -208,22 +289,18 @@ fn bench_ttt_training_step_matrix_with_device<B, MakeDevice>(
         )
         .expect("fixed-width sparse mask batch");
         let sparse_teacher_tokens = apply_mask_batch(teacher_tokens.clone(), &mask);
-        let mut sparse_model = Some(
+        let mut sparse_sequential_model = Some(
             VJepaTttModel::from_model(
                 VJepa2_1Model::<B>::new(&config, &device),
-                TttEncoderConfig {
-                    layers: vec![0],
-                    chunk_tokens: 2,
-                    ..TttEncoderConfig::default()
-                },
+                ttt_training_step_config(1),
                 &device,
             )
-            .expect("sparse ttt model"),
+            .expect("sequential sparse ttt model"),
         );
-        let mut sparse_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
-        group.bench_function(format!("fixed_width_sparse_b{batch_size}"), |bench| {
+        let mut sparse_sequential_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+        group.bench_function(format!("fixed_width_sparse_seq_b{batch_size}"), |bench| {
             bench.iter(|| {
-                let current = sparse_model.take().expect("model available");
+                let current = sparse_sequential_model.take().expect("model available");
                 let mut state = current.fresh_state();
                 let student = current
                     .forward_single_frame_rollout_sparse_batch(
@@ -237,10 +314,81 @@ fn bench_ttt_training_step_matrix_with_device<B, MakeDevice>(
                     .powf_scalar(2.0)
                     .mean();
                 let grads = GradientsParams::from_grads(loss.backward(), &current);
-                let next = sparse_optim.step(1.0e-3, current, grads);
-                sparse_model = Some(next);
+                let next = sparse_sequential_optim.step(1.0e-3, current, grads);
+                sparse_sequential_model = Some(next);
             });
         });
+
+        let mut sparse_chunked_model = Some(
+            VJepaTttModel::from_model(
+                VJepa2_1Model::<B>::new(&config, &device),
+                ttt_training_step_config(config.num_frames),
+                &device,
+            )
+            .expect("chunked sparse ttt model"),
+        );
+        let mut sparse_chunked_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+        group.bench_function(
+            format!("fixed_width_sparse_chunked_b{batch_size}"),
+            |bench| {
+                bench.iter(|| {
+                    let current = sparse_chunked_model.take().expect("model available");
+                    let mut state = current.fresh_state();
+                    let student = current
+                        .forward_single_frame_rollout_sparse_batch(
+                            black_box(video.clone()),
+                            &mask,
+                            Some(teacher_tokens.clone()),
+                            &mut state,
+                        )
+                        .expect("fixed-width sparse rollout");
+                    let loss = (student.tokens - sparse_teacher_tokens.clone())
+                        .powf_scalar(2.0)
+                        .mean();
+                    let grads = GradientsParams::from_grads(loss.backward(), &current);
+                    let next = sparse_chunked_optim.step(1.0e-3, current, grads);
+                    sparse_chunked_model = Some(next);
+                });
+            },
+        );
+
+        let mut sparse_inplace_chunked_model = Some(
+            VJepaTttModel::from_model(
+                VJepa2_1Model::<B>::new(&config, &device),
+                ttt_training_step_config_with_insertion(
+                    config.num_frames,
+                    TttInsertionMode::InPlaceMlp,
+                ),
+                &device,
+            )
+            .expect("in-place chunked sparse ttt model"),
+        );
+        let mut sparse_inplace_chunked_optim = AdamWConfig::new().init::<B, VJepaTttModel<B>>();
+        group.bench_function(
+            format!("fixed_width_sparse_chunked_inplace_mlp_b{batch_size}"),
+            |bench| {
+                bench.iter(|| {
+                    let current = sparse_inplace_chunked_model
+                        .take()
+                        .expect("model available");
+                    let mut state = current.fresh_state();
+                    let student = current
+                        .forward_single_frame_rollout_sparse_batch(
+                            black_box(video.clone()),
+                            &mask,
+                            Some(teacher_tokens.clone()),
+                            &mut state,
+                        )
+                        .expect("fixed-width sparse in-place rollout");
+                    let loss = (student.tokens - sparse_teacher_tokens.clone())
+                        .powf_scalar(2.0)
+                        .mean();
+                    let grads = GradientsParams::from_grads(loss.backward(), &current);
+                    let next = sparse_inplace_chunked_optim.step(1.0e-3, current, grads);
+                    sparse_inplace_chunked_model = Some(next);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -437,7 +585,7 @@ fn bench_ttt_sparse_patchify_sparsity_training_step_matrix<B>(
                         let current = sparse_model.take().expect("model available");
                         let mut state = current.fresh_state();
                         let student =
-                            <B as TttSparsePatchifyTrainingBackend>::student_frozen_sparse_patchify_rollout_batch(
+                            <B as TttSparsePatchifyBackend>::student_frozen_sparse_patchify_rollout_batch(
                                 &current,
                                 black_box(video.clone()),
                                 &mask,

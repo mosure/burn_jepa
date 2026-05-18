@@ -5,10 +5,10 @@ mod model;
 mod state;
 
 pub use config::{
-    TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttMemoryUpdateSource,
-    TttSupervisionMode, TttTargetMode,
+    TttBackpropMode, TttEncoderConfig, TttInsertionMode, TttLayerPlacement, TttMemoryDynamics,
+    TttMemoryUpdateSource, TttSupervisionMode, TttTargetMode,
 };
 pub use encoder::{TttStateResetMode, VJepaTttEncoder, VJepaTttLayerProbeRecord};
-pub use layer::{VJepaTttLayer, VJepaTttLayerProbe};
+pub use layer::{VJepaInPlaceTttMlp, VJepaTttLayer, VJepaTttLayerProbe};
 pub use model::VJepaTttModel;
 pub use state::{TttLayerState, TttState};

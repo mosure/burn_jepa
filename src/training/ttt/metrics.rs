@@ -1,8 +1,8 @@
 use super::step::{TttPatchifyKind, TttRolloutKind};
 use crate::training::config::BurnJepaTrainConfig;
 use crate::{
-    SparseMaskBatch, TttMemoryUpdateSource, TttSupervisionMode, VJepaConfig,
-    VJepaTttLayerProbeRecord, VJepaTttModel,
+    SparseMaskBatch, TttInsertionMode, TttMemoryDynamics, TttMemoryUpdateSource,
+    TttSupervisionMode, VJepaConfig, VJepaTttLayerProbeRecord, VJepaTttModel,
 };
 use anyhow::Result;
 use burn::optim::GradientsParams;
@@ -73,15 +73,30 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
     let layers = config.ttt.resolved_layers(model);
     let predictor_layers = config.ttt.resolved_predictor_layers(model);
     let embed_dim = model.encoder.embed_dim.max(1);
+    let hidden_dim = ((embed_dim as f32) * model.encoder.mlp_ratio.max(1.0)).round() as usize;
     let predictor_embed_dim = model.predictor.embed_dim.max(1);
     let layer_count = layers.len();
     let predictor_layer_count = predictor_layers.len();
     let batch_size = batch_size.max(1);
-    let fast_weight_elements = layer_count * batch_size * embed_dim * embed_dim
-        + predictor_layer_count * batch_size * predictor_embed_dim * predictor_embed_dim;
-    let per_encoder_layer_params = embed_dim * embed_dim
-        + embed_dim * config.ttt.conv_kernel.max(1)
-        + usize::from(config.ttt.use_projection) * embed_dim * embed_dim;
+    let memory_banks = config.ttt.memory_bank_count();
+    let encoder_fast_weight_elements = match config.ttt.insertion {
+        TttInsertionMode::Adapter => layer_count * batch_size * embed_dim * embed_dim,
+        TttInsertionMode::InPlaceMlp => layer_count * batch_size * hidden_dim * embed_dim,
+    };
+    let fast_weight_elements = memory_banks
+        * (encoder_fast_weight_elements
+            + predictor_layer_count * batch_size * predictor_embed_dim * predictor_embed_dim);
+    let per_encoder_layer_params = match config.ttt.insertion {
+        TttInsertionMode::Adapter => {
+            embed_dim * embed_dim
+                + embed_dim * config.ttt.conv_kernel.max(1)
+                + usize::from(config.ttt.use_projection) * embed_dim * embed_dim
+        }
+        TttInsertionMode::InPlaceMlp => {
+            embed_dim * config.ttt.conv_kernel.max(1)
+                + usize::from(config.ttt.use_projection) * embed_dim * embed_dim
+        }
+    };
     let per_predictor_layer_params = predictor_embed_dim * predictor_embed_dim
         + predictor_embed_dim * config.ttt.conv_kernel.max(1)
         + usize::from(config.ttt.use_projection) * predictor_embed_dim * predictor_embed_dim;
@@ -94,7 +109,16 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
         predictor_embed_dim,
         batch_size,
         chunk_tokens: config.ttt.chunk_tokens.max(1),
+        rollout_chunk_frames: config.ttt.rollout_chunk_frames.max(1),
         ttt_lr: config.ttt.ttt_lr,
+        insertion: config.ttt.insertion,
+        memory_dynamics: config.ttt.memory_dynamics,
+        memory_banks,
+        memory_alibi_half_lives: match config.ttt.memory_dynamics {
+            TttMemoryDynamics::Ema => Vec::new(),
+            TttMemoryDynamics::MemoryAlibi => config.ttt.resolved_memory_alibi_half_lives(),
+        },
+        memory_clip_rms: config.ttt.memory_clip_rms,
         fast_weight_elements,
         fast_weight_bytes_f32: fast_weight_elements * std::mem::size_of::<f32>(),
         trainable_param_elements,
