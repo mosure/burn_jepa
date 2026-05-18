@@ -1492,6 +1492,8 @@ fn clip_rows(
             teacher_frame_dir: None,
             precomputed_context_indices: None,
             precomputed_target_indices: None,
+            original_stream: None,
+            cache_id: None,
         });
         if end == clip.frames.len() {
             break;

@@ -3,10 +3,15 @@ use super::step::{self, TttRolloutKind};
 use crate::training::batch::TrainingBatchPlanner;
 use crate::training::config::BurnJepaTrainConfig;
 use crate::training::report::{
-    TttDomainEvalMetric, TttStageMetrics, TttStreamTrainingMetrics, TttTemporalDiagnosticMetrics,
-    TttTemporalSegmentMetric, TttTemporalSegmentMetrics, TttUtilizationMetrics, tensor_scalar,
+    TttDomainEvalMetric, TttLongRolloutMetrics, TttLongRolloutSegmentMetric,
+    TttLongRolloutStreamMetric, TttStageMetrics, TttStreamTrainingMetrics,
+    TttTemporalDiagnosticMetrics, TttTemporalSegmentMetric, TttTemporalSegmentMetrics,
+    TttUtilizationMetrics, tensor_scalar,
 };
-use crate::{SparseMaskBatch, TokenGridShape, VJepa2_1Model, VJepaTttModel, dataset_from_config};
+use crate::{
+    JepaSampleMetadata, SparseMaskBatch, TokenGridShape, VJepa2_1Model, VJepaTttModel,
+    dataset_from_config,
+};
 use crate::{TttMemoryUpdateSource, TttStateResetMode, TttSupervisionMode};
 use anyhow::{Context, Result};
 use burn::tensor::Tensor;
@@ -19,6 +24,7 @@ pub(super) struct TttEvalSummary {
     pub loss: f64,
     pub feature_loss: f64,
     pub predictor_loss: Option<f64>,
+    pub regularizer_loss: Option<f64>,
     pub cosine: f64,
     pub teacher_forced_loss: Option<f64>,
     pub teacher_forced_cosine: Option<f64>,
@@ -31,6 +37,7 @@ pub(super) struct TttEvalSummary {
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub long_rollout: Option<TttLongRolloutMetrics>,
     pub stream: TttStreamTrainingMetrics,
 }
 
@@ -39,6 +46,8 @@ struct DomainTotals {
     samples: usize,
     loss: f64,
     cosine: f64,
+    regularizer_samples: usize,
+    regularizer_loss: f64,
     teacher_forced_samples: usize,
     teacher_forced_loss: f64,
     teacher_forced_cosine: f64,
@@ -47,7 +56,216 @@ struct DomainTotals {
     full_cosine: f64,
 }
 
-pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
+#[derive(Clone, Debug, Default)]
+struct LongRolloutTotal {
+    samples: usize,
+    loss: f64,
+    cosine: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LongRolloutStreamTotal {
+    domain: String,
+    samples: usize,
+    first_start_frame: Option<usize>,
+    last_start_frame: Option<usize>,
+    current_consecutive_windows: usize,
+    longest_consecutive_windows: usize,
+    loss: f64,
+    cosine: f64,
+}
+
+struct LongRolloutAccumulator {
+    expected_windows: usize,
+    samples: usize,
+    segments: Vec<LongRolloutTotal>,
+    streams: BTreeMap<String, LongRolloutStreamTotal>,
+    previous_scene_key: Option<String>,
+    windows_since_scene_switch: Option<usize>,
+    scene_switches: usize,
+    switch_window: LongRolloutTotal,
+    recovery_window: LongRolloutTotal,
+    steady_state: LongRolloutTotal,
+}
+
+impl LongRolloutAccumulator {
+    fn new(expected_windows: usize, segment_count: usize) -> Self {
+        let expected_windows = expected_windows.max(1);
+        let segment_count = segment_count.clamp(1, expected_windows);
+        Self {
+            expected_windows,
+            samples: 0,
+            segments: vec![LongRolloutTotal::default(); segment_count],
+            streams: BTreeMap::new(),
+            previous_scene_key: None,
+            windows_since_scene_switch: None,
+            scene_switches: 0,
+            switch_window: LongRolloutTotal::default(),
+            recovery_window: LongRolloutTotal::default(),
+            steady_state: LongRolloutTotal::default(),
+        }
+    }
+
+    fn add_batch(
+        &mut self,
+        loss: f64,
+        cosine: f64,
+        batch_size: usize,
+        metadata: &[JepaSampleMetadata],
+    ) {
+        for row in 0..batch_size {
+            let sample_index = self.samples;
+            let segment = ((sample_index * self.segments.len()) / self.expected_windows)
+                .min(self.segments.len().saturating_sub(1));
+            let total = &mut self.segments[segment];
+            total.samples += 1;
+            total.loss += loss;
+            total.cosine += cosine;
+
+            let metadata = metadata.get(row).cloned().unwrap_or_default();
+            self.add_scene_switch_metrics(loss, cosine, &metadata);
+            let stream_key = rollout_stream_key(&metadata);
+            let domain = metadata
+                .domain
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let stream = self
+                .streams
+                .entry(stream_key)
+                .or_insert_with(|| LongRolloutStreamTotal {
+                    domain,
+                    ..LongRolloutStreamTotal::default()
+                });
+            if stream.samples == 0 {
+                stream.first_start_frame = metadata.start_frame;
+                stream.current_consecutive_windows = 1;
+            } else if is_consecutive_window(stream.last_start_frame, metadata.start_frame) {
+                stream.current_consecutive_windows += 1;
+            } else {
+                stream.current_consecutive_windows = 1;
+            }
+            stream.longest_consecutive_windows = stream
+                .longest_consecutive_windows
+                .max(stream.current_consecutive_windows);
+            stream.last_start_frame = metadata.start_frame;
+            stream.samples += 1;
+            stream.loss += loss;
+            stream.cosine += cosine;
+            self.samples += 1;
+        }
+    }
+
+    fn finish(self) -> Option<TttLongRolloutMetrics> {
+        if self.samples == 0 {
+            return None;
+        }
+        let count = self.segments.len();
+        let segments = self
+            .segments
+            .into_iter()
+            .enumerate()
+            .map(|(segment, total)| {
+                let samples = total.samples.max(1);
+                TttLongRolloutSegmentMetric {
+                    segment,
+                    start_window: (segment * self.expected_windows).div_ceil(count),
+                    end_window: ((segment + 1) * self.expected_windows).div_ceil(count),
+                    samples: total.samples,
+                    loss: total.loss / samples as f64,
+                    cosine: total.cosine / samples as f64,
+                }
+            })
+            .collect::<Vec<_>>();
+        let first = segments.first();
+        let last = segments.last();
+        let late_minus_early_loss = first.zip(last).and_then(|(first, last)| {
+            (first.samples > 0 && last.samples > 0).then_some(last.loss - first.loss)
+        });
+        let late_minus_early_cosine = first.zip(last).and_then(|(first, last)| {
+            (first.samples > 0 && last.samples > 0).then_some(last.cosine - first.cosine)
+        });
+        let mut longest_stream_windows = 0usize;
+        let mut longest_consecutive_windows = 0usize;
+        let stream_segments = self
+            .streams
+            .into_iter()
+            .map(|(stream, total)| {
+                longest_stream_windows = longest_stream_windows.max(total.samples);
+                longest_consecutive_windows =
+                    longest_consecutive_windows.max(total.longest_consecutive_windows);
+                let samples = total.samples.max(1);
+                TttLongRolloutStreamMetric {
+                    stream,
+                    domain: total.domain,
+                    samples: total.samples,
+                    first_start_frame: total.first_start_frame,
+                    last_start_frame: total.last_start_frame,
+                    longest_consecutive_windows: total.longest_consecutive_windows,
+                    loss: total.loss / samples as f64,
+                    cosine: total.cosine / samples as f64,
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(TttLongRolloutMetrics {
+            samples: self.samples,
+            windows: self.samples,
+            streams: stream_segments.len(),
+            longest_stream_windows,
+            longest_consecutive_windows,
+            scene_switches: self.scene_switches,
+            switch_window_samples: self.switch_window.samples,
+            switch_window_loss: mean_loss(&self.switch_window),
+            switch_window_cosine: mean_cosine(&self.switch_window),
+            recovery_window_samples: self.recovery_window.samples,
+            recovery_window_loss: mean_loss(&self.recovery_window),
+            recovery_window_cosine: mean_cosine(&self.recovery_window),
+            steady_state_samples: self.steady_state.samples,
+            steady_state_loss: mean_loss(&self.steady_state),
+            steady_state_cosine: mean_cosine(&self.steady_state),
+            segments,
+            late_minus_early_loss,
+            late_minus_early_cosine,
+            stream_segments,
+        })
+    }
+
+    fn add_scene_switch_metrics(&mut self, loss: f64, cosine: f64, metadata: &JepaSampleMetadata) {
+        let scene_key = rollout_scene_key(metadata);
+        let switched = self
+            .previous_scene_key
+            .as_ref()
+            .is_some_and(|previous| previous != &scene_key);
+        self.previous_scene_key = Some(scene_key);
+        if switched {
+            self.scene_switches += 1;
+            self.windows_since_scene_switch = Some(0);
+        }
+        match self.windows_since_scene_switch {
+            Some(0) => add_total(&mut self.switch_window, loss, cosine, 1),
+            Some(1..=4) => add_total(&mut self.recovery_window, loss, cosine, 1),
+            _ => add_total(&mut self.steady_state, loss, cosine, 1),
+        }
+        if let Some(distance) = self.windows_since_scene_switch.as_mut() {
+            *distance += 1;
+        }
+    }
+}
+
+fn add_total(total: &mut LongRolloutTotal, loss: f64, cosine: f64, samples: usize) {
+    total.samples += samples;
+    total.loss += loss * samples as f64;
+    total.cosine += cosine * samples as f64;
+}
+
+fn mean_loss(total: &LongRolloutTotal) -> Option<f64> {
+    (total.samples > 0).then_some(total.loss / total.samples as f64)
+}
+
+fn mean_cosine(total: &LongRolloutTotal) -> Option<f64> {
+    (total.samples > 0).then_some(total.cosine / total.samples as f64)
+}
+
+pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyBackend>(
     model: &VJepaTttModel<B>,
     teacher: &VJepa2_1Model<B>,
     config: &BurnJepaTrainConfig,
@@ -64,6 +282,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
     let mut total = 0.0;
     let mut total_feature = 0.0;
     let mut total_predictor = 0.0;
+    let mut total_regularizer = 0.0;
     let mut total_cosine = 0.0;
     let mut total_teacher_forced_loss = 0.0;
     let mut total_teacher_forced_cosine = 0.0;
@@ -71,6 +290,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
     let mut total_full_cosine = 0.0;
     let mut samples = 0usize;
     let mut predictor_samples = 0usize;
+    let mut regularizer_samples = 0usize;
     let mut teacher_forced_samples = 0usize;
     let mut full_samples = 0usize;
     let mut stage = TttStageMetrics::default();
@@ -80,6 +300,8 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
     let mut utilization = None;
     let mut temporal_diagnostics = TemporalDiagnosticAccumulator::default();
     let mut temporal_segments = TemporalSegmentAccumulator::new(3);
+    let expected_windows = steps.saturating_mul(eval_batch_size.max(1)).max(1);
+    let mut long_rollout = LongRolloutAccumulator::new(expected_windows, 4);
     let mut stream_state = super::StreamStateTracker::<B>::default();
     let teacher_forced_eval =
         config.ttt.memory_update == TttMemoryUpdateSource::TeacherForcedDiagnostic;
@@ -207,6 +429,10 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             .predictor
             .map(|predictor| tensor_scalar(predictor.detach()))
             .transpose()?;
+        let regularizer_loss = loss_breakdown
+            .regularizer
+            .map(|regularizer| tensor_scalar(regularizer.detach()))
+            .transpose()?;
         let primary_cosine = loss::primary_cosine(
             student.free_run.tokens.clone(),
             teacher_tokens.final_tokens.clone(),
@@ -218,6 +444,7 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             batch_size,
             device,
         )?;
+        long_rollout.add_batch(primary_loss, primary_cosine, batch_size, &batch.metadata);
         if config.training.eval_temporal_diagnostics {
             temporal_segments.add_batch(
                 student.free_run.tokens.clone(),
@@ -237,6 +464,11 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
         if let Some(predictor_loss) = predictor_loss {
             total_predictor += predictor_loss * batch_size as f64;
             predictor_samples += batch_size;
+        }
+        let regularizer_loss_for_domain = regularizer_loss;
+        if let Some(regularizer_loss) = regularizer_loss {
+            total_regularizer += regularizer_loss * batch_size as f64;
+            regularizer_samples += batch_size;
         }
         total_cosine += primary_cosine * batch_size as f64;
         samples += batch_size;
@@ -301,6 +533,10 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
         totals.samples += batch_size;
         totals.loss += primary_loss * batch_size as f64;
         totals.cosine += primary_cosine * batch_size as f64;
+        if let Some(regularizer_loss) = regularizer_loss_for_domain {
+            totals.regularizer_samples += batch_size;
+            totals.regularizer_loss += regularizer_loss * batch_size as f64;
+        }
         if let (Some(loss), Some(cosine)) = (teacher_forced_loss, teacher_forced_cosine) {
             totals.teacher_forced_samples += batch_size;
             totals.teacher_forced_loss += loss * batch_size as f64;
@@ -320,6 +556,8 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
             samples: totals.samples,
             loss: totals.loss / totals.samples.max(1) as f64,
             cosine: totals.cosine / totals.samples.max(1) as f64,
+            regularizer_loss: (totals.regularizer_samples > 0)
+                .then_some(totals.regularizer_loss / totals.regularizer_samples as f64),
             teacher_forced_loss: (totals.teacher_forced_samples > 0)
                 .then_some(totals.teacher_forced_loss / totals.teacher_forced_samples as f64),
             teacher_forced_cosine: (totals.teacher_forced_samples > 0)
@@ -344,6 +582,8 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
         feature_loss: total_feature / samples.max(1) as f64,
         predictor_loss: (predictor_samples > 0)
             .then_some(total_predictor / predictor_samples as f64),
+        regularizer_loss: (regularizer_samples > 0)
+            .then_some(total_regularizer / regularizer_samples as f64),
         cosine: total_cosine / samples.max(1) as f64,
         teacher_forced_loss: (teacher_forced_samples > 0)
             .then_some(total_teacher_forced_loss / teacher_forced_samples as f64),
@@ -364,12 +604,13 @@ pub(super) fn evaluate_ttt_dataset<B: step::TttSparsePatchifyTrainingBackend>(
         utilization,
         temporal_diagnostics: temporal_diagnostics.finish(),
         temporal_segments: temporal_segments.finish(),
+        long_rollout: long_rollout.finish(),
         stream: stream_state.metrics(config, false),
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_temporal_diagnostics<B: step::TttSparsePatchifyTrainingBackend>(
+fn eval_temporal_diagnostics<B: step::TttSparsePatchifyBackend>(
     model: &VJepaTttModel<B>,
     config: &BurnJepaTrainConfig,
     video: burn::tensor::Tensor<B, 5>,
@@ -699,7 +940,7 @@ fn reorder_video_frames<B: Backend>(video: Tensor<B, 5>, order: Vec<usize>) -> T
     Tensor::cat(slices, 2)
 }
 
-fn diagnostic_loss_cosine<B: step::TttSparsePatchifyTrainingBackend>(
+fn diagnostic_loss_cosine<B: step::TttSparsePatchifyBackend>(
     _model: &VJepaTttModel<B>,
     config: &BurnJepaTrainConfig,
     student: crate::VJepaEncoderOutput<B>,
@@ -748,5 +989,33 @@ fn batch_domain(metadata: &[crate::JepaSampleMetadata]) -> String {
         first.to_string()
     } else {
         "mixed".to_string()
+    }
+}
+
+fn rollout_stream_key(metadata: &JepaSampleMetadata) -> String {
+    metadata
+        .clip_id
+        .as_ref()
+        .or(metadata.source.as_ref())
+        .or(metadata.domain.as_ref())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn rollout_scene_key(metadata: &JepaSampleMetadata) -> String {
+    metadata
+        .original_stream
+        .as_ref()
+        .or(metadata.clip_id.as_ref())
+        .or(metadata.source.as_ref())
+        .or(metadata.domain.as_ref())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn is_consecutive_window(previous: Option<usize>, current: Option<usize>) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current)) => current > previous,
+        (None, None) | (Some(_), None) | (None, Some(_)) => true,
     }
 }

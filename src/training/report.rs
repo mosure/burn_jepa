@@ -63,10 +63,22 @@ pub struct TttBackpropMetrics {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct TttLatentRegularizationMetrics {
+    pub weight: f32,
+    pub mean_weight: f32,
+    pub variance_weight: f32,
+    pub covariance_weight: f32,
+    pub target_variance: f32,
+    pub covariance_sketch_dim: usize,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct TttStreamTrainingMetrics {
     pub enabled: bool,
     pub detach_between_steps: bool,
     pub reset_on_clip_change: bool,
+    pub reset_on_scene_change: bool,
     pub reset_on_non_monotonic_start: bool,
     pub reset_interval_steps: usize,
     pub curriculum_enabled: bool,
@@ -131,6 +143,7 @@ pub struct TttDomainEvalMetric {
     pub samples: usize,
     pub loss: f64,
     pub cosine: f64,
+    pub regularizer_loss: Option<f64>,
     pub teacher_forced_loss: Option<f64>,
     pub teacher_forced_cosine: Option<f64>,
     pub teacher_forcing_loss_gap: Option<f64>,
@@ -197,6 +210,58 @@ pub struct TttTemporalSegmentMetrics {
     pub late_minus_early_cosine: Option<f64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct TttLongRolloutSegmentMetric {
+    pub segment: usize,
+    pub start_window: usize,
+    pub end_window: usize,
+    pub samples: usize,
+    pub loss: f64,
+    pub cosine: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttLongRolloutStreamMetric {
+    pub stream: String,
+    pub domain: String,
+    pub samples: usize,
+    pub first_start_frame: Option<usize>,
+    pub last_start_frame: Option<usize>,
+    pub longest_consecutive_windows: usize,
+    pub loss: f64,
+    pub cosine: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TttLongRolloutMetrics {
+    pub samples: usize,
+    pub windows: usize,
+    pub streams: usize,
+    pub longest_stream_windows: usize,
+    pub longest_consecutive_windows: usize,
+    pub scene_switches: usize,
+    pub switch_window_samples: usize,
+    pub switch_window_loss: Option<f64>,
+    pub switch_window_cosine: Option<f64>,
+    pub recovery_window_samples: usize,
+    pub recovery_window_loss: Option<f64>,
+    pub recovery_window_cosine: Option<f64>,
+    pub steady_state_samples: usize,
+    pub steady_state_loss: Option<f64>,
+    pub steady_state_cosine: Option<f64>,
+    pub segments: Vec<TttLongRolloutSegmentMetric>,
+    pub late_minus_early_loss: Option<f64>,
+    pub late_minus_early_cosine: Option<f64>,
+    pub stream_segments: Vec<TttLongRolloutStreamMetric>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TttEvalModelKind {
+    Checkpoint,
+    BaseSparseZeroInitTtt,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TttRolloutReportMode {
@@ -212,7 +277,7 @@ pub struct TttRolloutMetrics {
     pub student_tokens: usize,
     pub student_token_density: f32,
     pub full_grid_eval: bool,
-    pub autodiff_sparse_patchify: bool,
+    pub frozen_sparse_patchify: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -237,6 +302,7 @@ pub struct TttTrainingReport {
     pub rollout: TttRolloutMetrics,
     pub dense_samples: TttDenseSampleMetrics,
     pub backprop: TttBackpropMetrics,
+    pub latent_regularization: TttLatentRegularizationMetrics,
     pub stream: TttStreamTrainingMetrics,
     pub lr_schedule: LearningRateScheduleConfig,
     pub lr_stats: LearningRateScheduleStats,
@@ -244,6 +310,7 @@ pub struct TttTrainingReport {
     pub pre_train_eval_loss: Option<f64>,
     pub pre_train_eval_feature_loss: Option<f64>,
     pub pre_train_eval_predictor_loss: Option<f64>,
+    pub pre_train_eval_regularizer_loss: Option<f64>,
     pub pre_train_eval_cosine: Option<f64>,
     pub pre_train_teacher_forced_eval_loss: Option<f64>,
     pub pre_train_teacher_forced_eval_cosine: Option<f64>,
@@ -251,9 +318,11 @@ pub struct TttTrainingReport {
     pub pre_train_teacher_forcing_cosine_gap: Option<f64>,
     pub pre_train_full_eval_loss: Option<f64>,
     pub pre_train_full_eval_cosine: Option<f64>,
+    pub pre_train_long_rollout: Option<TttLongRolloutMetrics>,
     pub eval_loss: Option<f64>,
     pub eval_feature_loss: Option<f64>,
     pub eval_predictor_loss: Option<f64>,
+    pub eval_regularizer_loss: Option<f64>,
     pub eval_cosine: Option<f64>,
     pub teacher_forced_eval_loss: Option<f64>,
     pub teacher_forced_eval_cosine: Option<f64>,
@@ -268,6 +337,7 @@ pub struct TttTrainingReport {
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub eval_long_rollout: Option<TttLongRolloutMetrics>,
     pub train_elapsed_ms: u128,
     pub eval_elapsed_ms: u128,
     pub elapsed_ms: u128,
@@ -278,12 +348,14 @@ pub struct TttTrainingReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TttEvalReport {
-    pub model_path: PathBuf,
+    pub model_kind: TttEvalModelKind,
+    pub model_path: Option<PathBuf>,
     pub eval_steps: usize,
     pub eval_samples: usize,
     pub loss: f64,
     pub feature_loss: f64,
     pub predictor_loss: Option<f64>,
+    pub regularizer_loss: Option<f64>,
     pub cosine: f64,
     pub teacher_forced_loss: Option<f64>,
     pub teacher_forced_cosine: Option<f64>,
@@ -295,11 +367,13 @@ pub struct TttEvalReport {
     pub mask: Option<TttMaskMetrics>,
     pub rollout: TttRolloutMetrics,
     pub target_supervision: TttTargetSupervisionMetrics,
+    pub latent_regularization: TttLatentRegularizationMetrics,
     pub stage: TttStageMetrics,
     pub domains: Vec<TttDomainEvalMetric>,
     pub utilization: Option<TttUtilizationMetrics>,
     pub temporal_diagnostics: Option<TttTemporalDiagnosticMetrics>,
     pub temporal_segments: Option<TttTemporalSegmentMetrics>,
+    pub long_rollout: Option<TttLongRolloutMetrics>,
     pub stream: TttStreamTrainingMetrics,
     pub elapsed_ms: u128,
     pub samples_per_second: f64,

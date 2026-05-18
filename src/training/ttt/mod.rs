@@ -10,9 +10,10 @@ use super::batch::{
 use super::config::BurnJepaTrainConfig;
 use super::model_io::{load_student_model, load_teacher_model};
 use super::report::{
-    TrainingLossSummary, TttBackpropMetrics, TttDenseSampleMetrics, TttEvalReport, TttStageMetrics,
-    TttStepMetric, TttStreamStepKind, TttStreamTrainingMetrics, TttTrainingReport,
-    samples_per_second, save_training_report, save_ttt_training_report, tensor_scalar,
+    TrainingLossSummary, TttBackpropMetrics, TttDenseSampleMetrics, TttEvalModelKind,
+    TttEvalReport, TttStageMetrics, TttStepMetric, TttStreamStepKind, TttStreamTrainingMetrics,
+    TttTrainingReport, samples_per_second, save_training_report, save_ttt_training_report,
+    tensor_scalar,
 };
 use crate::{JepaSampleMetadata, TttState, VJepaTttModel, dataset_from_config, video_token_grid};
 use anyhow::{Context, Result, ensure};
@@ -24,11 +25,11 @@ use burn::tensor::backend::Backend;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub use loss::{TttDistillationLoss, evaluate_ttt_distillation};
-pub use step::TttSparsePatchifyTrainingBackend;
+pub use step::{TttSparsePatchifyBackend, TttSparsePatchifyTrainingBackend};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 struct StreamKey {
@@ -50,6 +51,7 @@ impl StreamKey {
 #[derive(Clone, Debug, Default)]
 struct StreamSlot<B: Backend> {
     start_frame: Option<usize>,
+    scene_key: Option<String>,
     windows_in_stream: usize,
     state: Option<TttState<B>>,
 }
@@ -109,13 +111,20 @@ impl<B: Backend> StreamStateTracker<B> {
                 key
             );
             let slot = self.streams.entry(key.clone()).or_default();
+            let scene_key = stream_scene_key(&row_metadata);
+            let scene_changed = config.training.stream.reset_on_scene_change
+                && slot
+                    .scene_key
+                    .as_ref()
+                    .is_some_and(|previous| previous != &scene_key);
             let non_monotonic_start = config.training.stream.reset_on_non_monotonic_start
                 && slot
                     .start_frame
                     .zip(row_metadata.start_frame)
                     .is_some_and(|(previous, current)| current <= previous);
             let interval_reset = reset_interval > 0 && slot.windows_in_stream >= reset_interval;
-            let reset = slot.state.is_none() || non_monotonic_start || interval_reset;
+            let reset =
+                slot.state.is_none() || scene_changed || non_monotonic_start || interval_reset;
             let state = if reset {
                 slot.windows_in_stream = 1;
                 self.reset_steps += 1;
@@ -128,6 +137,7 @@ impl<B: Backend> StreamStateTracker<B> {
                 slot.state.take().unwrap_or_else(|| model.fresh_state())
             };
             slot.start_frame = row_metadata.start_frame;
+            slot.scene_key = Some(scene_key);
             self.active_keys.push(key);
             row_states.push(state);
         }
@@ -183,6 +193,7 @@ impl<B: Backend> StreamStateTracker<B> {
             enabled: config.training.stream.enabled,
             detach_between_steps: config.training.stream.detach_between_steps,
             reset_on_clip_change: config.training.stream.reset_on_clip_change,
+            reset_on_scene_change: config.training.stream.reset_on_scene_change,
             reset_on_non_monotonic_start: config.training.stream.reset_on_non_monotonic_start,
             reset_interval_steps: config.training.stream.reset_interval_steps,
             curriculum_enabled: config.training.stream.curriculum.enabled,
@@ -219,6 +230,17 @@ impl<B: Backend> StreamStateTracker<B> {
             decayed_steps: self.decayed_steps,
         }
     }
+}
+
+fn stream_scene_key(metadata: &JepaSampleMetadata) -> String {
+    metadata
+        .original_stream
+        .as_ref()
+        .or(metadata.clip_id.as_ref())
+        .or(metadata.source.as_ref())
+        .or(metadata.domain.as_ref())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn add_stream_regularization<B: Backend>(
@@ -580,6 +602,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         eval_loss,
         eval_feature_loss,
         eval_predictor_loss,
+        eval_regularizer_loss,
         eval_cosine,
         teacher_forced_eval_loss,
         teacher_forced_eval_cosine,
@@ -593,6 +616,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         mut utilization,
         temporal_diagnostics,
         temporal_segments,
+        eval_long_rollout,
     ) = if config.training.eval_steps > 0 {
         let eval = eval::evaluate_ttt_dataset(
             &model,
@@ -605,6 +629,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             Some(eval.loss),
             Some(eval.feature_loss),
             eval.predictor_loss,
+            eval.regularizer_loss,
             Some(eval.cosine),
             eval.teacher_forced_loss,
             eval.teacher_forced_cosine,
@@ -618,6 +643,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             eval.utilization,
             eval.temporal_diagnostics,
             eval.temporal_segments,
+            eval.long_rollout,
         )
     } else {
         (
@@ -631,9 +657,11 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             None,
             None,
             None,
+            None,
             0,
             TttStageMetrics::default(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -677,6 +705,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             mode: config.ttt.backprop_mode,
             truncate_blocks: config.ttt.backprop_truncate_blocks,
         },
+        latent_regularization: metrics::latent_regularization_metrics(config),
         stream: stream_state.metrics(config, true),
         lr_schedule: config.training.lr_schedule.clone(),
         lr_stats: config.training.learning_rate_stats(),
@@ -684,6 +713,9 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         pre_train_eval_loss: pre_train_eval.as_ref().map(|eval| eval.loss),
         pre_train_eval_feature_loss: pre_train_eval.as_ref().map(|eval| eval.feature_loss),
         pre_train_eval_predictor_loss: pre_train_eval.as_ref().and_then(|eval| eval.predictor_loss),
+        pre_train_eval_regularizer_loss: pre_train_eval
+            .as_ref()
+            .and_then(|eval| eval.regularizer_loss),
         pre_train_eval_cosine: pre_train_eval.as_ref().map(|eval| eval.cosine),
         pre_train_teacher_forced_eval_loss: pre_train_eval
             .as_ref()
@@ -699,9 +731,11 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
             .and_then(|eval| eval.teacher_forcing_cosine_gap),
         pre_train_full_eval_loss: pre_train_eval.as_ref().and_then(|eval| eval.full_loss),
         pre_train_full_eval_cosine: pre_train_eval.as_ref().and_then(|eval| eval.full_cosine),
+        pre_train_long_rollout: pre_train_eval.and_then(|eval| eval.long_rollout),
         eval_loss,
         eval_feature_loss,
         eval_predictor_loss,
+        eval_regularizer_loss,
         eval_cosine,
         teacher_forced_eval_loss,
         teacher_forced_eval_cosine,
@@ -716,6 +750,7 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
         utilization,
         temporal_diagnostics,
         temporal_segments,
+        eval_long_rollout,
         train_elapsed_ms,
         eval_elapsed_ms,
         elapsed_ms,
@@ -733,28 +768,52 @@ pub fn train_ttt_distillation<B: step::TttSparsePatchifyTrainingBackend>(
     Ok(report)
 }
 
-pub fn evaluate_ttt_model_file<B: step::TttSparsePatchifyTrainingBackend>(
+pub fn evaluate_ttt_model_file<B: step::TttSparsePatchifyBackend>(
     config: &BurnJepaTrainConfig,
     model_path: impl AsRef<Path>,
+    device: &B::Device,
+    steps: usize,
+) -> Result<TttEvalReport> {
+    evaluate_ttt_model_optional_file::<B>(
+        config,
+        Some(model_path.as_ref().to_path_buf()),
+        device,
+        steps,
+    )
+}
+
+pub fn evaluate_ttt_base_sparse<B: step::TttSparsePatchifyBackend>(
+    config: &BurnJepaTrainConfig,
+    device: &B::Device,
+    steps: usize,
+) -> Result<TttEvalReport> {
+    evaluate_ttt_model_optional_file::<B>(config, None, device, steps)
+}
+
+fn evaluate_ttt_model_optional_file<B: step::TttSparsePatchifyBackend>(
+    config: &BurnJepaTrainConfig,
+    model_path: Option<PathBuf>,
     device: &B::Device,
     steps: usize,
 ) -> Result<TttEvalReport> {
     config.validate_for_ttt()?;
     let steps = steps.max(1);
     let start = Instant::now();
-    let model_path = model_path.as_ref().to_path_buf();
     fs::create_dir_all(&config.model.output_dir)
         .with_context(|| format!("create {}", config.model.output_dir.display()))?;
 
     let teacher = load_teacher_model::<B>(config, device)?;
     let base = load_student_model::<B>(config, device)?;
-    let mut model = VJepaTttModel::from_model(base, config.ttt.clone(), device)?
-        .load_file(
-            model_path.clone(),
-            &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
-            device,
-        )
-        .with_context(|| format!("load TTT model {}", model_path.display()))?;
+    let mut model = VJepaTttModel::from_model(base, config.ttt.clone(), device)?;
+    if let Some(path) = &model_path {
+        model = model
+            .load_file(
+                path.clone(),
+                &NamedMpkFileRecorder::<FullPrecisionSettings>::default(),
+                device,
+            )
+            .with_context(|| format!("load TTT model {}", path.display()))?;
+    }
     model.set_backprop_mode(crate::TttBackpropMode::FinalFeature);
     let memory = metrics::ttt_memory_metrics_for_batch_size(
         config,
@@ -801,12 +860,18 @@ pub fn evaluate_ttt_model_file<B: step::TttSparsePatchifyTrainingBackend>(
     );
     let report_path = config.model.output_dir.join("ttt-eval-report.json");
     let report = TttEvalReport {
+        model_kind: if model_path.is_some() {
+            TttEvalModelKind::Checkpoint
+        } else {
+            TttEvalModelKind::BaseSparseZeroInitTtt
+        },
         model_path,
         eval_steps: steps,
         eval_samples,
         loss: eval.loss,
         feature_loss: eval.feature_loss,
         predictor_loss: eval.predictor_loss,
+        regularizer_loss: eval.regularizer_loss,
         cosine: eval.cosine,
         teacher_forced_loss: eval.teacher_forced_loss,
         teacher_forced_cosine: eval.teacher_forced_cosine,
@@ -818,11 +883,13 @@ pub fn evaluate_ttt_model_file<B: step::TttSparsePatchifyTrainingBackend>(
         mask: mask_metrics,
         rollout,
         target_supervision: metrics::target_supervision_metrics(config),
+        latent_regularization: metrics::latent_regularization_metrics(config),
         stage: eval.stage,
         domains: eval.domains,
         utilization: eval.utilization,
         temporal_diagnostics: eval.temporal_diagnostics,
         temporal_segments: eval.temporal_segments,
+        long_rollout: eval.long_rollout,
         stream: eval.stream,
         elapsed_ms,
         samples_per_second: samples_per_second(eval_samples, elapsed_ms),
@@ -842,7 +909,7 @@ pub(super) fn timed<T>(metric_ms: &mut u128, f: impl FnOnce() -> Result<T>) -> R
     output
 }
 
-pub(super) fn teacher_tokens_for_batch<B: step::TttSparsePatchifyTrainingBackend>(
+pub(super) fn teacher_tokens_for_batch<B: step::TttSparsePatchifyBackend>(
     teacher: &crate::VJepa2_1Model<B>,
     video: burn::tensor::Tensor<B, 5>,
     metadata: &[crate::JepaSampleMetadata],
@@ -894,6 +961,10 @@ fn teacher_cache_key(
         return key;
     }
     for (row_index, row) in metadata.iter().enumerate() {
+        if let Some(cache_id) = &row.cache_id {
+            let _ = write!(key, ":row{row_index}:cache={cache_id}");
+            continue;
+        }
         let has_identity =
             row.clip_id.is_some() || row.source.is_some() || row.start_frame.is_some();
         if !has_identity {

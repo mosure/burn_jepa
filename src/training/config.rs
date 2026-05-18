@@ -119,6 +119,7 @@ impl BurnJepaTrainConfig {
             self.loss.feature_loss_weight > 0.0 || self.loss.predictor_loss_weight > 0.0,
             "at least one loss weight must be positive"
         );
+        self.loss.validate()?;
         self.training.sparse_rollout.validate(
             self.training.mask.is_some(),
             self.loss.predictor_loss_weight,
@@ -369,6 +370,7 @@ pub struct TttStreamTrainingConfig {
     pub enabled: bool,
     pub detach_between_steps: bool,
     pub reset_on_clip_change: bool,
+    pub reset_on_scene_change: bool,
     pub reset_on_non_monotonic_start: bool,
     pub reset_interval_steps: usize,
     pub state_decay: f64,
@@ -384,6 +386,7 @@ impl Default for TttStreamTrainingConfig {
             enabled: false,
             detach_between_steps: true,
             reset_on_clip_change: true,
+            reset_on_scene_change: false,
             reset_on_non_monotonic_start: true,
             reset_interval_steps: 0,
             state_decay: 1.0,
@@ -711,6 +714,7 @@ impl TttSparsePatchifyTrainingMode {
 pub struct TttDistillationConfig {
     pub feature_loss_weight: f32,
     pub predictor_loss_weight: f32,
+    pub latent_regularization: TttLatentRegularizationConfig,
 }
 
 impl Default for TttDistillationConfig {
@@ -718,6 +722,78 @@ impl Default for TttDistillationConfig {
         Self {
             feature_loss_weight: 1.0,
             predictor_loss_weight: 0.0,
+            latent_regularization: TttLatentRegularizationConfig::default(),
         }
+    }
+}
+
+impl TttDistillationConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.feature_loss_weight.is_finite() && self.feature_loss_weight >= 0.0,
+            "loss.feature_loss_weight must be finite and non-negative"
+        );
+        ensure!(
+            self.predictor_loss_weight.is_finite() && self.predictor_loss_weight >= 0.0,
+            "loss.predictor_loss_weight must be finite and non-negative"
+        );
+        self.latent_regularization.validate()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TttLatentRegularizationConfig {
+    pub weight: f32,
+    pub mean_weight: f32,
+    pub variance_weight: f32,
+    pub covariance_weight: f32,
+    pub target_variance: f32,
+    pub covariance_sketch_dim: usize,
+}
+
+impl Default for TttLatentRegularizationConfig {
+    fn default() -> Self {
+        Self {
+            weight: 0.0,
+            mean_weight: 1.0,
+            variance_weight: 1.0,
+            covariance_weight: 0.0,
+            target_variance: 1.0,
+            covariance_sketch_dim: 64,
+        }
+    }
+}
+
+impl TttLatentRegularizationConfig {
+    pub fn active(&self) -> bool {
+        self.weight > 0.0
+            && (self.mean_weight > 0.0
+                || self.variance_weight > 0.0
+                || self.covariance_weight > 0.0)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.weight.is_finite() && self.weight >= 0.0,
+            "loss.latent_regularization.weight must be finite and non-negative"
+        );
+        ensure!(
+            self.mean_weight.is_finite() && self.mean_weight >= 0.0,
+            "loss.latent_regularization.mean_weight must be finite and non-negative"
+        );
+        ensure!(
+            self.variance_weight.is_finite() && self.variance_weight >= 0.0,
+            "loss.latent_regularization.variance_weight must be finite and non-negative"
+        );
+        ensure!(
+            self.covariance_weight.is_finite() && self.covariance_weight >= 0.0,
+            "loss.latent_regularization.covariance_weight must be finite and non-negative"
+        );
+        ensure!(
+            self.target_variance.is_finite() && self.target_variance > 0.0,
+            "loss.latent_regularization.target_variance must be finite and positive"
+        );
+        Ok(())
     }
 }

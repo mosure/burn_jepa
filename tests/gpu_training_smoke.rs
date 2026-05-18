@@ -68,7 +68,7 @@ fn cuda_ttt_training_sparse_patchify_smoke_runs_when_requested() {
         .expect("cuda sparse patchify TTT runtime smoke");
 
     assert_ttt_smoke_report_is_numerically_stable(&report, 1, 1);
-    assert!(report.rollout.autodiff_sparse_patchify);
+    assert!(report.rollout.frozen_sparse_patchify);
 }
 
 #[cfg(feature = "webgpu")]
@@ -151,7 +151,7 @@ fn wgpu_ttt_training_sparse_patchify_smoke_runs_when_requested() {
         .expect("wgpu sparse patchify TTT runtime smoke");
 
     assert_ttt_smoke_report_is_numerically_stable(&report, 1, 1);
-    assert!(report.rollout.autodiff_sparse_patchify);
+    assert!(report.rollout.frozen_sparse_patchify);
 }
 
 #[cfg(any(

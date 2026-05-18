@@ -43,7 +43,11 @@
     <video id="webcam" autoplay muted playsinline></video>
     <div id="status">loading bevy_jepa...</div>
     <script type="module">
-      import init, { frame_input } from "./out/bevy_jepa.js";
+      import init, {
+        anyup_model_package_input,
+        frame_input,
+        jepa_model_package_input,
+      } from "./out/bevy_jepa.js";
 
       const status = document.querySelector("#status");
       const video = document.querySelector("#webcam");
@@ -51,6 +55,9 @@
       const defaultModelRoot =
         "https://aberration.technology/model/burn_jepa";
       const defaultModelProfile = "vjepa2_1_ttt";
+      const defaultAnyupRoot =
+        "https://aberration.technology/model/burn_anyup";
+      const defaultAnyupProfile = "anyup_multi_backbone";
       window.__jepaFrameStats = {
         count: 0,
         firstFrameMs: null,
@@ -69,6 +76,9 @@
             if (modelLoadingEnabled() && hasExplicitModelPackage()) {
               await preloadModelPackage();
             }
+            if (anyupPackageShouldPreload()) {
+              await preloadAnyupModelPackage();
+            }
             window.__jepaWasmSkipped = "WebGPU unavailable";
             setStatus("bevy_jepa WebGPU unavailable; source preview running without inference");
             await startFrameSource();
@@ -76,6 +86,9 @@
           }
           if (modelLoadingEnabled()) {
             await preloadModelPackage();
+            if (anyupPackageShouldPreload()) {
+              await preloadAnyupModelPackage();
+            }
           } else {
             setStatus("bevy_jepa model load disabled");
           }
@@ -160,6 +173,75 @@
         }
       }
 
+      function anyupPackageRequired() {
+        return hasExplicitAnyupPackage() || anyupLoadingExplicitlyEnabled() || anyupHighResRequested();
+      }
+
+      function anyupPackageShouldPreload() {
+        if (anyupLoadingExplicitlyDisabled()) {
+          return false;
+        }
+        return modelLoadingEnabled() || anyupPackageRequired();
+      }
+
+      function anyupLoadingExplicitlyEnabled() {
+        const value = params.get("load-anyup");
+        return value != null && !["0", "false", "no", "off"].includes(value.toLowerCase());
+      }
+
+      function anyupLoadingExplicitlyDisabled() {
+        const value = params.get("load-anyup");
+        return value != null && ["0", "false", "no", "off"].includes(value.toLowerCase());
+      }
+
+      function anyupHighResRequested() {
+        const highResEvery = Number(params.get("high-res-pca-every") ?? "0");
+        return Number.isFinite(highResEvery) && highResEvery > 0;
+      }
+
+      function hasExplicitAnyupPackage() {
+        return (
+          params.has("anyup-model-manifest") ||
+          params.has("anyup-model-manifest-url") ||
+          params.has("anyup-model-base") ||
+          params.has("anyup-model-base-url") ||
+          params.has("anyup-model-profile") ||
+          params.has("anyup-model-name")
+        );
+      }
+
+      async function preloadAnyupModelPackage() {
+        const manifestUrl = anyupManifestUrl();
+        logStatus(`loading AnyUp package ${manifestUrl}`);
+        try {
+          const manifest = await fetchJson(manifestUrl);
+          const partsManifestUrl = resolvePartsManifestUrl(manifestUrl, manifest, "anyup.bpk");
+          const partsManifest = await fetchJson(partsManifestUrl);
+          const parts = [];
+          for (const part of partsManifest.parts ?? []) {
+            const partUrl = joinUrl(parentUrl(partsManifestUrl), part.path);
+            parts.push(await fetchBytes(partUrl));
+          }
+          window.__burnAnyupModelPackage = {
+            manifestJson: JSON.stringify(manifest),
+            parts,
+          };
+          window.__jepaAnyupModelPackageStats = {
+            manifestUrl,
+            partsManifestUrl,
+            parts: parts.length,
+            bytes: parts.reduce((sum, bytes) => sum + bytes.byteLength, 0),
+          };
+          logStatus(`AnyUp package loaded (${parts.length} shard${parts.length === 1 ? "" : "s"})`);
+        } catch (error) {
+          window.__burnAnyupModelPackageError = error?.message ?? String(error);
+          warnStatus("bevy_jepa AnyUp package unavailable", error);
+          if (anyupPackageRequired()) {
+            throw error;
+          }
+        }
+      }
+
       function modelManifestUrl() {
         const explicit = params.get("model-manifest") || params.get("model-manifest-url");
         if (explicit) {
@@ -170,6 +252,40 @@
           return joinUrl(base, "manifest.json");
         }
         return joinUrl(joinUrl(defaultModelRoot, modelProfile()), "manifest.json");
+      }
+
+      function anyupManifestUrl() {
+        const explicit =
+          params.get("anyup-model-manifest") ||
+          params.get("anyup-model-manifest-url");
+        if (explicit) {
+          return explicit;
+        }
+        const base =
+          params.get("anyup-model-base") ||
+          params.get("anyup-model-base-url");
+        if (base) {
+          return joinUrl(base, "manifest.json");
+        }
+        return joinUrl(joinUrl(defaultAnyupRoot, anyupProfile()), "manifest.json");
+      }
+
+      function anyupProfile() {
+        const raw =
+          params.get("anyup-model-profile") ||
+          params.get("anyup-model-name") ||
+          defaultAnyupProfile;
+        switch (raw.trim().toLowerCase()) {
+          case "anyup_multi_backbone":
+          case "anyup-multi-backbone":
+          case "multi_backbone":
+          case "multi-backbone":
+          case "default":
+          case "paper":
+            return "anyup_multi_backbone";
+          default:
+            throw new Error(`unsupported anyup-model-profile ${raw}`);
+        }
       }
 
       function modelProfile() {
@@ -198,7 +314,7 @@
         }
       }
 
-      function resolvePartsManifestUrl(manifestUrl, manifest) {
+      function resolvePartsManifestUrl(manifestUrl, manifest, defaultBurnpack = "jepa.bpk") {
         const partsManifest =
           manifest.parts_manifest ||
           manifest.partsManifest ||
@@ -208,7 +324,7 @@
           return joinUrl(parentUrl(manifestUrl), partsManifest);
         }
         const burnpack =
-          manifest.burnpack || manifest.model?.burnpack || "jepa.bpk";
+          manifest.burnpack || manifest.model?.burnpack || defaultBurnpack;
         return joinUrl(parentUrl(manifestUrl), `${burnpack}.parts.json`);
       }
 

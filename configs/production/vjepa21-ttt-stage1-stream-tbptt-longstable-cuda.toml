@@ -3,7 +3,8 @@ checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
-output_dir = "target/burn-jepa-production-final-256/stage1-stream-tbptt"
+ttt_checkpoint_path = "target/burn-jepa-production-final-256/stage1-stream-tbptt-sigreg/ttt-model.mpk"
+output_dir = "target/burn-jepa-production-final-256/stage1-stream-tbptt-longstable"
 save_model = true
 
 [dataset]
@@ -15,6 +16,8 @@ frames = 16
 stride = 1
 image_size = 256
 synthetic_len = 1
+repeat_count = 4
+repeat_mode = "continuous_streams"
 
 [ttt]
 layer_placement = "explicit"
@@ -34,51 +37,51 @@ freeze_pretrained = true
 
 [training]
 backend = "cuda"
-batch_size = 4
-max_steps = 1024
-learning_rate = 0.0000025
+batch_size = 2
+max_steps = 128
+learning_rate = 0.0000015
 weight_decay = 0.0
 context_keep_ratio = 0.75
 sparse_rollout = "context_mask"
 sparse_patchify_training = "frozen_sparse_patchify"
 batching = "packed_streams"
-loss_trace_interval = 64
+loss_trace_interval = 16
 eval_steps = 0
 eval_batch_size = 2
 eval_full_grid = false
 eval_utilization_diagnostics = false
 eval_temporal_diagnostics = false
-cache_teacher_tokens = false
-teacher_cache_max_entries = 0
+cache_teacher_tokens = true
+teacher_cache_max_entries = 512
 prefetch_batches = true
-save_steps = 256
+save_steps = 64
 
 [training.stream]
 enabled = true
 detach_between_steps = true
 reset_on_clip_change = true
 reset_on_non_monotonic_start = true
-reset_interval_steps = 4
-state_decay = 0.97
+reset_interval_steps = 16
+state_decay = 0.98
 state_l2_weight = 0.000001
-update_l2_weight = 0.00001
+update_l2_weight = 0.00002
 state_regularization_width = 64
 
 [training.stream.curriculum]
 enabled = true
-initial_reset_interval_steps = 1
-final_reset_interval_steps = 4
-warmup_steps = 512
+initial_reset_interval_steps = 2
+final_reset_interval_steps = 16
+warmup_steps = 96
 
 [training.dense_samples]
 enabled = true
-warmup_steps = 128
-interval_steps = 16
+warmup_steps = 48
+interval_steps = 32
 
 [training.lr_schedule]
 kind = "linear_warmup_cosine"
-warmup_steps = 512
-min_learning_rate = 0.0000005
+warmup_steps = 64
+min_learning_rate = 0.00000025
 
 [training.mask]
 kind = "manifest_precomputed_masks"
@@ -86,3 +89,11 @@ kind = "manifest_precomputed_masks"
 [loss]
 feature_loss_weight = 1.0
 predictor_loss_weight = 0.0
+
+[loss.latent_regularization]
+weight = 0.00001
+mean_weight = 1.0
+variance_weight = 1.0
+covariance_weight = 0.25
+target_variance = 1.0
+covariance_sketch_dim = 64

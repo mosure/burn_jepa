@@ -5,11 +5,12 @@ use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::{Tensor, TensorData};
 use burn_jepa::{
     BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseMaskBatch,
-    SparseTokenMask, TttBackpropMode, TttEncoderConfig, TttLayerPlacement, TttLayerState,
-    TttMemoryUpdateSource, TttRolloutReportMode, TttSparsePatchifyTrainingMode,
+    SparseTokenMask, TttBackpropMode, TttEncoderConfig, TttEvalModelKind, TttLayerPlacement,
+    TttLayerState, TttMemoryUpdateSource, TttRolloutReportMode, TttSparsePatchifyTrainingMode,
     TttSparseRolloutMode, TttStreamStepKind, TttSupervisionMode, TttTargetMode, VJepa2_1Model,
-    VJepaTttLayer, VJepaTttModel, apply_token_mask, evaluate_ttt_model_file,
-    load_jepa_tensor_batch, synthetic_video, train_dense_jepa, train_ttt_distillation,
+    VJepaTttLayer, VJepaTttModel, apply_token_mask, evaluate_ttt_base_sparse,
+    evaluate_ttt_model_file, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
+    train_ttt_distillation,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -49,6 +50,9 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
         min_learning_rate: 1.0e-5,
     };
     config.loss.predictor_loss_weight = 0.25;
+    config.loss.latent_regularization.weight = 1.0e-4;
+    config.loss.latent_regularization.covariance_weight = 0.25;
+    config.loss.latent_regularization.covariance_sketch_dim = 8;
 
     let toml = config.to_toml_string().expect("serialize config");
     assert!(toml.contains("[ttt]"));
@@ -60,6 +64,7 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     assert!(toml.contains("[training.lr_schedule]"));
     assert!(toml.contains("kind = \"linear_warmup_cosine\""));
     assert!(toml.contains("[loss]"));
+    assert!(toml.contains("[loss.latent_regularization]"));
 
     let parsed: burn_jepa::training::BurnJepaTrainConfig =
         toml::from_str(&toml).expect("parse config");
@@ -83,6 +88,9 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
         burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine { .. }
     ));
     assert_eq!(parsed.loss.predictor_loss_weight, 0.25);
+    assert_eq!(parsed.loss.latent_regularization.weight, 1.0e-4);
+    assert_eq!(parsed.loss.latent_regularization.covariance_weight, 0.25);
+    assert_eq!(parsed.loss.latent_regularization.covariance_sketch_dim, 8);
 }
 
 #[test]
@@ -122,6 +130,54 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
         "../configs/production/vjepa21-ttt-stream-eval-cuda.toml"
     ))
     .expect("parse stream eval production config");
+    let stable_stream: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-stream-tbptt-stable-cuda.toml"
+    ))
+    .expect("parse stable stream production config");
+    let verified_stream: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-stream-tbptt-verified-cuda.toml"
+    ))
+    .expect("parse verified stream production config");
+    let sigreg_stream: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-stream-tbptt-sigreg-cuda.toml"
+    ))
+    .expect("parse SIGReg stream production config");
+    let verified_lowlr_stream: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-stream-tbptt-verified-lowlr-cuda.toml"
+    ))
+    .expect("parse verified low-lr stream production config");
+    let stable_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stream-eval-stable-cuda.toml"
+    ))
+    .expect("parse stable stream eval config");
+    let dense_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-dense-eval-stable-cuda.toml"
+    ))
+    .expect("parse stable dense eval config");
+    let long_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-long-rollout-eval-cuda.toml"
+    ))
+    .expect("parse long rollout eval config");
+    let long_dense_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-long-rollout-dense-eval-cuda.toml"
+    ))
+    .expect("parse dense long rollout eval config");
+    let verylong_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-long-rollout-verylong-cuda.toml"
+    ))
+    .expect("parse very long rollout eval config");
+    let base_sparse_verylong_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-base-sparse-long-rollout-verylong-cuda.toml"
+    ))
+    .expect("parse base sparse very long rollout eval config");
+    let reset_window_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-long-rollout-reset-window-cuda.toml"
+    ))
+    .expect("parse reset-window long rollout eval config");
+    let sigreg_long_eval: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-long-rollout-sigreg-cuda.toml"
+    ))
+    .expect("parse SIGReg long rollout eval config");
     let stage2: BurnJepaTrainConfig = toml::from_str(include_str!(
         "../configs/production/vjepa21-ttt-stage2-unfrozen-low-lr-cuda.toml"
     ))
@@ -161,11 +217,69 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
     assert!(stream.training.prefetch_batches);
     assert!(!stream.training.cache_teacher_tokens);
     assert_eq!(stream.training.teacher_cache_max_entries, 0);
+    assert!(stream.training.dense_samples.enabled);
+    assert_eq!(stream.training.dense_samples.warmup_steps, 128);
+    assert_eq!(stream.training.dense_samples.interval_steps, 16);
     assert_eq!(stream.training.stream.state_regularization_width, 64);
     assert!(stream.dataset.image_size >= 256);
     assert_eq!(
         stream.training.batching,
         burn_jepa::TrainingBatchingMode::PackedStreams
+    );
+    assert!(stable_stream.training.dense_samples.enabled);
+    assert_eq!(stable_stream.training.dense_samples.warmup_steps, 128);
+    assert_eq!(stable_stream.training.dense_samples.interval_steps, 16);
+    assert!(
+        stable_stream
+            .model
+            .output_dir
+            .ends_with("stage1-stream-tbptt-stable")
+    );
+    assert!(verified_stream.training.dense_samples.enabled);
+    assert_eq!(verified_stream.training.dense_samples.warmup_steps, 48);
+    assert_eq!(verified_stream.training.dense_samples.interval_steps, 16);
+    assert_eq!(verified_stream.training.max_steps, 160);
+    assert_eq!(
+        verified_stream.training.stream.reset_interval_for_step(0),
+        1
+    );
+    assert_eq!(
+        verified_stream
+            .training
+            .stream
+            .reset_interval_for_step(verified_stream.training.max_steps - 1),
+        4
+    );
+    assert!(
+        verified_stream
+            .model
+            .output_dir
+            .ends_with("stage1-stream-tbptt-verified")
+    );
+    assert!(sigreg_stream.loss.latent_regularization.active());
+    assert_eq!(sigreg_stream.loss.latent_regularization.weight, 1.0e-5);
+    assert_eq!(
+        sigreg_stream.training.max_steps,
+        verified_stream.training.max_steps
+    );
+    assert_eq!(
+        sigreg_stream.training.sparse_rollout,
+        verified_stream.training.sparse_rollout
+    );
+    assert!(
+        sigreg_stream
+            .model
+            .output_dir
+            .ends_with("stage1-stream-tbptt-sigreg")
+    );
+    assert!(verified_lowlr_stream.model.ttt_checkpoint_path.is_some());
+    assert!(verified_lowlr_stream.training.learning_rate < verified_stream.training.learning_rate);
+    assert_eq!(verified_lowlr_stream.training.max_steps, 96);
+    assert!(
+        verified_lowlr_stream
+            .model
+            .output_dir
+            .ends_with("stage1-stream-tbptt-verified-lowlr")
     );
 
     assert!(stream_eval.training.stream.enabled);
@@ -177,6 +291,80 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
     );
     assert_eq!(stream_eval.training.stream.reset_interval_steps, 4);
     assert!(!stream_eval.training.stream.curriculum.enabled);
+    assert!(stable_eval.training.eval_temporal_diagnostics);
+    assert!(stable_eval.training.eval_utilization_diagnostics);
+    assert_eq!(stable_eval.training.effective_eval_batch_size(), 4);
+    assert_eq!(
+        dense_eval.training.sparse_rollout,
+        burn_jepa::TttSparseRolloutMode::Dense
+    );
+    assert!(dense_eval.training.eval_full_grid);
+    assert_eq!(
+        long_eval.training.batching,
+        burn_jepa::TrainingBatchingMode::Sequential
+    );
+    assert_eq!(long_eval.training.effective_eval_batch_size(), 1);
+    assert_eq!(long_eval.training.stream.reset_interval_steps, 0);
+    assert!(long_eval.training.eval_temporal_diagnostics);
+    assert_eq!(
+        long_dense_eval.training.sparse_rollout,
+        burn_jepa::TttSparseRolloutMode::Dense
+    );
+    assert_eq!(
+        long_dense_eval.training.batching,
+        burn_jepa::TrainingBatchingMode::Sequential
+    );
+    assert!(long_dense_eval.training.eval_full_grid);
+    assert_eq!(
+        verylong_eval.training.batching,
+        burn_jepa::TrainingBatchingMode::Sequential
+    );
+    assert_eq!(verylong_eval.training.effective_eval_batch_size(), 1);
+    assert_eq!(verylong_eval.training.eval_steps, 164);
+    assert_eq!(verylong_eval.training.stream.reset_interval_steps, 0);
+    assert!(!verylong_eval.training.eval_temporal_diagnostics);
+    assert_eq!(
+        base_sparse_verylong_eval.training.sparse_rollout,
+        verylong_eval.training.sparse_rollout
+    );
+    assert_eq!(
+        base_sparse_verylong_eval.training.sparse_patchify_training,
+        verylong_eval.training.sparse_patchify_training
+    );
+    assert_eq!(
+        base_sparse_verylong_eval
+            .training
+            .effective_eval_batch_size(),
+        verylong_eval.training.effective_eval_batch_size()
+    );
+    assert!(
+        base_sparse_verylong_eval
+            .model
+            .output_dir
+            .ends_with("long-rollout-base-sparse")
+    );
+    assert_eq!(reset_window_eval.training.stream.reset_interval_steps, 1);
+    assert_eq!(
+        reset_window_eval.training.eval_steps,
+        verylong_eval.training.eval_steps
+    );
+    assert_eq!(
+        reset_window_eval.training.sparse_rollout,
+        verylong_eval.training.sparse_rollout
+    );
+    assert!(sigreg_long_eval.loss.latent_regularization.active());
+    assert_eq!(
+        sigreg_long_eval.training.batching,
+        verylong_eval.training.batching
+    );
+    assert_eq!(
+        sigreg_long_eval.training.effective_eval_batch_size(),
+        verylong_eval.training.effective_eval_batch_size()
+    );
+    assert_eq!(
+        sigreg_long_eval.training.stream.reset_interval_steps,
+        verylong_eval.training.stream.reset_interval_steps
+    );
 
     assert_eq!(stage2.ttt.layers, vec![3, 7, 11]);
     assert!(stage2.dataset.image_size >= 256);
@@ -784,6 +972,9 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
     config.training.eval_utilization_diagnostics = true;
     config.training.eval_temporal_diagnostics = true;
     config.training.learning_rate = 5.0e-3;
+    config.loss.latent_regularization.weight = 1.0e-5;
+    config.loss.latent_regularization.covariance_weight = 0.25;
+    config.loss.latent_regularization.covariance_sketch_dim = 4;
     config.dataset.synthetic_len = 1;
     let report = train_ttt_distillation::<AB>(&config, &device).expect("training smoke");
 
@@ -794,9 +985,16 @@ fn ttt_distillation_training_smoke_improves_tiny_loss() {
     assert!(report.best_loss.is_finite());
     assert!(report.final_loss.is_finite());
     assert!(report.pre_train_eval_loss.is_some());
+    assert!(
+        report
+            .pre_train_eval_regularizer_loss
+            .is_some_and(f64::is_finite)
+    );
     assert!(report.pre_train_eval_cosine.is_some());
     assert!(report.eval_loss.is_some());
+    assert!(report.eval_regularizer_loss.is_some_and(f64::is_finite));
     assert!(report.eval_cosine.is_some());
+    assert!(report.latent_regularization.active);
     assert_eq!(report.target_supervision.mode, TttTargetMode::TeacherFinal);
     assert_eq!(
         report.target_supervision.memory_update,
@@ -1336,12 +1534,53 @@ fn ttt_stream_eval_carries_manifest_state_between_windows() {
     let model_path = train.model_path.expect("saved stream eval model");
     let eval = evaluate_ttt_model_file::<AB>(&config, model_path, &device, 2).expect("stream eval");
 
+    assert_eq!(eval.model_kind, TttEvalModelKind::Checkpoint);
+    assert!(eval.model_path.is_some());
     assert!(eval.stream.enabled);
     assert_eq!(eval.stream.reset_steps, 1);
     assert_eq!(eval.stream.carried_steps, 1);
     assert_eq!(eval.stream.detached_steps, 2);
     assert_eq!(eval.stream.optimizer_steps, None);
+    let long_rollout = eval
+        .long_rollout
+        .as_ref()
+        .expect("stream eval should report longitudinal rollout metrics");
+    assert_eq!(long_rollout.samples, 2);
+    assert_eq!(long_rollout.windows, 2);
+    assert_eq!(long_rollout.streams, 1);
+    assert_eq!(long_rollout.longest_stream_windows, 2);
+    assert_eq!(long_rollout.longest_consecutive_windows, 2);
+    assert_eq!(
+        long_rollout
+            .segments
+            .iter()
+            .map(|s| s.samples)
+            .sum::<usize>(),
+        2
+    );
+    assert!(
+        long_rollout
+            .late_minus_early_loss
+            .is_some_and(f64::is_finite)
+    );
+    assert!(
+        long_rollout
+            .stream_segments
+            .iter()
+            .all(|stream| stream.loss.is_finite() && stream.cosine.is_finite())
+    );
     assert!(eval.loss.is_finite());
+
+    let base_eval =
+        evaluate_ttt_base_sparse::<AB>(&config, &device, 2).expect("base sparse stream eval");
+    assert_eq!(
+        base_eval.model_kind,
+        TttEvalModelKind::BaseSparseZeroInitTtt
+    );
+    assert!(base_eval.model_path.is_none());
+    assert_eq!(base_eval.stream.reset_steps, 1);
+    assert_eq!(base_eval.stream.carried_steps, 1);
+    assert!(base_eval.loss.is_finite());
 }
 
 #[test]
@@ -1445,7 +1684,7 @@ fn ttt_sparse_rollout_training_smoke_uses_target_mask() {
     assert_eq!(report.rollout.mode, TttRolloutReportMode::SparseTarget);
     assert_eq!(report.rollout.dense_tokens, 8);
     assert_eq!(report.rollout.student_tokens, 2);
-    assert!(!report.rollout.autodiff_sparse_patchify);
+    assert!(!report.rollout.frozen_sparse_patchify);
     assert!(report.final_loss.is_finite());
     assert!(report.eval_loss.is_some_and(f64::is_finite));
     assert!(report.teacher_forced_eval_loss.is_none());

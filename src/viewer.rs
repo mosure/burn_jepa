@@ -1,7 +1,7 @@
 use crate::{
     FeaturePcaUpdateConfig, FeaturePcaUpdateMode, SparseJepaAnyUpPcaMeasurementConfig,
-    SparseJepaPatchDiffSparsityConfig, SparseTokenMask, TokenGridShape, coords_to_token_index,
-    patch_diff_context_mask_from_scores,
+    SparseJepaPatchDiffSparsityConfig, SparseTokenMask, TokenGridShape, TttRuntimeStateConfig,
+    coords_to_token_index, patch_diff_context_mask_from_scores,
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -575,6 +575,8 @@ pub struct FeatureFrameViewerConfig {
     pub pca_update_iterations: usize,
     /// High-resolution AnyUp PCA cadence; zero disables the high-res worker by default.
     pub high_res_pca_every: u64,
+    /// Runtime TTT fast-memory policy used by the viewer pipeline.
+    pub ttt_runtime: TttRuntimeStateConfig,
     /// Collect stage timings.
     pub measure_stages: bool,
     /// Synchronize the backend around measurements.
@@ -601,6 +603,7 @@ impl Default for FeatureFrameViewerConfig {
             pca_min_sample_frames: DEFAULT_PCA_MIN_SAMPLE_FRAMES,
             pca_update_iterations: DEFAULT_PCA_UPDATE_ITERATIONS,
             high_res_pca_every: DEFAULT_HIGH_RES_PCA_EVERY,
+            ttt_runtime: TttRuntimeStateConfig::default(),
             measure_stages: true,
             sync_measurements: false,
         }

@@ -120,6 +120,23 @@ impl<B: Backend> VJepaTttModel<B> {
             .forward_image_with_mask_batch_state(image, mask, target_tokens, state)
     }
 
+    pub fn encode_image_batch_with_state_options(
+        &self,
+        image: Tensor<B, 4>,
+        mask: SparseMaskBatch<B>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.encoder.forward_image_with_mask_batch_state_options(
+            image,
+            mask,
+            target_tokens,
+            state,
+            update_fast_weight,
+        )
+    }
+
     pub fn forward_sparse(
         &self,
         video: Tensor<B, 5>,
@@ -278,6 +295,24 @@ impl VJepaTttModel<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         self.encoder
             .forward_single_frame_rollout_sparse_patchify_wgpu(video, mask, target_tokens, state)
     }
+
+    pub fn forward_single_frame_rollout_sparse_patchify_wgpu_options(
+        &self,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
+        state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.encoder
+            .forward_single_frame_rollout_sparse_patchify_wgpu_options(
+                video,
+                mask,
+                target_tokens,
+                state,
+                update_fast_weight,
+            )
+    }
 }
 
 #[cfg(feature = "sparse-patchify-wgpu")]
@@ -295,6 +330,24 @@ impl VJepaTttModel<burn::backend::Wgpu<f32, i32>> {
                 plan,
                 target_tokens,
                 state,
+            )
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_fusion_batch_state_options(
+        &self,
+        image: Tensor<burn::backend::Wgpu<f32, i32>, 4>,
+        plan: &crate::SparsePatchifyBatchPlan<burn::backend::Wgpu<f32, i32>>,
+        target_tokens: Option<Tensor<burn::backend::Wgpu<f32, i32>, 3>>,
+        state: &mut TttState<burn::backend::Wgpu<f32, i32>>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<burn::backend::Wgpu<f32, i32>>> {
+        self.encoder
+            .forward_image_sparse_patchify_wgpu_fusion_batch_state_options(
+                image,
+                plan,
+                target_tokens,
+                state,
+                update_fast_weight,
             )
     }
 

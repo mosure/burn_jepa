@@ -1,8 +1,9 @@
 use bevy::app::AppExit;
 use bevy_jepa::{
-    BevyJepaConfig, BevyJepaEncoderSource, BevyJepaFrameSource, BevyJepaModelPackageProfile,
-    run_app,
+    BevyJepaAnyUpModelPackageProfile, BevyJepaConfig, BevyJepaEncoderSource, BevyJepaFrameSource,
+    BevyJepaModelPackageProfile, run_app,
 };
+use burn_jepa::AnyUpAttentionMode;
 
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_jepa::{
@@ -24,8 +25,8 @@ use bevy_jepa::{
 use burn_jepa::DEFAULT_BURN_JEPA_MODEL_BASE_URL;
 #[cfg(not(target_arch = "wasm32"))]
 use burn_jepa::{
-    AnyUpAttentionMode, FeatureFrameViewerConfig, PatchDiffRefreshConfig,
-    patch_diff_threshold_from_quality,
+    DEFAULT_BURN_ANYUP_MODEL_BASE_URL, FeatureFrameViewerConfig, PatchDiffRefreshConfig,
+    TttRuntimeCollapseGuardAction, TttRuntimeStateConfig, patch_diff_threshold_from_quality,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -74,6 +75,22 @@ struct Cli {
         help = "AnyUp checkpoint path. If omitted, the viewer auto-uses target/burn-anyup-checkpoints/anyup_multi_backbone.pth when present."
     )]
     anyup_weights: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Local burn_anyup package manifest.json. If omitted, AnyUp checks BURN_ANYUP_MODEL_MANIFEST, target/burn_anyup/{anyup_model_profile}/manifest.json, then the auto-downloaded cache."
+    )]
+    anyup_model_manifest: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Exact local cache directory for auto-downloaded burn_anyup model shards."
+    )]
+    anyup_model_cache_dir: Option<PathBuf>,
+    #[arg(long, visible_alias = "anyup-model-name", default_value_t = BevyJepaAnyUpModelPackageProfile::default())]
+    anyup_model_profile: BevyJepaAnyUpModelPackageProfile,
+    #[arg(long, default_value = DEFAULT_BURN_ANYUP_MODEL_BASE_URL)]
+    anyup_model_base_url: String,
+    #[arg(long, action = ArgAction::SetTrue, help = "Disable native AnyUp package auto-download/cache lookup.")]
+    no_anyup_model_download: bool,
     #[arg(long, default_value_t = AnyUpAttentionMode::EfficientLocal)]
     anyup_attention_mode: AnyUpAttentionMode,
     #[arg(long, default_value_t = BevyJepaMaskSource::PatchDiff)]
@@ -170,6 +187,22 @@ struct Cli {
     measure_stages: bool,
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     sync_measurements: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    ttt_runtime_enabled: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    ttt_update_fast_weight: bool,
+    #[arg(long, default_value_t = TttRuntimeStateConfig::default().state_decay_per_frame)]
+    ttt_state_decay_per_frame: f64,
+    #[arg(long, default_value_t = TttRuntimeStateConfig::default().reset_interval_frames)]
+    ttt_reset_interval_frames: u64,
+    #[arg(long, default_value_t = TttRuntimeStateConfig::default().metrics_interval_frames)]
+    ttt_stability_metrics_every: u64,
+    #[arg(long, default_value_t = TttRuntimeStateConfig::default().collapse_guard_enabled, action = ArgAction::Set)]
+    ttt_collapse_guard: bool,
+    #[arg(long, default_value_t = TttRuntimeCollapseGuardAction::default())]
+    ttt_collapse_guard_action: TttRuntimeCollapseGuardAction,
+    #[arg(long, default_value_t = TttRuntimeStateConfig::default().collapse_guard_decay)]
+    ttt_collapse_guard_decay: f64,
     #[arg(long, default_value_t = DEFAULT_CAMERA_WIDTH)]
     camera_width: u32,
     #[arg(long, default_value_t = DEFAULT_CAMERA_HEIGHT)]
@@ -182,6 +215,8 @@ struct Cli {
 impl From<Cli> for BevyJepaConfig {
     fn from(cli: Cli) -> Self {
         let model_base_url = resolve_model_profile_base_url(cli.model_profile, cli.model_base_url);
+        let anyup_model_base_url =
+            resolve_anyup_model_profile_base_url(cli.anyup_model_profile, cli.anyup_model_base_url);
         Self {
             encoder_source: cli.encoder_source,
             model_manifest_path: cli.model_manifest,
@@ -200,6 +235,11 @@ impl From<Cli> for BevyJepaConfig {
             }),
             image_path: cli.image_path,
             anyup_weights: cli.anyup_weights,
+            anyup_model_manifest_path: cli.anyup_model_manifest,
+            anyup_model_cache_dir: cli.anyup_model_cache_dir,
+            anyup_model_profile: cli.anyup_model_profile,
+            anyup_model_base_url,
+            anyup_model_auto_download: !cli.no_anyup_model_download,
             anyup_attention_mode: cli.anyup_attention_mode,
             mask_source: cli.mask_source,
             display_transfer: cli.display_transfer,
@@ -241,6 +281,17 @@ impl From<Cli> for BevyJepaConfig {
                 pca_min_sample_frames: cli.pca_min_sample_frames,
                 pca_update_iterations: cli.pca_update_iterations,
                 high_res_pca_every: cli.high_res_pca_every,
+                ttt_runtime: TttRuntimeStateConfig {
+                    enabled: cli.ttt_runtime_enabled,
+                    update_fast_weight: cli.ttt_update_fast_weight,
+                    state_decay_per_frame: cli.ttt_state_decay_per_frame,
+                    reset_interval_frames: cli.ttt_reset_interval_frames,
+                    metrics_interval_frames: cli.ttt_stability_metrics_every,
+                    collapse_guard_enabled: cli.ttt_collapse_guard,
+                    collapse_guard_action: cli.ttt_collapse_guard_action,
+                    collapse_guard_decay: cli.ttt_collapse_guard_decay,
+                    ..TttRuntimeStateConfig::default()
+                },
                 measure_stages: cli.measure_stages,
                 sync_measurements: cli.sync_measurements,
             },
@@ -259,6 +310,18 @@ fn resolve_model_profile_base_url(
 ) -> String {
     if model_base_url == DEFAULT_BURN_JEPA_MODEL_BASE_URL {
         burn_jepa::burn_jepa_model_profile_base_url(model_profile)
+    } else {
+        model_base_url
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_anyup_model_profile_base_url(
+    model_profile: BevyJepaAnyUpModelPackageProfile,
+    model_base_url: String,
+) -> String {
+    if model_base_url == DEFAULT_BURN_ANYUP_MODEL_BASE_URL {
+        burn_jepa::burn_anyup_model_profile_base_url(model_profile)
     } else {
         model_base_url
     }
@@ -321,6 +384,17 @@ mod tests {
         assert!(default_config.model_manifest_path.is_none());
         assert!(default_config.ttt_model_path.is_none());
         assert!(default_config.model_auto_download);
+        assert!(default_config.anyup_model_manifest_path.is_none());
+        assert!(default_config.anyup_model_auto_download);
+        assert_eq!(
+            default_config.anyup_model_profile,
+            BevyJepaAnyUpModelPackageProfile::AnyupMultiBackbone
+        );
+        assert!(
+            default_config
+                .anyup_model_base_url
+                .ends_with("/anyup_multi_backbone")
+        );
         assert_eq!(
             default_config.model_profile,
             BevyJepaModelPackageProfile::Vjepa21Ttt
@@ -337,6 +411,15 @@ mod tests {
             "--no-model-download",
             "--ttt-model",
             "target/local-ttt.mpk",
+            "--anyup-model-manifest",
+            "target/burn_anyup/anyup_multi_backbone/manifest.json",
+            "--anyup-model-cache-dir",
+            "target/burn-anyup-cache",
+            "--anyup-model-base-url",
+            "http://127.0.0.1:8092",
+            "--no-anyup-model-download",
+            "--anyup-attention-mode",
+            "upstream-masked",
         ]));
         assert_eq!(
             config.model_manifest_path.as_deref(),
@@ -354,6 +437,22 @@ mod tests {
         );
         assert_eq!(config.model_base_url, "http://127.0.0.1:8091");
         assert!(!config.model_auto_download);
+        assert_eq!(
+            config.anyup_model_manifest_path.as_deref(),
+            Some(std::path::Path::new(
+                "target/burn_anyup/anyup_multi_backbone/manifest.json"
+            ))
+        );
+        assert_eq!(
+            config.anyup_model_cache_dir.as_deref(),
+            Some(std::path::Path::new("target/burn-anyup-cache"))
+        );
+        assert_eq!(config.anyup_model_base_url, "http://127.0.0.1:8092");
+        assert!(!config.anyup_model_auto_download);
+        assert_eq!(
+            config.anyup_attention_mode,
+            burn_jepa::AnyUpAttentionMode::UpstreamMasked
+        );
 
         let base_config =
             BevyJepaConfig::from(Cli::parse_from(["bevy_jepa", "--model-profile", "base"]));
@@ -454,6 +553,23 @@ fn wasm_config_from_url() -> BevyJepaConfig {
             BevyJepaModelPackageProfile::Vjepa21Base => BevyJepaEncoderSource::BaseCheckpoint,
             BevyJepaModelPackageProfile::Vjepa21Ttt => BevyJepaEncoderSource::TrainedTtt,
         };
+    }
+    if let Some(value) =
+        query_param("anyup-model-profile").or_else(|| query_param("anyup-model-name"))
+        && let Ok(profile) = value.parse::<BevyJepaAnyUpModelPackageProfile>()
+    {
+        config.anyup_model_profile = profile;
+        config.anyup_model_base_url = burn_jepa::burn_anyup_model_profile_base_url(profile);
+    }
+    if let Some(value) =
+        query_param("anyup-model-base").or_else(|| query_param("anyup-model-base-url"))
+    {
+        config.anyup_model_base_url = value;
+    }
+    if let Some(value) = query_param("anyup-attention-mode").or_else(|| query_param("anyup-mode"))
+        && let Ok(mode) = value.parse::<AnyUpAttentionMode>()
+    {
+        config.anyup_attention_mode = mode;
     }
     if let Some(value) = query_param("source")
         && let Ok(source) = value.parse::<BevyJepaFrameSource>()

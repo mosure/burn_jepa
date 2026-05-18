@@ -8,7 +8,8 @@ use burn_jepa::{
     SparseJepaAnyUpPcaMeasurementConfig, SparseJepaAnyUpPcaPipeline,
     SparseJepaAnyUpPcaPipelineConfig, SparseJepaAnyUpPcaStream, SparseJepaAnyUpPcaStreamConfig,
     SparseJepaPatchDiffSparsityConfig, SparseMaskBatch, SparseTokenMask, TokenGridShape,
-    VJepa2_1Model, VJepaConfig, coords_to_token_index, jepa_feature_tokens_to_nchw,
+    TttRuntimeCollapseGuardAction, TttRuntimeStateConfig, VJepa2_1Model, VJepaConfig,
+    coords_to_token_index, jepa_feature_tokens_to_nchw, measure_feature_token_stability,
     patch_diff_context_mask_from_scores, patch_diff_context_mask_from_video,
 };
 
@@ -1240,6 +1241,68 @@ fn highres_pipeline_step_keeps_hot_path_device_resident() {
             "high-res sparse pipeline hot path should not contain {marker}"
         );
     }
+}
+
+#[test]
+fn ttt_runtime_state_config_validates_guard_parameters() {
+    let valid = TttRuntimeStateConfig {
+        collapse_guard_action: TttRuntimeCollapseGuardAction::Reset,
+        ..TttRuntimeStateConfig::default()
+    };
+    valid.validate().expect("valid runtime config");
+
+    let invalid_decay = TttRuntimeStateConfig {
+        state_decay_per_frame: 1.1,
+        ..TttRuntimeStateConfig::default()
+    };
+    assert!(invalid_decay.validate().is_err());
+
+    let invalid_guard = TttRuntimeStateConfig {
+        metrics_interval_frames: 0,
+        collapse_guard_enabled: true,
+        ..TttRuntimeStateConfig::default()
+    };
+    assert!(invalid_guard.validate().is_err());
+}
+
+#[test]
+fn token_stability_metrics_detect_collapsed_dense_rollout_tokens() {
+    let device = Default::default();
+    let collapsed = Tensor::<B, 3>::from_data(
+        TensorData::new(
+            vec![
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0,
+            ],
+            [1, 4, 4],
+        ),
+        &device,
+    );
+    let diverse = Tensor::<B, 3>::from_data(
+        TensorData::new(
+            vec![
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            [1, 4, 4],
+        ),
+        &device,
+    );
+
+    let collapsed_metrics =
+        measure_feature_token_stability(collapsed).expect("collapsed diagnostics");
+    let diverse_metrics = measure_feature_token_stability(diverse).expect("diverse diagnostics");
+
+    assert!(collapsed_metrics.token_spatial_std_rms < 1.0e-6);
+    assert!(collapsed_metrics.mean_pairwise_token_cosine > 0.99);
+    assert!(collapsed_metrics.collapse_score > 0.99);
+    assert!(diverse_metrics.token_spatial_std_rms > collapsed_metrics.token_spatial_std_rms);
+    assert!(diverse_metrics.mean_pairwise_token_cosine < 0.1);
+    assert!(diverse_metrics.collapse_score < collapsed_metrics.collapse_score);
 }
 
 #[test]

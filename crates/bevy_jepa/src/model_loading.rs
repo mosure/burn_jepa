@@ -9,13 +9,16 @@ use burn::{
     record::{FullPrecisionSettings, NamedMpkFileRecorder},
 };
 use burn_jepa::{
-    AnyUp, AnyUpConfig, AnyUpLoadOptions, FeatureFrameJepaEncoder, VJepa2_1Model, VJepaConfig,
+    AnyUp, AnyUpConfig, AnyUpLoadOptions, BurnAnyUpPackageManifest, FeatureFrameJepaEncoder,
+    VJepa2_1Model, VJepaConfig, load_anyup_burnpack_parts,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_jepa::{
-    BurnJepaModelBootstrapConfig, TttBackpropMode, TttEncoderConfig, TttLayerPlacement,
-    TttMemoryUpdateSource, TttSupervisionMode, VJepaLoadOptions, VJepaTttModel,
-    load_config_from_hf_dir, resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress,
+    BurnAnyUpModelBootstrapConfig, BurnJepaModelBootstrapConfig, TttBackpropMode, TttEncoderConfig,
+    TttLayerPlacement, TttMemoryUpdateSource, TttSupervisionMode, VJepaLoadOptions, VJepaTttModel,
+    load_config_from_hf_dir,
+    resolve_or_bootstrap_burn_anyup_model_package_with_config_and_progress,
+    resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress,
 };
 use burn_jepa::{
     BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, load_ttt_burnpack_parts,
@@ -393,6 +396,80 @@ pub(super) fn effective_anyup_weights(config: &BevyJepaConfig) -> Option<PathBuf
     default_path.exists().then_some(default_path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn effective_anyup_manifest_path(config: &BevyJepaConfig) -> Result<Option<PathBuf>> {
+    if config.high_res_pca_every == 0 {
+        return Ok(None);
+    }
+
+    for (label, path) in [
+        (
+            "BURN_ANYUP_MODEL_MANIFEST",
+            env::var_os("BURN_ANYUP_MODEL_MANIFEST").map(PathBuf::from),
+        ),
+        (
+            "BURN_ANYUP_MODEL_PACKAGE_MANIFEST",
+            env::var_os("BURN_ANYUP_MODEL_PACKAGE_MANIFEST").map(PathBuf::from),
+        ),
+        (
+            "--anyup-model-manifest",
+            config.anyup_model_manifest_path.clone(),
+        ),
+    ] {
+        if let Some(path) = path {
+            let path = resolve_repo_relative_path(path);
+            if path.exists() {
+                return Ok(Some(path));
+            }
+            bail!(
+                "burn_anyup package manifest `{}` from {label} does not exist",
+                path.display()
+            );
+        }
+    }
+
+    let mut local_manifest_paths = vec![crate::default_anyup_model_manifest_path_for_profile(
+        config.anyup_model_profile,
+    )];
+    if config.anyup_model_profile == burn_jepa::BurnAnyUpModelProfile::default() {
+        local_manifest_paths.push(PathBuf::from("target/burn_anyup/manifest.json"));
+    }
+    for path in local_manifest_paths {
+        let path = resolve_repo_relative_path(path);
+        if path.exists() {
+            return Ok(Some(path));
+        }
+    }
+
+    if config.anyup_model_auto_download && env_anyup_model_download_enabled() {
+        let bootstrap = BurnAnyUpModelBootstrapConfig {
+            cache_root: config
+                .anyup_model_cache_dir
+                .clone()
+                .map(resolve_repo_relative_path),
+            model_profile: config.anyup_model_profile,
+            model_base_url: config.anyup_model_base_url.clone(),
+            manifest_url: env::var("BURN_ANYUP_MODEL_MANIFEST_URL").ok(),
+        }
+        .with_env_overrides();
+        let package = resolve_or_bootstrap_burn_anyup_model_package_with_config_and_progress(
+            &bootstrap,
+            |message| log(&format!("bevy_jepa: {message}")),
+        )?;
+        return Ok(Some(package.manifest_path));
+    }
+
+    Ok(None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn env_anyup_model_download_enabled() -> bool {
+    env::var("BURN_ANYUP_MODEL_DOWNLOAD")
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(true)
+}
+
 fn ensure_anyup_load_report_has_critical_weights(
     report: &burn_jepa::AnyUpLoadReport,
     path: &std::path::Path,
@@ -426,10 +503,52 @@ fn ensure_anyup_load_report_has_critical_weights(
     Ok(())
 }
 
+fn ensure_anyup_apply_report_has_critical_weights(
+    report: &burn_jepa::BurnStoreApplyResult,
+    label: &str,
+) -> Result<()> {
+    ensure_apply_report_ok(report)?;
+    let loaded = |needle: &str| report.applied.iter().any(|path| path == needle);
+    for critical in [
+        "image_encoder.pre.weight",
+        "key_encoder.pre.weight",
+        "query_encoder.pre.weight",
+        "key_features_encoder.pre.basis",
+        "aggregation.pre.weight",
+        "cross_decode.conv.weight",
+        "cross_decode.cross_attn.q_proj.weight",
+        "cross_decode.cross_attn.k_proj.weight",
+    ] {
+        if !loaded(critical) {
+            bail!(
+                "AnyUp bpk package `{label}` did not load critical tensor `{critical}`; refusing to show a misleading high-res AnyUp panel"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn load_viewer_anyup(
     config: &BevyJepaConfig,
     device: &JepaBevyDevice,
 ) -> Result<AnyUp<JepaBevyBackend>> {
+    if config.high_res_pca_every == 0 {
+        let anyup_config =
+            AnyUpConfig::tiny_for_tests().with_attention_mode(config.anyup_attention_mode);
+        return AnyUp::<JepaBevyBackend>::new(anyup_config, device)
+            .context("initialize disabled AnyUp viewer placeholder");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    if let Some(package) = crate::platform::camera::anyup_model_package() {
+        return load_wasm_anyup_package(package, config, device);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(package_manifest_path) = effective_anyup_manifest_path(config)? {
+        return load_native_anyup_package(&package_manifest_path, config, device);
+    }
+
     let anyup_weights = effective_anyup_weights(config);
     let mut anyup_config = if anyup_weights.is_some() {
         AnyUpConfig::default()
@@ -455,6 +574,79 @@ pub(super) fn load_viewer_anyup(
             "bevy_jepa: no AnyUp weights configured or found; high-res AnyUp PCA uses the untrained tiny diagnostic module",
         );
     }
+    Ok(anyup)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_wasm_anyup_package(
+    package: crate::platform::camera::WasmModelPackage,
+    config: &BevyJepaConfig,
+    device: &JepaBevyDevice,
+) -> Result<AnyUp<JepaBevyBackend>> {
+    let manifest = BurnAnyUpPackageManifest::from_json_str(&package.manifest_json)?;
+    load_anyup_from_manifest_and_parts(manifest, &package.parts, config, "wasm package", device)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_native_anyup_package(
+    manifest_path: &Path,
+    config: &BevyJepaConfig,
+    device: &JepaBevyDevice,
+) -> Result<AnyUp<JepaBevyBackend>> {
+    let manifest_json = fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "read burn_anyup package manifest `{}`",
+            manifest_path.display()
+        )
+    })?;
+    let manifest = BurnAnyUpPackageManifest::from_json_str(&manifest_json).with_context(|| {
+        format!(
+            "parse burn_anyup package manifest `{}`",
+            manifest_path.display()
+        )
+    })?;
+    let parts_manifest_path =
+        resolve_package_manifest_entry_path(manifest_path, &manifest.parts_manifest)?;
+    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
+    let parts = parts_manifest
+        .parts
+        .iter()
+        .map(|entry| {
+            let path = resolve_part_entry_path(&parts_manifest_path, &entry.path)?;
+            fs::read(&path).with_context(|| format!("read AnyUp bpk shard `{}`", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    log(&format!(
+        "bevy_jepa: loading burn_anyup package `{}` from {} shard(s)",
+        manifest_path.display(),
+        parts.len()
+    ));
+    load_anyup_from_manifest_and_parts(
+        manifest,
+        &parts,
+        config,
+        &manifest_path.display().to_string(),
+        device,
+    )
+}
+
+fn load_anyup_from_manifest_and_parts(
+    mut manifest: BurnAnyUpPackageManifest,
+    parts: &[Vec<u8>],
+    config: &BevyJepaConfig,
+    label: &str,
+    device: &JepaBevyDevice,
+) -> Result<AnyUp<JepaBevyBackend>> {
+    manifest.anyup_config.attention_mode = config.anyup_attention_mode;
+    manifest.anyup_config.input_dim = 3;
+    let (anyup, report) =
+        load_anyup_burnpack_parts::<JepaBevyBackend>(&manifest.anyup_config, parts, device)
+            .context("load AnyUp burnpack parts")?;
+    ensure_anyup_apply_report_has_critical_weights(&report, label)?;
+    log(&format!(
+        "bevy_jepa: loaded AnyUp bpk package `{label}` ({} tensors applied)",
+        report.applied.len()
+    ));
     Ok(anyup)
 }
 

@@ -175,6 +175,24 @@ PyTorch tensors into the Burn `q_proj` and `k_proj` parameters. With
 `UpstreamMasked`, this matches upstream Python's default paper path; with
 `EfficientLocal`, it matches upstream's `use_natten=True` conversion behavior.
 
+## Deployment Package
+
+The workspace `burn-jepa` CLI can export an AnyUp checkpoint to an f16 sharded
+Burn package for native/wasm viewers:
+
+```bash
+cargo run --no-default-features --features ndarray --bin burn-jepa -- export-anyup-bpk \
+  --weights target/burn-anyup-checkpoints/anyup_multi_backbone.pth \
+  --output target/burn_anyup-build/anyup_multi_backbone/anyup.bpk \
+  --deploy-dir target/burn_anyup/anyup_multi_backbone \
+  --overwrite-shards \
+  --overwrite-deploy
+```
+
+The clean upload bundle contains `manifest.json`, `anyup.bpk.parts.json`, and
+the `anyup.bpk.part-*.bpk` shards. The default CDN manifest route is
+`https://aberration.technology/model/burn_anyup/anyup_multi_backbone/manifest.json`.
+
 ## Validation
 
 The test fixture `tests/fixtures/anyup_tiny_parity.py` builds a deterministic

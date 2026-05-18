@@ -151,7 +151,7 @@ pub(super) fn rollout_kind(config: &BurnJepaTrainConfig) -> TttRolloutKind {
     }
 }
 
-pub(super) fn patchify_kind<B: TttSparsePatchifyTrainingBackend>(
+pub(super) fn patchify_kind<B: TttSparsePatchifyBackend>(
     config: &BurnJepaTrainConfig,
     rollout: TttRolloutKind,
 ) -> Result<TttPatchifyKind> {
@@ -274,7 +274,7 @@ pub(super) fn student_training_rollout_with_state<B: TttSparsePatchifyTrainingBa
     )
 }
 
-pub(super) fn student_free_run_rollout_with_state<B: TttSparsePatchifyTrainingBackend>(
+pub(super) fn student_free_run_rollout_with_state<B: TttSparsePatchifyBackend>(
     model: &VJepaTttModel<B>,
     video: Tensor<B, 5>,
     masks: Option<&ResolvedTttMasks<B>>,
@@ -285,7 +285,7 @@ pub(super) fn student_free_run_rollout_with_state<B: TttSparsePatchifyTrainingBa
     student_rollout_with_patchify_and_state(model, video, None, masks, rollout, patchify, state)
 }
 
-fn student_rollout_with_patchify<B: TttSparsePatchifyTrainingBackend>(
+fn student_rollout_with_patchify<B: TttSparsePatchifyBackend>(
     model: &VJepaTttModel<B>,
     video: Tensor<B, 5>,
     adapter_target_tokens: Option<Tensor<B, 3>>,
@@ -305,15 +305,18 @@ fn student_rollout_with_patchify<B: TttSparsePatchifyTrainingBackend>(
     )
 }
 
-fn student_rollout_with_patchify_and_state<B: TttSparsePatchifyTrainingBackend>(
+fn student_rollout_with_patchify_and_state<B: TttSparsePatchifyBackend>(
     model: &VJepaTttModel<B>,
     video: Tensor<B, 5>,
-    adapter_target_tokens: Option<Tensor<B, 3>>,
+    mut adapter_target_tokens: Option<Tensor<B, 3>>,
     masks: Option<&ResolvedTttMasks<B>>,
     rollout: TttRolloutKind,
     patchify: TttPatchifyKind,
     state: &mut crate::TttState<B>,
 ) -> Result<crate::VJepaEncoderOutput<B>> {
+    if model.encoder.memory_update_source() == crate::TttMemoryUpdateSource::SelfHidden {
+        adapter_target_tokens = None;
+    }
     if rollout.sparse_mask_kind().is_some() && patchify == TttPatchifyKind::FrozenSparsePatchify {
         let Some(masks) = masks else {
             bail!("frozen sparse patchify rollout requires resolved masks")
@@ -364,7 +367,7 @@ fn student_rollout_with_patchify_and_state<B: TttSparsePatchifyTrainingBackend>(
     }
 }
 
-pub(super) fn student_eval_rollout<B: TttSparsePatchifyTrainingBackend>(
+pub(super) fn student_eval_rollout<B: TttSparsePatchifyBackend>(
     model: &VJepaTttModel<B>,
     video: Tensor<B, 5>,
     teacher_tokens: Tensor<B, 3>,
@@ -401,7 +404,7 @@ pub(super) fn student_eval_rollout<B: TttSparsePatchifyTrainingBackend>(
     })
 }
 
-pub(super) fn student_eval_rollout_with_state<B: TttSparsePatchifyTrainingBackend>(
+pub(super) fn student_eval_rollout_with_state<B: TttSparsePatchifyBackend>(
     model: &VJepaTttModel<B>,
     video: Tensor<B, 5>,
     teacher_tokens: Tensor<B, 3>,
@@ -522,7 +525,7 @@ pub(super) enum SparseMaskKind {
     Target,
 }
 
-pub trait TttSparsePatchifyTrainingBackend: AutodiffBackend {
+pub trait TttSparsePatchifyBackend: Backend {
     fn frozen_sparse_patchify_supported() -> bool {
         false
     }
@@ -552,25 +555,79 @@ pub trait TttSparsePatchifyTrainingBackend: AutodiffBackend {
     }
 }
 
+pub trait TttSparsePatchifyTrainingBackend: TttSparsePatchifyBackend + AutodiffBackend {}
+
+impl<B> TttSparsePatchifyTrainingBackend for B where B: TttSparsePatchifyBackend + AutodiffBackend {}
+
 #[cfg(feature = "ndarray")]
-impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::NdArray<f32>> {}
+impl TttSparsePatchifyBackend for burn::backend::NdArray<f32> {}
+
+#[cfg(feature = "ndarray")]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::NdArray<f32>> {}
 
 #[cfg(feature = "flex")]
-impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::Flex<f32, i32>> {}
+impl TttSparsePatchifyBackend for burn::backend::Flex<f32, i32> {}
+
+#[cfg(feature = "flex")]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::Flex<f32, i32>> {}
 
 #[cfg(feature = "dispatch")]
-impl TttSparsePatchifyTrainingBackend for burn::Dispatch {}
+impl TttSparsePatchifyBackend for burn::Dispatch {}
 
 #[cfg(all(feature = "webgpu", not(feature = "wgpu")))]
-impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::WebGpu<f32, i32>> {}
+impl TttSparsePatchifyBackend for burn::backend::WebGpu<f32, i32> {}
+
+#[cfg(all(feature = "webgpu", not(feature = "wgpu")))]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::WebGpu<f32, i32>> {}
 
 #[cfg(feature = "wgpu")]
-impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>> {}
+impl TttSparsePatchifyBackend for burn::backend::Wgpu<f32, i32> {
+    #[cfg(feature = "sparse-patchify-wgpu")]
+    fn frozen_sparse_patchify_supported() -> bool {
+        true
+    }
+
+    #[cfg(feature = "sparse-patchify-wgpu")]
+    fn student_frozen_sparse_patchify_rollout(
+        model: &VJepaTttModel<Self>,
+        video: Tensor<Self, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<Self, 3>>,
+        state: &mut crate::TttState<Self>,
+    ) -> Result<crate::VJepaEncoderOutput<Self>> {
+        model
+            .encoder
+            .forward_single_frame_rollout_sparse_patchify_wgpu_fusion(
+                video,
+                mask,
+                target_tokens,
+                state,
+            )
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>> {}
 
 #[cfg(feature = "sparse-patchify-wgpu")]
-impl TttSparsePatchifyTrainingBackend
-    for burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend>
-{
+impl TttSparsePatchifyBackend for burn_flex_gmm::wgpu::DefaultWgpuBackend {
+    fn frozen_sparse_patchify_supported() -> bool {
+        true
+    }
+
+    fn student_frozen_sparse_patchify_rollout(
+        model: &VJepaTttModel<Self>,
+        video: Tensor<Self, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<Self, 3>>,
+        state: &mut crate::TttState<Self>,
+    ) -> Result<crate::VJepaEncoderOutput<Self>> {
+        model.forward_single_frame_rollout_sparse_patchify_wgpu(video, mask, target_tokens, state)
+    }
+}
+
+#[cfg(feature = "sparse-patchify-wgpu")]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
     fn frozen_sparse_patchify_supported() -> bool {
         true
     }
@@ -611,10 +668,37 @@ impl TttSparsePatchifyTrainingBackend
 }
 
 #[cfg(all(feature = "cuda", not(feature = "sparse-patchify-cuda")))]
-impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::Cuda<f32, i32>> {}
+impl TttSparsePatchifyBackend for burn::backend::Cuda<f32, i32> {}
+
+#[cfg(all(feature = "cuda", not(feature = "sparse-patchify-cuda")))]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::Cuda<f32, i32>> {}
 
 #[cfg(feature = "sparse-patchify-cuda")]
-impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend::Cuda<f32, i32>> {
+impl TttSparsePatchifyBackend for burn::backend::Cuda<f32, i32> {
+    fn frozen_sparse_patchify_supported() -> bool {
+        true
+    }
+
+    fn student_frozen_sparse_patchify_rollout(
+        model: &VJepaTttModel<Self>,
+        video: Tensor<Self, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<Self, 3>>,
+        state: &mut crate::TttState<Self>,
+    ) -> Result<crate::VJepaEncoderOutput<Self>> {
+        model
+            .encoder
+            .forward_single_frame_rollout_sparse_patchify_cuda_fusion(
+                video,
+                mask,
+                target_tokens,
+                state,
+            )
+    }
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::Cuda<f32, i32>> {
     fn frozen_sparse_patchify_supported() -> bool {
         true
     }
@@ -655,9 +739,24 @@ impl TttSparsePatchifyTrainingBackend for burn::backend::Autodiff<burn::backend:
 }
 
 #[cfg(feature = "sparse-patchify-cuda")]
-impl TttSparsePatchifyTrainingBackend
-    for burn::backend::Autodiff<burn_flex_gmm::cuda::DefaultCudaBackend>
-{
+impl TttSparsePatchifyBackend for burn_flex_gmm::cuda::DefaultCudaBackend {
+    fn frozen_sparse_patchify_supported() -> bool {
+        true
+    }
+
+    fn student_frozen_sparse_patchify_rollout(
+        model: &VJepaTttModel<Self>,
+        video: Tensor<Self, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<Self, 3>>,
+        state: &mut crate::TttState<Self>,
+    ) -> Result<crate::VJepaEncoderOutput<Self>> {
+        model.forward_single_frame_rollout_sparse_patchify_cuda(video, mask, target_tokens, state)
+    }
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn_flex_gmm::cuda::DefaultCudaBackend> {
     fn frozen_sparse_patchify_supported() -> bool {
         true
     }

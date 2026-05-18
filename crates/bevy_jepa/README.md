@@ -79,19 +79,16 @@ The default view renders three stage panels:
 High-resolution AnyUp PCA is hidden when `--high-res-pca-every 0` (the
 default) and appears as a fourth panel when AnyUp is enabled. Open the compact
 `controls` submenu, or press `C`, to switch TTT/base model packages, 256/512
-input size, AnyUp cadence, patch-diff threshold, and bounded refresh modes
-without crowding the default viewer.
+input size, AnyUp cadence and attention mode, patch-diff threshold, and bounded
+refresh modes without crowding the default viewer.
 
 The viewer preprocesses camera/static frames with the same ImageNet
-mean/std normalization expected by V-JEPA and upstream AnyUp. If
-`target/burn-anyup-checkpoints/anyup_multi_backbone.pth` exists, the viewer
-uses it automatically when `--anyup-weights` is omitted. Without an explicit or
-auto-discovered checkpoint, the viewer uses the tiny untrained AnyUp test module
-and logs that the high-resolution panel is only a wiring diagnostic, not a
-meaningful pretrained feature visualization. Use an upstream checkpoint plus
-`--anyup-attention-mode upstream-masked` for exact parity with upstream Python's
-default AnyUp path, or `efficient-local` for the portable NATTEN-style path used
-by the real-time pipeline.
+mean/std normalization expected by V-JEPA and upstream AnyUp. When high-res PCA
+is enabled, AnyUp prefers the sharded f16 `.bpk` package path; the legacy
+`--anyup-weights` / `BURN_ANYUP_WEIGHTS` checkpoint path remains a fallback for
+local parity work. Use `--anyup-attention-mode upstream-masked` for exact parity
+with upstream Python's default AnyUp path, or `efficient-local` for the portable
+NATTEN-style path used by the real-time pipeline.
 
 `--mask-source autogaze` is reserved for a real model-backed AutoGaze node. The
 viewer now fails clearly instead of synthesizing an AutoGaze-looking moving
@@ -121,10 +118,10 @@ subthreshold changes accumulate, old token positions are age-refreshed, and a
 small deterministic blue-noise refresh probes quiet regions. The extra writes
 are capped by unused context budget, so high-motion threshold hits still win.
 Use `--no-patch-diff-refresh` for legacy instantaneous masks.
-Model loading prefers a sharded `burn_jepa` `.bpk` package manifest. Exported
-packages store floating-point records as f16 for deployment size, and the
-native/wasm loaders upcast those records into the active backend dtype. Native
-runs check `--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`,
+Model loading prefers sharded `.bpk` package manifests. Exported packages store
+floating-point records as f16 for deployment size, and the native/wasm loaders
+upcast those records into the active backend dtype. Native JEPA runs check
+`--model-manifest`, `BURN_JEPA_MODEL_MANIFEST`,
 `target/burn-jepa-web/model/{model_profile}/manifest.json`, then an
 auto-downloaded cache under `~/.burn_jepa/models/burn_jepa/{model_profile}`
 before accepting a legacy explicit `--ttt-model ...mpk` override. The native
@@ -141,6 +138,16 @@ auto-cache profile. Wasm accepts `?model-profile=vjepa2_1_base`,
 fetches. `?preload-only=true` checks shard fetching without starting the Bevy
 app. Model shards are not included in the GitHub Pages artifact.
 
+When `--high-res-pca-every` is positive, AnyUp also uses a sharded
+`burn_anyup` package. Native runs check `--anyup-model-manifest`,
+`BURN_ANYUP_MODEL_MANIFEST`,
+`target/burn_anyup/{anyup_model_profile}/manifest.json`, then
+`~/.burn_jepa/models/burn_anyup/{anyup_model_profile}`. The default route is
+`https://aberration.technology/model/burn_anyup/anyup_multi_backbone/manifest.json`.
+Use `--anyup-model-base-url`, `--anyup-model-cache-dir`,
+`--no-anyup-model-download`, or wasm query params `?anyup-model-base=...` and
+`?anyup-model-manifest=...` to override it.
+
 ```bash
 cargo run --bin burn-jepa -- export-bpk \
   --config ../../configs/deploy/vjepa21-base-bpk-export.toml \
@@ -156,6 +163,14 @@ cargo run --bin burn-jepa -- export-bpk \
   --shard-mib 20 \
   --model-profile vjepa2_1_ttt \
   --deploy-dir ../../target/burn-jepa-cdn-upload/vjepa2_1_ttt \
+  --overwrite-shards \
+  --overwrite-deploy
+cargo run --no-default-features --features ndarray --bin burn-jepa -- export-anyup-bpk \
+  --weights ../../target/burn-anyup-checkpoints/anyup_multi_backbone.pth \
+  --output ../../target/burn_anyup-build/anyup_multi_backbone/anyup.bpk \
+  --shard-mib 20 \
+  --model-profile anyup_multi_backbone \
+  --deploy-dir ../../target/burn_anyup/anyup_multi_backbone \
   --overwrite-shards \
   --overwrite-deploy
 python3 -m http.server 8091 -d ../../target/burn-jepa-web/model

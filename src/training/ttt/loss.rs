@@ -19,6 +19,7 @@ pub(super) struct TttLossBreakdown<B: Backend> {
     pub total: Tensor<B, 1>,
     pub feature: Tensor<B, 1>,
     pub predictor: Option<Tensor<B, 1>>,
+    pub regularizer: Option<Tensor<B, 1>>,
 }
 
 pub fn evaluate_ttt_distillation<B: Backend>(
@@ -147,14 +148,28 @@ pub(super) fn training_loss_breakdown<B: Backend>(
     } else {
         None
     };
+    let regularizer = latent_regularization_loss(
+        config,
+        student.tokens.clone(),
+        teacher.final_tokens.clone(),
+        primary_mask,
+        rollout,
+        batch_size,
+        device,
+    );
     let total = match predictor.clone() {
         Some(predictor) => feature_loss.clone() + predictor,
         None => feature_loss.clone(),
+    };
+    let total = match regularizer.clone() {
+        Some(regularizer) => total + regularizer,
+        None => total,
     };
     Ok(TttLossBreakdown {
         total,
         feature: feature_loss,
         predictor,
+        regularizer,
     })
 }
 
@@ -251,6 +266,158 @@ pub(super) fn primary_feature_loss<B: Backend>(
         squared.mean()
     };
     loss.mul_scalar(config.loss.feature_loss_weight as f64)
+}
+
+pub(super) fn latent_regularization_loss<B: Backend>(
+    config: &BurnJepaTrainConfig,
+    student_tokens: Tensor<B, 3>,
+    teacher_tokens: Tensor<B, 3>,
+    target_mask: Option<&SparseMaskBatch<B>>,
+    rollout: TttRolloutKind,
+    batch_size: usize,
+    device: &B::Device,
+) -> Option<Tensor<B, 1>> {
+    let regularization = &config.loss.latent_regularization;
+    if !regularization.active() {
+        return None;
+    }
+    let (tokens, _) = align_primary_tokens(
+        student_tokens,
+        teacher_tokens,
+        target_mask,
+        rollout,
+        batch_size,
+        device,
+    );
+    let [batch, token_count, dim] = tokens.shape().dims::<3>();
+    let valid_mask = target_mask.and_then(|mask| mask.valid_token_mask(device));
+    let valid_tokens = target_mask
+        .map(SparseMaskBatch::valid_token_count)
+        .unwrap_or(batch * token_count)
+        .max(1);
+    let mean = feature_mean(
+        tokens.clone(),
+        valid_mask.clone(),
+        valid_tokens,
+        batch * token_count,
+    );
+    let centered = tokens - mean.clone();
+
+    let mut count = 0usize;
+    let mut total = None;
+    if regularization.mean_weight > 0.0 {
+        total = Some(
+            mean.powf_scalar(2.0)
+                .mean()
+                .mul_scalar(regularization.mean_weight as f64),
+        );
+        count += 1;
+    }
+    if regularization.variance_weight > 0.0 {
+        let variance = feature_mean(
+            centered.clone().powf_scalar(2.0),
+            valid_mask.clone(),
+            valid_tokens,
+            batch * token_count,
+        );
+        let loss = variance
+            .sub_scalar(regularization.target_variance as f64)
+            .powf_scalar(2.0)
+            .mean()
+            .mul_scalar(regularization.variance_weight as f64);
+        total = Some(match total {
+            Some(total) => total + loss,
+            None => loss,
+        });
+        count += 1;
+    }
+    if regularization.covariance_weight > 0.0 {
+        if let Some(loss) = covariance_sketch_loss(
+            centered,
+            valid_mask,
+            valid_tokens,
+            batch * token_count,
+            regularization.covariance_sketch_dim.min(dim),
+        ) {
+            let loss = loss.mul_scalar(regularization.covariance_weight as f64);
+            total = Some(match total {
+                Some(total) => total + loss,
+                None => loss,
+            });
+            count += 1;
+        }
+    }
+    total.map(|total| {
+        total
+            .div_scalar(count.max(1) as f64)
+            .mul_scalar(regularization.weight as f64)
+    })
+}
+
+fn feature_mean<B: Backend>(
+    tensor: Tensor<B, 3>,
+    valid_mask: Option<Tensor<B, 2>>,
+    valid_tokens: usize,
+    dense_tokens: usize,
+) -> Tensor<B, 3> {
+    if let Some(mask) = valid_mask {
+        let dim = tensor.shape().dims::<3>()[2];
+        let mask = mask.unsqueeze_dim::<3>(2).repeat_dim(2, dim);
+        return (tensor * mask)
+            .mean_dim(0)
+            .mean_dim(1)
+            .mul_scalar(dense_tokens as f64 / valid_tokens.max(1) as f64);
+    }
+    tensor.mean_dim(0).mean_dim(1)
+}
+
+fn covariance_sketch_loss<B: Backend>(
+    centered: Tensor<B, 3>,
+    valid_mask: Option<Tensor<B, 2>>,
+    valid_tokens: usize,
+    dense_tokens: usize,
+    sketch_dim: usize,
+) -> Option<Tensor<B, 1>> {
+    if sketch_dim < 2 {
+        return None;
+    }
+    let adjacent = pairwise_covariance_loss(
+        centered.clone(),
+        valid_mask.clone(),
+        valid_tokens,
+        dense_tokens,
+        1,
+        sketch_dim,
+    );
+    if sketch_dim < 4 {
+        return Some(adjacent);
+    }
+    let offset = (sketch_dim / 2).max(1);
+    let strided = pairwise_covariance_loss(
+        centered,
+        valid_mask,
+        valid_tokens,
+        dense_tokens,
+        offset,
+        sketch_dim,
+    );
+    Some((adjacent + strided).mul_scalar(0.5))
+}
+
+fn pairwise_covariance_loss<B: Backend>(
+    centered: Tensor<B, 3>,
+    valid_mask: Option<Tensor<B, 2>>,
+    valid_tokens: usize,
+    dense_tokens: usize,
+    offset: usize,
+    sketch_dim: usize,
+) -> Tensor<B, 1> {
+    let width = sketch_dim.saturating_sub(offset).max(1);
+    let left = centered.clone().slice_dim(2, 0..width);
+    let right = centered.slice_dim(2, offset..(offset + width));
+    feature_mean(left * right, valid_mask, valid_tokens, dense_tokens)
+        .powf_scalar(2.0)
+        .mean()
 }
 
 pub(super) fn primary_cosine<B: Backend>(

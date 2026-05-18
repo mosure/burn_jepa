@@ -132,8 +132,9 @@ windows. Enable this with `[training.stream]`:
 enabled = true
 detach_between_steps = true
 reset_on_clip_change = true
+reset_on_scene_change = true
 reset_on_non_monotonic_start = true
-reset_interval_steps = 4
+reset_interval_steps = 16
 state_decay = 0.97
 state_l2_weight = 0.000001
 update_l2_weight = 0.00001
@@ -142,7 +143,7 @@ state_regularization_width = 64
 [training.stream.curriculum]
 enabled = true
 initial_reset_interval_steps = 1
-final_reset_interval_steps = 4
+final_reset_interval_steps = 16
 warmup_steps = 512
 ```
 
@@ -164,9 +165,13 @@ updates inside the batch.
 
 The loader uses manifest metadata (`clip_id`, `domain`, `source`, and
 `start_frame`) to reset state at new streams, non-monotonic windows, and
-scheduled reset intervals. Manifest stream rows must include `start_frame` plus
-either `clip_id` or `source`; anonymous manifest streams are rejected so
-unrelated windows cannot silently share state.
+scheduled reset intervals. When `reset_on_scene_change = true`, repeated or
+stitched manifests may additionally provide `original_stream`; this lets eval
+or a deployment scene-cut detector reset state when a logical stream jumps to a
+different scene while still measuring one continuous output stream. Manifest
+stream rows must include `start_frame` plus either `clip_id` or `source`;
+anonymous manifest streams are rejected so unrelated windows cannot silently
+share state.
 `detach_between_steps = true` gives a TBPTT boundary between windows; the
 carried fast weights remain device tensors, but the previous window graph is not
 retained. `state_decay` applies a scheduled stability decay after each step,
@@ -186,10 +191,37 @@ the TBPTT boundary. Reports expose this directly through
 `training.loss_trace_interval` is enabled. Set `loss_trace_interval = 0` for
 throughput runs to avoid extra scalar readbacks.
 
+## Latent Gaussian Regularization
+
+The TTT loss supports an opt-in LeJEPA/SIGReg-style latent regularizer:
+
+```toml
+[loss.latent_regularization]
+weight = 0.00001
+mean_weight = 1.0
+variance_weight = 1.0
+covariance_weight = 0.25
+target_variance = 1.0
+covariance_sketch_dim = 64
+```
+
+The penalty is applied to the same aligned student tokens used by the feature
+loss.  It is mask-aware, excludes padded ragged tokens, and uses a cheap
+adjacent-feature covariance sketch rather than a dense covariance matrix.  Keep
+the weight small for V-JEPA 2.1 teacher distillation: the 2026-05-18 ablation
+selected `1e-5` because it was non-regressive, but the full 164-window eval was
+effectively neutral relative to the unregularized selected checkpoint. Treat it
+as a stability hook and diagnostic surface, not as a substitute for state
+decay, update regularization, dense stabilization samples, or long-rollout
+eval.
+
 The sequence curriculum ramps the scheduled reset interval from short horizon
-to longer carried-state blocks. With 16-frame windows and
-`final_reset_interval_steps = 4`, the final training horizon is 64 frames before
-the next scheduled reset. Training reports include `stream.carried_steps`,
+to longer carried-state blocks. The current production gate uses 16-frame
+windows and `final_reset_interval_steps = 16`, so the trained deployment
+horizon is 256 frames before the next scheduled refresh. Unbounded carried
+state is not assumed: repeated-stream stress tests showed drift without a
+reset, while the reset16 gate remained flat over 136 consecutive same-source
+windows. Training reports include `stream.carried_steps`,
 `stream.reset_steps`, `stream.detached_steps`, `stream.decayed_steps`, and the
 effective final reset interval so experiment artifacts show whether the run
 actually trained with persistent state. Packed reports also include
@@ -203,6 +235,26 @@ lanes, reports the same stream counters, and still runs teacher-forced/full-grid
 diagnostics in fresh diagnostic states. Use
 `configs/production/vjepa21-ttt-stream-eval-cuda.toml` for the production
 long-form eval shape.
+
+Long-run stress configs can repeat or stitch manifests without generating new
+JSONL files. Set `dataset.repeat_count > 1` and choose
+`repeat_mode = "continuous_streams"` for same-source carry,
+`"stitched_stream"` for scene-switch recovery, or
+`"adversarial_stitched_stream"` for worst-case scene ordering. `sample_limit`
+can isolate the first N rows of a manifest, for example the current cactus-only
+8x repeat gate.
+
+The live image pipeline now has an explicit deployment-side TTT runtime policy
+(`TttRuntimeStateConfig`) instead of carrying fast weights forever. The default
+viewer policy updates fast weights, applies per-frame decay, and resets at the
+trained rollout horizon without host reads. Native token/state stability probes
+and collapse-guard actions are opt-in diagnostics (`metrics_interval_frames > 0`
+plus `collapse_guard_enabled = true`) so normal deployment does not add periodic
+tensor readbacks. This mirrors the training intent: fresh/reset windows teach
+zero-state initialization, carried TBPTT windows teach stability, and runtime
+decay/reset keeps arbitrary-length streams from drifting outside the trained
+horizon. WebAssembly builds keep the decay and reset policy but skip synchronous
+host-read diagnostics in the hot path.
 
 The legacy `ttt.target` field still deserializes for old configs, but
 `print-config` omits its default value; new configs should use
@@ -315,8 +367,8 @@ all-token TTT distillation against the 3D/tubelet teacher:
 ```toml
 [training.dense_samples]
 enabled = true
-warmup_steps = 2
-interval_steps = 4
+warmup_steps = 128
+interval_steps = 16
 ```
 
 Dense-sample steps ignore `training.mask`, run the dense single-frame rollout,
@@ -338,16 +390,16 @@ by sparse TTT training:
 - `frozen_sparse_patchify`: require the bridge and fail if it is unavailable.
 
 The bridge is currently available for WGPU with `sparse-patchify-wgpu` and CUDA
-with `sparse-patchify-cuda`. It runs flex-gmm sparse patchify on the backend's
-inner non-autodiff tensor, then re-enters autodiff at the sparse token boundary.
-This is intended for adapter-only TTT training and requires
-`ttt.freeze_pretrained = true`; gradients still train the TTT/memory layers, but
-the frozen patch embedding does not receive gradients. Training reports include
-`rollout.autodiff_sparse_patchify` so benchmark artifacts show which path was
+with `sparse-patchify-cuda`. In training it runs frozen sparse patchify at the
+sparse token boundary so adapter-only TTT gradients still train the TTT/memory
+layers while the frozen patch embedding does not receive gradients. Evaluation
+can use the same frozen sparse patchify route without the autodiff wrapper.
+This requires `ttt.freeze_pretrained = true`. Training and eval reports include
+`rollout.frozen_sparse_patchify` so benchmark artifacts show which path was
 actually used.
 
 Training reports include `rollout.mode`, `rollout.student_tokens`,
-`rollout.student_token_density`, `rollout.autodiff_sparse_patchify`, and
+`rollout.student_token_density`, `rollout.frozen_sparse_patchify`, and
 `dense_samples.{dense_steps,sparse_steps}` so experiment artifacts show whether
 a run actually trained dense rollout, target-mask sparse rollout, mixed dense
 samples, or frozen sparse patchify rollout. Set

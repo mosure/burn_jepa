@@ -28,6 +28,32 @@ pub enum TttStateResetMode {
     EachTubelet,
 }
 
+#[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
+struct SingleFrameSparseRolloutPlan<B: Backend> {
+    patchify: SparsePatchifyPlan<B>,
+    encoder: SparseEncoderPlan<B>,
+}
+
+#[cfg(any(feature = "sparse-patchify-wgpu", feature = "sparse-patchify-cuda"))]
+fn single_frame_sparse_rollout_plan<'a, B: Backend>(
+    plans: &'a mut [Option<SingleFrameSparseRolloutPlan<B>>],
+    tubelet_index: usize,
+    config: &VJepaConfig,
+    frame_mask: SparseTokenMask,
+    frame_grid: TokenGridShape,
+    batch: usize,
+    device: &B::Device,
+) -> Result<&'a SingleFrameSparseRolloutPlan<B>> {
+    if plans[tubelet_index].is_none() {
+        let patchify = SparsePatchifyPlan::new(frame_mask.clone(), frame_grid, batch, device)?;
+        let encoder = SparseEncoderPlan::new(config, frame_mask, frame_grid, batch, false, device)?;
+        plans[tubelet_index] = Some(SingleFrameSparseRolloutPlan { patchify, encoder });
+    }
+    Ok(plans[tubelet_index]
+        .as_ref()
+        .expect("single frame sparse rollout plan inserted above"))
+}
+
 #[derive(Module, Debug)]
 pub struct VJepaTttEncoder<B: Backend> {
     pub base: VJepaEncoder<B>,
@@ -167,6 +193,17 @@ impl<B: Backend> VJepaTttEncoder<B> {
         target_tokens: Option<Tensor<B, 3>>,
         state: &mut TttState<B>,
     ) -> Result<VJepaEncoderOutput<B>> {
+        self.forward_image_with_mask_batch_state_options(image, mask, target_tokens, state, true)
+    }
+
+    pub fn forward_image_with_mask_batch_state_options(
+        &self,
+        image: Tensor<B, 4>,
+        mask: SparseMaskBatch<B>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<B>> {
         let [batch, channels, height, width] = image.shape().dims::<4>();
         ensure!(
             batch == mask.batch(),
@@ -196,7 +233,14 @@ impl<B: Backend> VJepaTttEncoder<B> {
             tokens
         };
         let plan = SparseEncoderBatchPlan::new(&self.config, mask, grid, false, &device)?;
-        self.forward_sparse_tokens_with_batch_plan(tokens, &plan, target_tokens, state)
+        self.forward_sparse_tokens_with_batch_plan_options(
+            tokens,
+            &plan,
+            target_tokens,
+            state,
+            update_fast_weight,
+            None,
+        )
     }
 
     fn forward_image_with_state_impl(
@@ -691,6 +735,24 @@ impl<B: Backend> VJepaTttEncoder<B> {
         state: &mut TttState<B>,
     ) -> Result<VJepaEncoderOutput<B>> {
         self.forward_sparse_tokens_impl(tokens, plan, target_tokens, state)
+    }
+
+    pub fn forward_sparse_tokens_with_plan_options(
+        &self,
+        tokens: Tensor<B, 3>,
+        plan: &SparseEncoderPlan<B>,
+        target_tokens: Option<Tensor<B, 3>>,
+        state: &mut TttState<B>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<B>> {
+        self.forward_sparse_tokens_impl_options(
+            tokens,
+            plan,
+            target_tokens,
+            state,
+            update_fast_weight,
+            None,
+        )
     }
 
     fn forward_tokens(
@@ -1227,11 +1289,29 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
         state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
     ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.forward_single_frame_rollout_sparse_patchify_wgpu_options(
+            video,
+            mask,
+            target_tokens,
+            state,
+            true,
+        )
+    }
+
+    pub fn forward_single_frame_rollout_sparse_patchify_wgpu_options(
+        &self,
+        video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
+        state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
         self.forward_single_frame_rollout_sparse_patchify_wgpu_impl(
             video,
             mask,
             target_tokens,
             state,
+            update_fast_weight,
         )
     }
 
@@ -1241,6 +1321,7 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         mask: &SparseTokenMask,
         target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
         state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        update_fast_weight: bool,
     ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
         let [batch, channels, frames, height, width] = video.shape().dims::<5>();
         let tubelet = self.config.tubelet_size.max(1);
@@ -1260,6 +1341,7 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         let frame_grid = TokenGridShape::new(1, grid.height, grid.width);
         let frame_tokens = frame_grid.len();
         let device = video.device();
+        let mut plans = (0..grid.depth).map(|_| None).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(grid.depth);
         let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
             .map(|_| Vec::with_capacity(grid.depth))
@@ -1286,19 +1368,23 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
                 batch,
                 &device,
             );
-            let patchify_plan =
-                SparsePatchifyPlan::new(frame_mask.clone(), frame_grid, batch, &device)?;
-            let encoder_plan = SparseEncoderPlan::new(
+            let plan = single_frame_sparse_rollout_plan(
+                &mut plans,
+                tubelet_index,
                 &self.config,
                 frame_mask,
                 frame_grid,
                 batch,
-                false,
                 &device,
             )?;
-            let tokens = self.sparse_patchify_image_wgpu(image, &patchify_plan)?;
-            let encoded =
-                self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
+            let tokens = self.sparse_patchify_image_wgpu(image, &plan.patchify)?;
+            let encoded = self.forward_sparse_tokens_with_plan_options(
+                tokens,
+                &plan.encoder,
+                target_frame,
+                state,
+                update_fast_weight,
+            )?;
             if frame % tubelet == tubelet - 1 {
                 for (layer_outputs, tokens) in hierarchical_outputs
                     .iter_mut()
@@ -1396,6 +1482,23 @@ impl VJepaTttEncoder<burn::backend::Wgpu<f32, i32>> {
         target_tokens: Option<Tensor<burn::backend::Wgpu<f32, i32>, 3>>,
         state: &mut TttState<burn::backend::Wgpu<f32, i32>>,
     ) -> Result<VJepaEncoderOutput<burn::backend::Wgpu<f32, i32>>> {
+        self.forward_image_sparse_patchify_wgpu_fusion_batch_state_options(
+            image,
+            plan,
+            target_tokens,
+            state,
+            true,
+        )
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_fusion_batch_state_options(
+        &self,
+        image: Tensor<burn::backend::Wgpu<f32, i32>, 4>,
+        plan: &SparsePatchifyBatchPlan<burn::backend::Wgpu<f32, i32>>,
+        target_tokens: Option<Tensor<burn::backend::Wgpu<f32, i32>, 3>>,
+        state: &mut TttState<burn::backend::Wgpu<f32, i32>>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<burn::backend::Wgpu<f32, i32>>> {
         let [batch, channels, height, width] = image.shape().dims::<4>();
         ensure!(
             batch == plan.batch,
@@ -1418,7 +1521,14 @@ impl VJepaTttEncoder<burn::backend::Wgpu<f32, i32>> {
         let tokens = self.sparse_patchify_image_wgpu_fusion_batch(image, plan)?;
         let encoder_plan =
             SparseEncoderBatchPlan::new(&self.config, plan.mask.clone(), grid, false, &device)?;
-        self.forward_sparse_tokens_with_batch_plan(tokens, &encoder_plan, target_tokens, state)
+        self.forward_sparse_tokens_with_batch_plan_options(
+            tokens,
+            &encoder_plan,
+            target_tokens,
+            state,
+            update_fast_weight,
+            None,
+        )
     }
 
     fn sparse_patchify_image_wgpu_fusion(
@@ -2338,14 +2448,14 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::cuda::DefaultCudaBac
 }
 
 #[cfg(feature = "sparse-patchify-cuda")]
-impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
-    pub fn forward_single_frame_rollout_sparse_patchify_cuda_fusion_frozen(
+impl VJepaTttEncoder<burn::backend::Cuda<f32, i32>> {
+    pub fn forward_single_frame_rollout_sparse_patchify_cuda_fusion(
         &self,
-        video: Tensor<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>, 5>,
+        video: Tensor<burn::backend::Cuda<f32, i32>, 5>,
         mask: &SparseTokenMask,
-        target_tokens: Option<Tensor<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>, 3>>,
-        state: &mut TttState<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>,
-    ) -> Result<VJepaEncoderOutput<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>> {
+        target_tokens: Option<Tensor<burn::backend::Cuda<f32, i32>, 3>>,
+        state: &mut TttState<burn::backend::Cuda<f32, i32>>,
+    ) -> Result<VJepaEncoderOutput<burn::backend::Cuda<f32, i32>>> {
         let [batch, channels, frames, height, width] = video.shape().dims::<5>();
         let tubelet = self.config.tubelet_size.max(1);
         ensure!(
@@ -2364,6 +2474,7 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
         let frame_grid = TokenGridShape::new(1, grid.height, grid.width);
         let frame_tokens = frame_grid.len();
         let device = video.device();
+        let mut plans = (0..grid.depth).map(|_| None).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(grid.depth);
         let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
             .map(|_| Vec::with_capacity(grid.depth))
@@ -2390,19 +2501,172 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
                 batch,
                 &device,
             );
-            let patchify_plan =
-                SparsePatchifyPlan::new(frame_mask.clone(), frame_grid, batch, &device)?;
-            let encoder_plan = SparseEncoderPlan::new(
+            let plan = single_frame_sparse_rollout_plan(
+                &mut plans,
+                tubelet_index,
                 &self.config,
                 frame_mask,
                 frame_grid,
                 batch,
-                false,
                 &device,
             )?;
-            let tokens = self.sparse_patchify_image_cuda_fusion_frozen(image, &patchify_plan)?;
+            let tokens = self.sparse_patchify_image_cuda_fusion(image, &plan.patchify)?;
             let encoded =
-                self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
+                self.forward_sparse_tokens_with_plan(tokens, &plan.encoder, target_frame, state)?;
+            if frame % tubelet == tubelet - 1 {
+                for (layer_outputs, tokens) in hierarchical_outputs
+                    .iter_mut()
+                    .zip(encoded.hierarchical.into_iter())
+                {
+                    layer_outputs.push(tokens);
+                }
+                outputs.push(encoded.tokens);
+                if self.should_detach_after_tubelet(tubelet_index, grid.depth) {
+                    state.detach();
+                }
+            }
+        }
+        ensure!(
+            !outputs.is_empty(),
+            "single-frame sparse patchify rollout produced no output tokens"
+        );
+        let tokens = Tensor::cat(outputs, 1);
+        let hierarchical = cat_hierarchical_outputs(hierarchical_outputs);
+        let plan = SparseEncoderPlan::new(&self.config, mask.clone(), grid, batch, true, &device)?;
+        Ok(VJepaEncoderOutput {
+            tokens,
+            hierarchical,
+            captured_layers: self.hierarchical_layers.clone(),
+            token_indices: plan.positions.indices,
+            grid,
+        })
+    }
+
+    fn sparse_patchify_image_cuda_fusion(
+        &self,
+        image: Tensor<burn::backend::Cuda<f32, i32>, 4>,
+        plan: &SparsePatchifyPlan<burn::backend::Cuda<f32, i32>>,
+    ) -> Result<Tensor<burn::backend::Cuda<f32, i32>, 3>> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        ensure!(
+            batch == plan.batch,
+            "image batch does not match sparse patchify plan"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "image channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            grid == plan.grid,
+            "image token grid does not match sparse patchify plan"
+        );
+        let device = image.device();
+        let patchify_config = burn_flex_gmm::SparsePatchify3dConfig {
+            in_channels: channels,
+            out_channels: self.config.encoder.embed_dim,
+            frames: 1,
+            height,
+            width,
+            tubelet_size: 1,
+            patch_h: self.config.patch_size,
+            patch_w: self.config.patch_size,
+        };
+        let bias = self
+            .base
+            .image_patch_embed
+            .proj
+            .bias
+            .as_ref()
+            .map(|bias| bias.val())
+            .unwrap_or_else(|| {
+                Tensor::<burn::backend::Cuda<f32, i32>, 1>::zeros(
+                    [self.config.encoder.embed_dim],
+                    &device,
+                )
+            });
+        let tokens = crate::sparse_patchify::sparse_patchify3d_forward_cuda_fusion(
+            &patchify_config,
+            image.reshape([batch, channels, 1, height, width]),
+            plan.coords.clone(),
+            self.base.image_patch_embed.proj.weight.val(),
+            bias,
+        )
+        .reshape([batch, plan.token_count(), self.config.encoder.embed_dim]);
+        Ok(tokens)
+    }
+}
+
+#[cfg(feature = "sparse-patchify-cuda")]
+impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
+    pub fn forward_single_frame_rollout_sparse_patchify_cuda_fusion_frozen(
+        &self,
+        video: Tensor<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>, 5>,
+        mask: &SparseTokenMask,
+        target_tokens: Option<Tensor<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>, 3>>,
+        state: &mut TttState<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>,
+    ) -> Result<VJepaEncoderOutput<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>>> {
+        let [batch, channels, frames, height, width] = video.shape().dims::<5>();
+        let tubelet = self.config.tubelet_size.max(1);
+        ensure!(
+            frames % tubelet == 0,
+            "single-frame sparse rollout requires frames divisible by tubelet_size"
+        );
+        let grid = TokenGridShape::new(
+            frames / tubelet,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            mask.dense_len() == grid.len() && !mask.is_empty(),
+            "single-frame sparse rollout mask must match a non-empty video token grid"
+        );
+        let frame_grid = TokenGridShape::new(1, grid.height, grid.width);
+        let frame_tokens = frame_grid.len();
+        let device = video.device();
+        let mut plans = (0..grid.depth).map(|_| None).collect::<Vec<_>>();
+        let mut outputs = Vec::with_capacity(grid.depth);
+        let mut hierarchical_outputs = (0..self.hierarchical_layers.len())
+            .map(|_| Vec::with_capacity(grid.depth))
+            .collect::<Vec<_>>();
+        for frame in 0..frames {
+            let tubelet_index = frame / tubelet;
+            let Some(frame_mask) = sparse_rollout_frame_mask(mask, grid, tubelet_index)? else {
+                if frame % tubelet == tubelet - 1
+                    && self.should_detach_after_tubelet(tubelet_index, grid.depth)
+                {
+                    state.detach();
+                }
+                continue;
+            };
+            let image = video
+                .clone()
+                .slice_dim(2, frame..frame + 1)
+                .reshape([batch, channels, height, width]);
+            let target_frame = rollout_target_frame(
+                target_tokens.as_ref(),
+                tubelet_index,
+                frame_tokens,
+                Some(&frame_mask),
+                batch,
+                &device,
+            );
+            let plan = single_frame_sparse_rollout_plan(
+                &mut plans,
+                tubelet_index,
+                &self.config,
+                frame_mask,
+                frame_grid,
+                batch,
+                &device,
+            )?;
+            let tokens = self.sparse_patchify_image_cuda_fusion_frozen(image, &plan.patchify)?;
+            let encoded =
+                self.forward_sparse_tokens_with_plan(tokens, &plan.encoder, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
                 for (layer_outputs, tokens) in hierarchical_outputs
                     .iter_mut()

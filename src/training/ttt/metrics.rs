@@ -10,8 +10,9 @@ use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 
 use crate::training::report::{
-    TttLayerUtilizationMetric, TttMaskMetrics, TttMemoryMetrics, TttRolloutMetrics,
-    TttRolloutReportMode, TttTargetSupervisionMetrics, TttUtilizationMetrics, tensor_scalar,
+    TttLatentRegularizationMetrics, TttLayerUtilizationMetric, TttMaskMetrics, TttMemoryMetrics,
+    TttRolloutMetrics, TttRolloutReportMode, TttTargetSupervisionMetrics, TttUtilizationMetrics,
+    tensor_scalar,
 };
 
 pub(super) fn mask_metrics_from_batches<B: Backend>(
@@ -132,7 +133,7 @@ pub(super) fn rollout_metrics(
         student_tokens,
         student_token_density: student_tokens as f32 / dense_tokens as f32,
         full_grid_eval,
-        autodiff_sparse_patchify: patchify == TttPatchifyKind::FrozenSparsePatchify,
+        frozen_sparse_patchify: patchify == TttPatchifyKind::FrozenSparsePatchify,
     }
 }
 
@@ -158,6 +159,21 @@ pub(super) fn target_supervision_metrics(
         layer_alignment,
         teacher_forced_eval: config.ttt.memory_update
             == TttMemoryUpdateSource::TeacherForcedDiagnostic,
+    }
+}
+
+pub(super) fn latent_regularization_metrics(
+    config: &BurnJepaTrainConfig,
+) -> TttLatentRegularizationMetrics {
+    let regularization = &config.loss.latent_regularization;
+    TttLatentRegularizationMetrics {
+        weight: regularization.weight,
+        mean_weight: regularization.mean_weight,
+        variance_weight: regularization.variance_weight,
+        covariance_weight: regularization.covariance_weight,
+        target_variance: regularization.target_variance,
+        covariance_sketch_dim: regularization.covariance_sketch_dim,
+        active: regularization.active(),
     }
 }
 

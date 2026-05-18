@@ -3,7 +3,7 @@ checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
-output_dir = "target/burn-jepa-production-final-256/stage1-stream-tbptt"
+output_dir = "target/burn-jepa-production-final-256/stage1-stream-tbptt-stable"
 save_model = true
 
 [dataset]
@@ -35,7 +35,7 @@ freeze_pretrained = true
 [training]
 backend = "cuda"
 batch_size = 4
-max_steps = 1024
+max_steps = 1536
 learning_rate = 0.0000025
 weight_decay = 0.0
 context_keep_ratio = 0.75
@@ -44,14 +44,14 @@ sparse_patchify_training = "frozen_sparse_patchify"
 batching = "packed_streams"
 loss_trace_interval = 64
 eval_steps = 0
-eval_batch_size = 2
+eval_batch_size = 4
 eval_full_grid = false
 eval_utilization_diagnostics = false
 eval_temporal_diagnostics = false
 cache_teacher_tokens = false
 teacher_cache_max_entries = 0
 prefetch_batches = true
-save_steps = 256
+save_steps = 512
 
 [training.stream]
 enabled = true
@@ -68,7 +68,7 @@ state_regularization_width = 64
 enabled = true
 initial_reset_interval_steps = 1
 final_reset_interval_steps = 4
-warmup_steps = 512
+warmup_steps = 768
 
 [training.dense_samples]
 enabled = true
@@ -77,7 +77,7 @@ interval_steps = 16
 
 [training.lr_schedule]
 kind = "linear_warmup_cosine"
-warmup_steps = 512
+warmup_steps = 768
 min_learning_rate = 0.0000005
 
 [training.mask]

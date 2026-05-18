@@ -18,6 +18,9 @@ pub struct JepaDatasetConfig {
     pub stride: usize,
     pub image_size: usize,
     pub synthetic_len: usize,
+    pub sample_limit: usize,
+    pub repeat_count: usize,
+    pub repeat_mode: JepaDatasetRepeatMode,
 }
 
 impl Default for JepaDatasetConfig {
@@ -31,6 +34,9 @@ impl Default for JepaDatasetConfig {
             stride: 1,
             image_size: 32,
             synthetic_len: 16,
+            sample_limit: 0,
+            repeat_count: 1,
+            repeat_mode: JepaDatasetRepeatMode::Preserve,
         }
     }
 }
@@ -50,6 +56,16 @@ pub enum JepaSampleKind {
     PairedVideo,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JepaDatasetRepeatMode {
+    #[default]
+    Preserve,
+    ContinuousStreams,
+    StitchedStream,
+    AdversarialStitchedStream,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JepaManifestRow {
     pub clip_id: Option<String>,
@@ -66,6 +82,8 @@ pub struct JepaManifestRow {
     pub teacher_frame_dir: Option<PathBuf>,
     pub precomputed_context_indices: Option<Vec<usize>>,
     pub precomputed_target_indices: Option<Vec<usize>>,
+    pub original_stream: Option<String>,
+    pub cache_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -79,6 +97,8 @@ pub struct JepaSampleMetadata {
     pub source: Option<String>,
     pub precomputed_context_indices: Option<Vec<usize>>,
     pub precomputed_target_indices: Option<Vec<usize>>,
+    pub original_stream: Option<String>,
+    pub cache_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,8 +214,8 @@ pub fn dataset_from_config(
     config: &JepaDatasetConfig,
     train: bool,
 ) -> Result<Box<dyn JepaDataset>> {
-    match config.kind {
-        JepaDatasetKind::Synthetic => Ok(Box::new(SyntheticJepaDataset::new(config.synthetic_len))),
+    let dataset: Box<dyn JepaDataset> = match config.kind {
+        JepaDatasetKind::Synthetic => Box::new(SyntheticJepaDataset::new(config.synthetic_len)),
         JepaDatasetKind::Manifest => {
             let path = if train {
                 config.train_manifest.as_ref()
@@ -206,12 +226,14 @@ pub fn dataset_from_config(
                     .or(config.train_manifest.as_ref())
             }
             .context("manifest dataset requires train_manifest or eval_manifest")?;
-            Ok(Box::new(ManifestJepaDataset::from_manifest(
+            Box::new(ManifestJepaDataset::from_manifest(
                 path,
                 config.sample_kind,
-            )?))
+            )?)
         }
-    }
+    };
+    let dataset = limit_dataset_if_needed(config, dataset);
+    Ok(repeat_dataset_if_needed(config, dataset))
 }
 
 pub fn load_jepa_tensor_batch<B: Backend>(
@@ -381,6 +403,8 @@ impl JepaManifestRow {
             source: self.source.clone(),
             precomputed_context_indices: self.precomputed_context_indices.clone(),
             precomputed_target_indices: self.precomputed_target_indices.clone(),
+            original_stream: self.original_stream.clone(),
+            cache_id: self.cache_id.clone(),
         }
     }
 
@@ -488,4 +512,311 @@ fn load_video_values_from_paths(paths: &[PathBuf], image_size: usize) -> Result<
         }
     }
     Ok(values)
+}
+
+struct RepeatedJepaDataset {
+    inner: Box<dyn JepaDataset>,
+    repeat_count: usize,
+    mode: JepaDatasetRepeatMode,
+    window_stride: usize,
+}
+
+struct LimitedJepaDataset {
+    inner: Box<dyn JepaDataset>,
+    len: usize,
+}
+
+impl JepaDataset for LimitedJepaDataset {
+    fn len(&self) -> usize {
+        self.len.max(1)
+    }
+
+    fn sample(&self, index: usize) -> Result<JepaSample> {
+        self.inner.sample(index % self.len())
+    }
+}
+
+fn limit_dataset_if_needed(
+    config: &JepaDatasetConfig,
+    dataset: Box<dyn JepaDataset>,
+) -> Box<dyn JepaDataset> {
+    if config.sample_limit == 0 {
+        return dataset;
+    }
+    Box::new(LimitedJepaDataset {
+        len: config.sample_limit.min(dataset.len()).max(1),
+        inner: dataset,
+    })
+}
+
+impl JepaDataset for RepeatedJepaDataset {
+    fn len(&self) -> usize {
+        self.inner
+            .len()
+            .saturating_mul(self.repeat_count.max(1))
+            .max(1)
+    }
+
+    fn sample(&self, index: usize) -> Result<JepaSample> {
+        let base_len = self.inner.len().max(1);
+        let virtual_index = index % self.len();
+        let repeat = virtual_index / base_len;
+        let base_slot = virtual_index % base_len;
+        let base_index = match self.mode {
+            JepaDatasetRepeatMode::Preserve
+            | JepaDatasetRepeatMode::ContinuousStreams
+            | JepaDatasetRepeatMode::StitchedStream => base_slot,
+            JepaDatasetRepeatMode::AdversarialStitchedStream => {
+                if base_slot.is_multiple_of(2) {
+                    base_slot / 2
+                } else {
+                    base_len.saturating_sub(1 + base_slot / 2)
+                }
+            }
+        };
+        let mut sample = self.inner.sample(base_index)?;
+        if let Some(metadata) = sample_metadata_mut(&mut sample) {
+            rewrite_repeated_metadata(
+                metadata,
+                self.mode,
+                repeat,
+                base_index,
+                virtual_index,
+                base_len,
+                self.window_stride,
+            );
+        }
+        Ok(sample)
+    }
+}
+
+fn repeat_dataset_if_needed(
+    config: &JepaDatasetConfig,
+    dataset: Box<dyn JepaDataset>,
+) -> Box<dyn JepaDataset> {
+    let repeat_count = config.repeat_count.max(1);
+    if repeat_count == 1 && config.repeat_mode == JepaDatasetRepeatMode::Preserve {
+        return dataset;
+    }
+    Box::new(RepeatedJepaDataset {
+        inner: dataset,
+        repeat_count,
+        mode: config.repeat_mode,
+        window_stride: config.frames.max(1) * config.stride.max(1),
+    })
+}
+
+fn sample_metadata_mut(sample: &mut JepaSample) -> Option<&mut JepaSampleMetadata> {
+    match sample {
+        JepaSample::Image { metadata, .. }
+        | JepaSample::Video { metadata, .. }
+        | JepaSample::PairedVideo { metadata, .. } => Some(metadata),
+        JepaSample::SyntheticVideo { .. } => None,
+    }
+}
+
+fn rewrite_repeated_metadata(
+    metadata: &mut JepaSampleMetadata,
+    mode: JepaDatasetRepeatMode,
+    repeat: usize,
+    base_index: usize,
+    virtual_index: usize,
+    _base_len: usize,
+    window_stride: usize,
+) {
+    let original_stream = original_stream_key(metadata);
+    let original_start = metadata.start_frame.unwrap_or(base_index);
+    metadata.original_stream = Some(original_stream.clone());
+    metadata.cache_id = Some(format!(
+        "{original_stream}:start={original_start}:row={base_index}"
+    ));
+
+    match mode {
+        JepaDatasetRepeatMode::Preserve => {}
+        JepaDatasetRepeatMode::ContinuousStreams => {
+            let offset = repeat * 1_000_000usize;
+            metadata.start_frame = Some(original_start + offset);
+        }
+        JepaDatasetRepeatMode::StitchedStream
+        | JepaDatasetRepeatMode::AdversarialStitchedStream => {
+            metadata.clip_id = Some("stitched_stream".to_string());
+            metadata.source = Some("stitched_stream".to_string());
+            metadata.domain = Some("stitched".to_string());
+            metadata.start_frame = Some(virtual_index * window_stride.max(1));
+        }
+    }
+}
+
+fn original_stream_key(metadata: &JepaSampleMetadata) -> String {
+    metadata
+        .original_stream
+        .as_ref()
+        .or(metadata.clip_id.as_ref())
+        .or(metadata.source.as_ref())
+        .or(metadata.domain.as_ref())
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        JepaDataset, JepaDatasetConfig, JepaDatasetKind, JepaDatasetRepeatMode, JepaManifestRow,
+        JepaSampleKind, dataset_from_config,
+    };
+    use std::fs;
+
+    fn write_manifest(rows: &[JepaManifestRow]) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let frame_dir = temp.path().join("frames");
+        fs::create_dir_all(&frame_dir).expect("frame dir");
+        for index in 0..2 {
+            let image = image::RgbImage::from_pixel(2, 2, image::Rgb([index as u8, 0, 0]));
+            image
+                .save(frame_dir.join(format!("{index:04}.png")))
+                .expect("frame");
+        }
+        let text = rows
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row.frames = Some(vec![frame_dir.join("0000.png"), frame_dir.join("0001.png")]);
+                serde_json::to_string(&row).expect("json")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(temp.path().join("manifest.jsonl"), text).expect("manifest");
+        temp
+    }
+
+    fn metadata(dataset: &dyn JepaDataset, index: usize) -> super::JepaSampleMetadata {
+        dataset
+            .sample(index)
+            .expect("sample")
+            .metadata()
+            .cloned()
+            .expect("metadata")
+    }
+
+    #[test]
+    fn repeated_dataset_can_make_streams_continuous() {
+        let temp = write_manifest(&[
+            JepaManifestRow {
+                clip_id: Some("a".into()),
+                domain: Some("d".into()),
+                start_frame: Some(0),
+                fps: None,
+                duration: None,
+                caption: None,
+                source: Some("src-a".into()),
+                image: None,
+                frames: None,
+                frame_dir: None,
+                teacher_frames: None,
+                teacher_frame_dir: None,
+                precomputed_context_indices: None,
+                precomputed_target_indices: None,
+                original_stream: None,
+                cache_id: None,
+            },
+            JepaManifestRow {
+                clip_id: Some("a".into()),
+                domain: Some("d".into()),
+                start_frame: Some(8),
+                fps: None,
+                duration: None,
+                caption: None,
+                source: Some("src-a".into()),
+                image: None,
+                frames: None,
+                frame_dir: None,
+                teacher_frames: None,
+                teacher_frame_dir: None,
+                precomputed_context_indices: None,
+                precomputed_target_indices: None,
+                original_stream: None,
+                cache_id: None,
+            },
+        ]);
+        let config = JepaDatasetConfig {
+            kind: JepaDatasetKind::Manifest,
+            sample_kind: JepaSampleKind::Video,
+            train_manifest: Some(temp.path().join("manifest.jsonl")),
+            eval_manifest: None,
+            frames: 2,
+            repeat_count: 2,
+            repeat_mode: JepaDatasetRepeatMode::ContinuousStreams,
+            ..JepaDatasetConfig::default()
+        };
+        let dataset = dataset_from_config(&config, true).expect("dataset");
+        assert_eq!(dataset.len(), 4);
+        assert_eq!(metadata(dataset.as_ref(), 0).start_frame, Some(0));
+        assert_eq!(metadata(dataset.as_ref(), 1).start_frame, Some(8));
+        assert_eq!(metadata(dataset.as_ref(), 2).start_frame, Some(1_000_000));
+        assert_eq!(
+            metadata(dataset.as_ref(), 2).cache_id.as_deref(),
+            Some("a:start=0:row=0")
+        );
+    }
+
+    #[test]
+    fn repeated_dataset_can_force_scene_stitching() {
+        let temp = write_manifest(&[
+            JepaManifestRow {
+                clip_id: Some("a".into()),
+                domain: Some("a-domain".into()),
+                start_frame: Some(0),
+                fps: None,
+                duration: None,
+                caption: None,
+                source: Some("src-a".into()),
+                image: None,
+                frames: None,
+                frame_dir: None,
+                teacher_frames: None,
+                teacher_frame_dir: None,
+                precomputed_context_indices: None,
+                precomputed_target_indices: None,
+                original_stream: None,
+                cache_id: None,
+            },
+            JepaManifestRow {
+                clip_id: Some("b".into()),
+                domain: Some("b-domain".into()),
+                start_frame: Some(0),
+                fps: None,
+                duration: None,
+                caption: None,
+                source: Some("src-b".into()),
+                image: None,
+                frames: None,
+                frame_dir: None,
+                teacher_frames: None,
+                teacher_frame_dir: None,
+                precomputed_context_indices: None,
+                precomputed_target_indices: None,
+                original_stream: None,
+                cache_id: None,
+            },
+        ]);
+        let config = JepaDatasetConfig {
+            kind: JepaDatasetKind::Manifest,
+            sample_kind: JepaSampleKind::Video,
+            train_manifest: Some(temp.path().join("manifest.jsonl")),
+            eval_manifest: None,
+            frames: 2,
+            repeat_count: 2,
+            repeat_mode: JepaDatasetRepeatMode::AdversarialStitchedStream,
+            ..JepaDatasetConfig::default()
+        };
+        let dataset = dataset_from_config(&config, true).expect("dataset");
+        let first = metadata(dataset.as_ref(), 0);
+        let second = metadata(dataset.as_ref(), 1);
+        assert_eq!(first.clip_id.as_deref(), Some("stitched_stream"));
+        assert_eq!(second.clip_id.as_deref(), Some("stitched_stream"));
+        assert_eq!(first.domain.as_deref(), Some("stitched"));
+        assert_eq!(first.original_stream.as_deref(), Some("a"));
+        assert_eq!(second.original_stream.as_deref(), Some("b"));
+        assert_eq!(second.start_frame, Some(2));
+    }
 }

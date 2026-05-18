@@ -20,14 +20,21 @@ use ciborium::Value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{TttEncoderConfig, VJepa2_1Model, VJepaConfig, VJepaTttModel};
+use crate::{AnyUp, AnyUpConfig, TttEncoderConfig, VJepa2_1Model, VJepaConfig, VJepaTttModel};
 
 pub const DEFAULT_BURN_JEPA_MODEL_ROOT_URL: &str = "https://aberration.technology/model/burn_jepa";
 pub const DEFAULT_BURN_JEPA_MODEL_BASE_URL: &str =
     "https://aberration.technology/model/burn_jepa/vjepa2_1_ttt";
+pub const DEFAULT_BURN_ANYUP_MODEL_ROOT_URL: &str =
+    "https://aberration.technology/model/burn_anyup";
+pub const DEFAULT_BURN_ANYUP_MODEL_BASE_URL: &str =
+    "https://aberration.technology/model/burn_anyup/anyup_multi_backbone";
+pub const DEFAULT_BURN_ANYUP_CHECKPOINT_PATH: &str =
+    "target/burn-anyup-checkpoints/anyup_multi_backbone.pth";
 pub const DEFAULT_BURNPACK_SHARD_MAX_BYTES: u64 = 20 * 1024 * 1024;
 pub const DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR: &str = ".burn_jepa";
 pub const DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR: &str = "models/burn_jepa";
+pub const DEFAULT_BURN_ANYUP_MODEL_CACHE_SUBDIR: &str = "models/burn_anyup";
 const BURNPACK_HEADER_SIZE: usize = 10;
 const BURNPACK_MAGIC_NUMBER: u32 = 0x4255_524E;
 const BURNPACK_TENSOR_ALIGNMENT: u64 = 256;
@@ -132,6 +139,71 @@ pub fn burn_jepa_model_profile_base_url(profile: BurnJepaModelProfile) -> String
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BurnAnyUpModelProfile {
+    #[default]
+    #[serde(
+        rename = "anyup_multi_backbone",
+        alias = "multi_backbone",
+        alias = "multi-backbone",
+        alias = "default",
+        alias = "paper"
+    )]
+    AnyupMultiBackbone,
+}
+
+impl BurnAnyUpModelProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AnyupMultiBackbone => "anyup_multi_backbone",
+        }
+    }
+
+    pub const fn valid_values() -> &'static [&'static str] {
+        &[
+            "anyup_multi_backbone",
+            "anyup-multi-backbone",
+            "multi_backbone",
+            "multi-backbone",
+            "default",
+            "paper",
+        ]
+    }
+}
+
+impl fmt::Display for BurnAnyUpModelProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BurnAnyUpModelProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "anyup_multi_backbone"
+            | "anyup-multi-backbone"
+            | "multi_backbone"
+            | "multi-backbone"
+            | "default"
+            | "paper" => Ok(Self::AnyupMultiBackbone),
+            other => Err(format!(
+                "unsupported burn_anyup model profile `{other}`; expected one of {}",
+                Self::valid_values().join(", ")
+            )),
+        }
+    }
+}
+
+pub fn burn_anyup_model_profile_base_url(profile: BurnAnyUpModelProfile) -> String {
+    format!(
+        "{}/{}",
+        DEFAULT_BURN_ANYUP_MODEL_ROOT_URL.trim_end_matches('/'),
+        profile.as_str()
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BurnJepaPipelinePackageManifest {
@@ -143,6 +215,54 @@ pub struct BurnJepaPipelinePackageManifest {
     pub model_base_url: String,
     pub jepa_config: VJepaConfig,
     pub ttt_config: Option<TttEncoderConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BurnAnyUpPackageManifest {
+    pub version: u32,
+    pub record_dtype: Option<String>,
+    pub burnpack: String,
+    pub parts_manifest: String,
+    pub model_base_url: String,
+    pub anyup_config: AnyUpConfig,
+}
+
+impl Default for BurnAnyUpPackageManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            record_dtype: None,
+            burnpack: "anyup.bpk".to_string(),
+            parts_manifest: "anyup.bpk.parts.json".to_string(),
+            model_base_url: DEFAULT_BURN_ANYUP_MODEL_BASE_URL.to_string(),
+            anyup_config: AnyUpConfig::default(),
+        }
+    }
+}
+
+impl BurnAnyUpPackageManifest {
+    pub fn from_json_str(json: &str) -> Result<Self> {
+        serde_json::from_str(json).context("parse burn_anyup package manifest")
+    }
+
+    pub fn to_json_string(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).context("serialize burn_anyup package manifest")
+    }
+
+    pub fn with_burnpack_paths(mut self, burnpack_path: &Path) -> Self {
+        self.burnpack = burnpack_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("anyup.bpk")
+            .to_string();
+        self.parts_manifest = burnpack_parts_manifest_path(burnpack_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("anyup.bpk.parts.json")
+            .to_string();
+        self
+    }
 }
 
 impl Default for BurnJepaPipelinePackageManifest {
@@ -243,6 +363,41 @@ pub struct BurnJepaModelBootstrapConfig {
     pub manifest_url: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BurnAnyUpModelBootstrapConfig {
+    pub cache_root: Option<PathBuf>,
+    pub model_profile: BurnAnyUpModelProfile,
+    pub model_base_url: String,
+    pub manifest_url: Option<String>,
+}
+
+impl Default for BurnAnyUpModelBootstrapConfig {
+    fn default() -> Self {
+        let model_profile = BurnAnyUpModelProfile::default();
+        Self {
+            cache_root: None,
+            model_profile,
+            model_base_url: burn_anyup_model_profile_base_url(model_profile),
+            manifest_url: None,
+        }
+    }
+}
+
+impl BurnAnyUpModelBootstrapConfig {
+    pub fn for_profile(model_profile: BurnAnyUpModelProfile) -> Self {
+        Self {
+            model_profile,
+            model_base_url: burn_anyup_model_profile_base_url(model_profile),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_env_overrides(self) -> Self {
+        apply_anyup_bootstrap_env_overrides(self)
+    }
+}
+
 impl Default for BurnJepaModelBootstrapConfig {
     fn default() -> Self {
         let model_profile = BurnJepaModelProfile::default();
@@ -281,7 +436,26 @@ pub struct BurnJepaModelPackageFiles {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BurnAnyUpModelPackageFiles {
+    pub cache_root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub parts_manifest_path: PathBuf,
+    pub part_paths: Vec<PathBuf>,
+    pub total_bytes: u64,
+    pub model_base_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BurnJepaModelDeployBundleReport {
+    pub output_dir: PathBuf,
+    pub manifest_path: PathBuf,
+    pub parts_manifest_path: PathBuf,
+    pub part_paths: Vec<PathBuf>,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BurnAnyUpModelDeployBundleReport {
     pub output_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub parts_manifest_path: PathBuf,
@@ -415,6 +589,13 @@ pub fn save_ttt_burnpack<B: Backend>(
     save_module_burnpack::<B, _>(model, output)
 }
 
+pub fn save_anyup_burnpack<B: Backend>(
+    model: &AnyUp<B>,
+    output: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    save_module_burnpack::<B, _>(model, output)
+}
+
 pub fn load_vjepa_burnpack<B: Backend>(
     config: &VJepaConfig,
     path: impl AsRef<Path>,
@@ -478,6 +659,17 @@ pub fn load_ttt_burnpack_parts<B: Backend>(
     Ok((model, result))
 }
 
+pub fn load_anyup_burnpack_parts<B: Backend>(
+    config: &AnyUpConfig,
+    parts: &[Vec<u8>],
+    device: &B::Device,
+) -> Result<(AnyUp<B>, ApplyResult)> {
+    let mut model = AnyUp::new(config.clone(), device)?;
+    let result = apply_burnpack_parts::<B, _>(&mut model, parts)?;
+    let model = force_module_float32::<B, _>(model);
+    Ok((model, result))
+}
+
 pub fn apply_burnpack_parts<B, M>(model: &mut M, parts: &[Vec<u8>]) -> Result<ApplyResult>
 where
     B: Backend,
@@ -534,6 +726,17 @@ pub fn write_pipeline_package_manifest(
     Ok(manifest_path.to_path_buf())
 }
 
+pub fn write_anyup_package_manifest(
+    manifest_path: impl AsRef<Path>,
+    manifest: &BurnAnyUpPackageManifest,
+) -> Result<PathBuf> {
+    let manifest_path = manifest_path.as_ref();
+    ensure_parent_dir(manifest_path)?;
+    fs::write(manifest_path, manifest.to_json_string()?)
+        .with_context(|| format!("write AnyUp package manifest {}", manifest_path.display()))?;
+    Ok(manifest_path.to_path_buf())
+}
+
 pub fn resolve_package_manifest_entry_path(
     manifest_path: &Path,
     entry_path: &str,
@@ -566,6 +769,27 @@ pub fn default_burn_jepa_model_cache_root_with_config(
     Ok(home
         .join(DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR)
         .join(DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR)
+        .join(config.model_profile.as_str()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_burn_anyup_model_cache_root() -> Result<PathBuf> {
+    default_burn_anyup_model_cache_root_with_config(&apply_anyup_bootstrap_env_overrides(
+        BurnAnyUpModelBootstrapConfig::default(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_burn_anyup_model_cache_root_with_config(
+    config: &BurnAnyUpModelBootstrapConfig,
+) -> Result<PathBuf> {
+    if let Some(cache_root) = &config.cache_root {
+        return Ok(expand_home_path(cache_root.clone()));
+    }
+    let home = user_home_dir().context("failed to resolve user home directory for model cache")?;
+    Ok(home
+        .join(DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR)
+        .join(DEFAULT_BURN_ANYUP_MODEL_CACHE_SUBDIR)
         .join(config.model_profile.as_str()))
 }
 
@@ -668,6 +892,108 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_or_bootstrap_burn_anyup_model_package() -> Result<BurnAnyUpModelPackageFiles> {
+    resolve_or_bootstrap_burn_anyup_model_package_with_config(&apply_anyup_bootstrap_env_overrides(
+        BurnAnyUpModelBootstrapConfig::default(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_or_bootstrap_burn_anyup_model_package_with_config(
+    config: &BurnAnyUpModelBootstrapConfig,
+) -> Result<BurnAnyUpModelPackageFiles> {
+    resolve_or_bootstrap_burn_anyup_model_package_with_config_and_progress(config, |_| {})
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_or_bootstrap_burn_anyup_model_package_with_config_and_progress<F>(
+    config: &BurnAnyUpModelBootstrapConfig,
+    progress: F,
+) -> Result<BurnAnyUpModelPackageFiles>
+where
+    F: Fn(String),
+{
+    let config = normalized_anyup_bootstrap_config(config);
+    let cache_root = default_burn_anyup_model_cache_root_with_config(&config)?;
+    progress(format!(
+        "resolving burn_anyup model cache under {}",
+        cache_root.display()
+    ));
+    fs::create_dir_all(&cache_root).with_context(|| {
+        format!(
+            "create AnyUp model cache directory {}",
+            cache_root.display()
+        )
+    })?;
+    let manifest_path = cache_root.join("manifest.json");
+    if let Some(files) = cached_anyup_package_files(&cache_root, &manifest_path)? {
+        progress("using cached burn_anyup package manifest".to_string());
+        return Ok(files);
+    }
+
+    let manifest_url = config
+        .manifest_url
+        .clone()
+        .unwrap_or_else(|| join_url(&config.model_base_url, "manifest.json"));
+    progress(format!(
+        "downloading burn_anyup package manifest {manifest_url}"
+    ));
+    ensure_file_cached(&manifest_path, &manifest_url, true)?;
+
+    let manifest_json = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read AnyUp package manifest {}", manifest_path.display()))?;
+    let manifest = BurnAnyUpPackageManifest::from_json_str(&manifest_json)
+        .with_context(|| format!("parse AnyUp package manifest {}", manifest_path.display()))?;
+    let parts_manifest_url = resolve_manifest_entry_url(&manifest_url, &manifest.parts_manifest);
+    let parts_manifest_path = safe_cache_entry_path(&cache_root, &manifest.parts_manifest)?;
+
+    progress(format!(
+        "downloading burn_anyup parts manifest {parts_manifest_url}"
+    ));
+    ensure_file_cached(&parts_manifest_path, &parts_manifest_url, true)?;
+    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
+    if parts_manifest.parts.is_empty() {
+        bail!(
+            "burn_anyup parts manifest {} contains no parts",
+            parts_manifest_path.display()
+        );
+    }
+
+    let total_parts = parts_manifest.parts.len();
+    for (index, part) in parts_manifest.parts.iter().enumerate() {
+        let part_path = safe_cache_entry_path(&cache_root, &part.path)?;
+        if part_matches_cache(&part_path, part)? {
+            progress(format!(
+                "cached burn_anyup shard {}/{}",
+                index + 1,
+                total_parts
+            ));
+            continue;
+        }
+        let part_url = resolve_manifest_entry_url(&parts_manifest_url, &part.path);
+        progress(format!(
+            "downloading burn_anyup shard {}/{}",
+            index + 1,
+            total_parts
+        ));
+        ensure_file_cached(&part_path, &part_url, false)?;
+        if !part_matches_cache(&part_path, part)? {
+            bail!(
+                "downloaded burn_anyup shard `{}` does not match manifest entry",
+                part_path.display()
+            );
+        }
+    }
+
+    cached_anyup_package_files(&cache_root, &manifest_path)?.ok_or_else(|| {
+        anyhow!(
+            "burn_anyup package cache remained incomplete after download: {}",
+            cache_root.display()
+        )
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn normalized_model_bootstrap_config(
     config: &BurnJepaModelBootstrapConfig,
 ) -> BurnJepaModelBootstrapConfig {
@@ -681,11 +1007,35 @@ fn normalized_model_bootstrap_config(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn normalized_anyup_bootstrap_config(
+    config: &BurnAnyUpModelBootstrapConfig,
+) -> BurnAnyUpModelBootstrapConfig {
+    let mut config = config.clone();
+    if config.model_base_url == DEFAULT_BURN_ANYUP_MODEL_BASE_URL
+        && config.model_profile != BurnAnyUpModelProfile::default()
+    {
+        config.model_base_url = burn_anyup_model_profile_base_url(config.model_profile);
+    }
+    config
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn burn_jepa_model_package_cache_complete(manifest_path: &Path) -> Result<bool> {
     let cache_root = manifest_path
         .parent()
         .ok_or_else(|| anyhow!("invalid package manifest path {}", manifest_path.display()))?;
     Ok(cached_model_package_files(cache_root, manifest_path)?.is_some())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn burn_anyup_model_package_cache_complete(manifest_path: &Path) -> Result<bool> {
+    let cache_root = manifest_path.parent().ok_or_else(|| {
+        anyhow!(
+            "invalid AnyUp package manifest path {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(cached_anyup_package_files(cache_root, manifest_path)?.is_some())
 }
 
 pub fn write_burn_jepa_model_deploy_bundle(
@@ -757,6 +1107,84 @@ pub fn write_burn_jepa_model_deploy_bundle(
     let deploy_manifest_path = output_dir.join("manifest.json");
     write_pipeline_package_manifest(&deploy_manifest_path, &manifest)?;
     Ok(BurnJepaModelDeployBundleReport {
+        output_dir: output_dir.to_path_buf(),
+        manifest_path: deploy_manifest_path,
+        parts_manifest_path: deploy_parts_manifest_path,
+        part_paths: deploy_part_paths,
+        total_bytes: parts_manifest.total_bytes,
+    })
+}
+
+pub fn write_burn_anyup_model_deploy_bundle(
+    manifest_path: impl AsRef<Path>,
+    output_dir: impl AsRef<Path>,
+    overwrite: bool,
+) -> Result<BurnAnyUpModelDeployBundleReport> {
+    let manifest_path = manifest_path.as_ref();
+    let output_dir = output_dir.as_ref();
+    if output_dir.exists() {
+        if !overwrite {
+            let mut entries = fs::read_dir(output_dir)
+                .with_context(|| format!("read output directory {}", output_dir.display()))?;
+            if entries.next().transpose()?.is_some() {
+                bail!(
+                    "AnyUp deploy bundle output directory `{}` is not empty; pass --overwrite",
+                    output_dir.display()
+                );
+            }
+        } else {
+            fs::remove_dir_all(output_dir).with_context(|| {
+                format!("remove old AnyUp deploy bundle {}", output_dir.display())
+            })?;
+        }
+    }
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create deploy bundle directory {}", output_dir.display()))?;
+
+    let manifest_json = fs::read_to_string(manifest_path)
+        .with_context(|| format!("read AnyUp package manifest {}", manifest_path.display()))?;
+    let mut manifest = BurnAnyUpPackageManifest::from_json_str(&manifest_json)
+        .with_context(|| format!("parse AnyUp package manifest {}", manifest_path.display()))?;
+    let source_parts_manifest_path =
+        resolve_package_manifest_entry_path(manifest_path, &manifest.parts_manifest)?;
+    let mut parts_manifest = read_parts_manifest(&source_parts_manifest_path)?;
+
+    let parts_manifest_name = file_name_string(&source_parts_manifest_path)?;
+    let deploy_parts_manifest_path = output_dir.join(&parts_manifest_name);
+    let mut deploy_part_paths = Vec::with_capacity(parts_manifest.parts.len());
+    for part in &mut parts_manifest.parts {
+        let source_part_path = resolve_part_entry_path(&source_parts_manifest_path, &part.path)?;
+        let part_name = file_name_string(&source_part_path)?;
+        let deploy_part_path = output_dir.join(&part_name);
+        fs::copy(&source_part_path, &deploy_part_path).with_context(|| {
+            format!(
+                "copy AnyUp burnpack shard {} -> {}",
+                source_part_path.display(),
+                deploy_part_path.display()
+            )
+        })?;
+        part.path = part_name;
+        deploy_part_paths.push(deploy_part_path);
+    }
+    manifest.parts_manifest = parts_manifest_name;
+    manifest.burnpack = Path::new(&manifest.burnpack)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("anyup.bpk")
+        .to_string();
+    fs::write(
+        &deploy_parts_manifest_path,
+        serde_json::to_string_pretty(&parts_manifest)?,
+    )
+    .with_context(|| {
+        format!(
+            "write AnyUp deploy parts manifest {}",
+            deploy_parts_manifest_path.display()
+        )
+    })?;
+    let deploy_manifest_path = output_dir.join("manifest.json");
+    write_anyup_package_manifest(&deploy_manifest_path, &manifest)?;
+    Ok(BurnAnyUpModelDeployBundleReport {
         output_dir: output_dir.to_path_buf(),
         manifest_path: deploy_manifest_path,
         parts_manifest_path: deploy_parts_manifest_path,
@@ -1253,6 +1681,42 @@ fn apply_model_bootstrap_env_overrides(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn apply_anyup_bootstrap_env_overrides(
+    mut config: BurnAnyUpModelBootstrapConfig,
+) -> BurnAnyUpModelBootstrapConfig {
+    let had_profile_default_url =
+        config.model_base_url == burn_anyup_model_profile_base_url(config.model_profile);
+    if let Ok(value) = std::env::var("BURN_ANYUP_MODEL_PROFILE")
+        .or_else(|_| std::env::var("BURN_ANYUP_MODEL_NAME"))
+    {
+        if let Ok(profile) = BurnAnyUpModelProfile::from_str(&value) {
+            config.model_profile = profile;
+            if had_profile_default_url {
+                config.model_base_url = burn_anyup_model_profile_base_url(profile);
+            }
+        }
+    }
+    if let Some(root) = std::env::var_os("BURN_ANYUP_CACHE_DIR") {
+        config.cache_root = Some(
+            PathBuf::from(root)
+                .join(DEFAULT_BURN_ANYUP_MODEL_CACHE_SUBDIR)
+                .join(config.model_profile.as_str())
+                .to_path_buf(),
+        );
+    }
+    if let Some(root) = std::env::var_os("BURN_ANYUP_MODEL_CACHE_DIR") {
+        config.cache_root = Some(PathBuf::from(root));
+    }
+    if let Ok(value) = std::env::var("BURN_ANYUP_MODEL_BASE_URL") {
+        config.model_base_url = value;
+    }
+    if let Ok(value) = std::env::var("BURN_ANYUP_MODEL_MANIFEST_URL") {
+        config.manifest_url = Some(value);
+    }
+    config
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn cached_model_package_files(
     cache_root: &Path,
     manifest_path: &Path,
@@ -1291,6 +1755,54 @@ fn cached_model_package_files(
         part_paths.push(path);
     }
     Ok(Some(BurnJepaModelPackageFiles {
+        cache_root: cache_root.to_path_buf(),
+        manifest_path: manifest_path.to_path_buf(),
+        parts_manifest_path,
+        part_paths,
+        total_bytes: parts_manifest.total_bytes,
+        model_base_url: manifest.model_base_url,
+    }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_anyup_package_files(
+    cache_root: &Path,
+    manifest_path: &Path,
+) -> Result<Option<BurnAnyUpModelPackageFiles>> {
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest_json = match fs::read_to_string(manifest_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let manifest = match BurnAnyUpPackageManifest::from_json_str(&manifest_json) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let parts_manifest_path = match safe_cache_entry_path(cache_root, &manifest.parts_manifest) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let parts_manifest = match read_parts_manifest(&parts_manifest_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if parts_manifest.parts.is_empty() {
+        return Ok(None);
+    }
+    let mut part_paths = Vec::with_capacity(parts_manifest.parts.len());
+    for part in &parts_manifest.parts {
+        let path = match safe_cache_entry_path(cache_root, &part.path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !part_matches_cache(&path, part)? {
+            return Ok(None);
+        }
+        part_paths.push(path);
+    }
+    Ok(Some(BurnAnyUpModelPackageFiles {
         cache_root: cache_root.to_path_buf(),
         manifest_path: manifest_path.to_path_buf(),
         parts_manifest_path,
@@ -1550,6 +2062,26 @@ mod tests {
         (manifest_path, parts)
     }
 
+    fn write_tiny_anyup_package(root: &Path, shard_bytes: u64) -> (PathBuf, BurnpackPartsReport) {
+        let device = Default::default();
+        let config = AnyUpConfig::tiny_for_tests();
+        let model = AnyUp::<B>::new(config.clone(), &device).expect("tiny AnyUp");
+        let burnpack = root.join("anyup.bpk");
+        save_anyup_burnpack(&model, &burnpack).expect("save anyup bpk");
+        let parts =
+            write_burnpack_parts_for_browser(&burnpack, shard_bytes, true).expect("write parts");
+        let manifest = BurnAnyUpPackageManifest {
+            record_dtype: Some("f16".to_string()),
+            anyup_config: config,
+            model_base_url: "http://127.0.0.1/anyup".to_string(),
+            ..BurnAnyUpPackageManifest::default()
+        }
+        .with_burnpack_paths(&burnpack);
+        let manifest_path = root.join("manifest.json");
+        write_anyup_package_manifest(&manifest_path, &manifest).expect("write manifest");
+        (manifest_path, parts)
+    }
+
     #[test]
     fn model_profiles_resolve_distinct_cdn_routes() {
         assert_eq!(
@@ -1580,6 +2112,95 @@ mod tests {
             serde_json::from_str::<BurnJepaModelProfile>("\"vjepa21_ttt\"")
                 .expect("deserialize ttt alias"),
             BurnJepaModelProfile::Vjepa21Ttt
+        );
+    }
+
+    #[test]
+    fn anyup_model_profile_resolves_cdn_route() {
+        assert_eq!(
+            BurnAnyUpModelProfile::from_str("paper").expect("anyup profile"),
+            BurnAnyUpModelProfile::AnyupMultiBackbone
+        );
+        assert_eq!(
+            burn_anyup_model_profile_base_url(BurnAnyUpModelProfile::AnyupMultiBackbone),
+            DEFAULT_BURN_ANYUP_MODEL_BASE_URL
+        );
+        assert_eq!(
+            serde_json::to_string(&BurnAnyUpModelProfile::AnyupMultiBackbone)
+                .expect("serialize anyup"),
+            "\"anyup_multi_backbone\""
+        );
+        assert_eq!(
+            serde_json::from_str::<BurnAnyUpModelProfile>("\"multi-backbone\"")
+                .expect("deserialize anyup alias"),
+            BurnAnyUpModelProfile::AnyupMultiBackbone
+        );
+    }
+
+    #[test]
+    fn tiny_anyup_burnpack_parts_roundtrip() {
+        let device = Default::default();
+        let config = AnyUpConfig::tiny_for_tests();
+        let model = AnyUp::<B>::new(config.clone(), &device).expect("tiny AnyUp");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let burnpack = temp.path().join("tiny-anyup.bpk");
+        save_anyup_burnpack(&model, &burnpack).expect("save anyup bpk");
+        let dtype_counts = burnpack_dtype_counts(&burnpack).expect("dtype counts");
+        assert!(dtype_counts.get("F16").copied().unwrap_or(0) > 0);
+        assert_eq!(dtype_counts.get("F32").copied().unwrap_or(0), 0);
+        let report = write_burnpack_parts_for_browser(&burnpack, 1024, true).expect("write parts");
+        let parts_dtype_counts =
+            burnpack_parts_dtype_counts(&report.manifest_path).expect("parts dtype counts");
+        assert_eq!(parts_dtype_counts, dtype_counts);
+        let parts = report
+            .part_paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read parts");
+        let (loaded, result) =
+            load_anyup_burnpack_parts::<B>(&config, &parts, &device).expect("load parts");
+        assert!(!result.applied.is_empty());
+        assert!(result.missing.is_empty());
+        assert!(result.errors.is_empty());
+        let image = Tensor::<B, 4>::zeros([1, 3, 16, 16], &device);
+        let features = Tensor::<B, 4>::zeros([1, config.qk_dim, 4, 4], &device);
+        let output = loaded.forward(image, features, Some([16, 16]), Some(4));
+        assert_eq!(output.shape().dims::<4>(), [1, config.qk_dim, 16, 16]);
+        let values = output
+            .slice([0..1, 0..1, 0..2, 0..2])
+            .to_data()
+            .to_vec::<f32>()
+            .expect("output sample");
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn anyup_deploy_bundle_contains_clean_cdn_assets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source dir");
+        let (manifest_path, parts) = write_tiny_anyup_package(&source, 1024);
+        let output = temp.path().join("deploy");
+        let report =
+            write_burn_anyup_model_deploy_bundle(&manifest_path, &output, false).expect("bundle");
+
+        assert_eq!(report.manifest_path, output.join("manifest.json"));
+        assert!(report.manifest_path.exists());
+        assert!(report.parts_manifest_path.exists());
+        assert_eq!(report.part_paths.len(), parts.part_paths.len());
+        assert!(!output.join("anyup.bpk").exists());
+        let manifest = BurnAnyUpPackageManifest::from_json_str(
+            &fs::read_to_string(&report.manifest_path).unwrap(),
+        )
+        .expect("manifest");
+        assert_eq!(manifest.parts_manifest, "anyup.bpk.parts.json");
+        let parts_manifest = read_parts_manifest(&report.parts_manifest_path).expect("parts");
+        assert!(
+            parts_manifest
+                .parts
+                .iter()
+                .all(|part| !part.path.contains('/'))
         );
     }
 
@@ -1741,6 +2362,38 @@ mod tests {
         server.requests.store(0, Ordering::SeqCst);
         let second = resolve_or_bootstrap_burn_jepa_model_package_with_config(&config)
             .expect("reuse package cache");
+        assert_eq!(second.manifest_path, first.manifest_path);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_anyup_bootstrap_downloads_and_reuses_sharded_package_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("remote-anyup");
+        fs::create_dir_all(&source).expect("remote dir");
+        let (_manifest_path, parts) = write_tiny_anyup_package(&source, 1024);
+        assert!(parts.part_paths.len() > 1);
+        let server = TestServer::serve(source);
+        let cache_root = temp.path().join("anyup-cache");
+        let config = BurnAnyUpModelBootstrapConfig {
+            cache_root: Some(cache_root.clone()),
+            model_profile: BurnAnyUpModelProfile::AnyupMultiBackbone,
+            model_base_url: server.base_url.clone(),
+            manifest_url: None,
+        };
+
+        let first = resolve_or_bootstrap_burn_anyup_model_package_with_config(&config)
+            .expect("bootstrap AnyUp package");
+        assert_eq!(first.manifest_path, cache_root.join("manifest.json"));
+        assert!(first.parts_manifest_path.exists());
+        assert_eq!(first.part_paths.len(), parts.part_paths.len());
+        assert!(burn_anyup_model_package_cache_complete(&first.manifest_path).unwrap());
+        let requests = server.requests.load(Ordering::SeqCst);
+        assert!(requests >= 2 + parts.part_paths.len());
+
+        server.requests.store(0, Ordering::SeqCst);
+        let second = resolve_or_bootstrap_burn_anyup_model_package_with_config(&config)
+            .expect("reuse AnyUp package cache");
         assert_eq!(second.manifest_path, first.manifest_path);
         assert_eq!(server.requests.load(Ordering::SeqCst), 0);
     }

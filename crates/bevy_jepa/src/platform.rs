@@ -287,6 +287,7 @@ pub mod camera {
     thread_local! {
         pub static SAMPLE_RECEIVER: RefCell<Option<RgbaImage>> = const { RefCell::new(None) };
         static MODEL_PACKAGE: RefCell<Option<WasmModelPackage>> = const { RefCell::new(None) };
+        static ANYUP_MODEL_PACKAGE: RefCell<Option<WasmModelPackage>> = const { RefCell::new(None) };
     }
 
     #[derive(Clone, Debug)]
@@ -320,6 +321,20 @@ pub mod camera {
         });
     }
 
+    #[wasm_bindgen]
+    pub fn anyup_model_package_input(manifest_json: &str, parts: Array) {
+        let package = WasmModelPackage {
+            manifest_json: manifest_json.to_string(),
+            parts: parts
+                .iter()
+                .map(|part| Uint8Array::new(&part).to_vec())
+                .collect(),
+        };
+        ANYUP_MODEL_PACKAGE.with(|cell| {
+            *cell.borrow_mut() = Some(package);
+        });
+    }
+
     pub fn receive_image() -> Option<RgbaImage> {
         SAMPLE_RECEIVER.with(|receiver| receiver.borrow_mut().take())
     }
@@ -328,18 +343,28 @@ pub mod camera {
         if let Some(package) = MODEL_PACKAGE.with(|cell| cell.borrow().clone()) {
             return Some(package);
         }
-        let package = read_window_model_package()?;
+        let package = read_window_model_package("__burnJepaModelPackage")?;
         MODEL_PACKAGE.with(|cell| {
             *cell.borrow_mut() = Some(package.clone());
         });
         Some(package)
     }
 
-    fn read_window_model_package() -> Option<WasmModelPackage> {
+    pub fn anyup_model_package() -> Option<WasmModelPackage> {
+        if let Some(package) = ANYUP_MODEL_PACKAGE.with(|cell| cell.borrow().clone()) {
+            return Some(package);
+        }
+        let package = read_window_model_package("__burnAnyupModelPackage")?;
+        ANYUP_MODEL_PACKAGE.with(|cell| {
+            *cell.borrow_mut() = Some(package.clone());
+        });
+        Some(package)
+    }
+
+    fn read_window_model_package(property: &str) -> Option<WasmModelPackage> {
         let window = web_sys::window()?;
         let window_value = JsValue::from(window);
-        let package =
-            Reflect::get(&window_value, &JsValue::from_str("__burnJepaModelPackage")).ok()?;
+        let package = Reflect::get(&window_value, &JsValue::from_str(property)).ok()?;
         if package.is_null() || package.is_undefined() {
             return None;
         }

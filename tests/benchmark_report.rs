@@ -528,7 +528,8 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(viewer_config.contains("impl Deref for BevyJepaConfig"));
     assert!(viewer_policy.contains("MIN_PIPELINE_IMAGE_SIZE: usize = 256"));
     assert!(viewer_policy.contains("DEFAULT_IMAGE_SIZE: usize = 512"));
-    assert!(viewer_config.contains("burn-jepa-production-final-256"));
+    assert!(viewer_config.contains("target/burn-jepa-web/model/vjepa2_1_ttt/manifest.json"));
+    assert!(viewer_docs.contains("BURN_JEPA_MODEL_MANIFEST"));
     assert!(viewer_config.contains("~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"));
     assert!(viewer_policy.contains("DEFAULT_HIGH_RES_PCA_EVERY: u64 = 0"));
     assert!(viewer_policy.contains("DEFAULT_PCA_UPDATE_EVERY: u64 = 1"));
