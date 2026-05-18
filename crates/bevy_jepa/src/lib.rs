@@ -3327,6 +3327,7 @@ fn tensor_rgba_to_host(tensor: Tensor<JepaBevyBackend, 3>) -> Result<Vec<u8>> {
         .collect())
 }
 
+#[allow(clippy::type_complexity)]
 fn update_metrics_overlay(
     config: Res<BevyJepaConfig>,
     metrics: Res<BevyJepaMetrics>,
@@ -3742,6 +3743,7 @@ fn publish_wasm_metrics(metrics: &BevyJepaMetrics) {
 #[cfg(not(target_arch = "wasm32"))]
 fn publish_wasm_metrics(_metrics: &BevyJepaMetrics) {}
 
+#[allow(clippy::type_complexity)]
 fn control_button_interactions(
     mut interactions: Query<
         (&Interaction, &JepaControlButton),
@@ -3835,6 +3837,7 @@ fn slider_normalized_from_relative_x(relative_x: f32) -> f32 {
     (relative_x + 0.5).clamp(0.0, 1.0)
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_controls_ui(
     config: Res<BevyJepaConfig>,
     controls: Res<JepaControlsState>,
@@ -3905,6 +3908,7 @@ fn update_controls_ui(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn update_panel_layout(
     config: Res<BevyJepaConfig>,
     texture: Res<JepaPanelTextures>,

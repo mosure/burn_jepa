@@ -45,10 +45,10 @@ pub(super) fn load_viewer_encoder(
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    if config.encoder_source != BevyJepaEncoderSource::TinyTest {
-        if let Some(package_manifest_path) = effective_model_manifest_path(config)? {
-            return load_native_package_encoder(&package_manifest_path, image_size, device);
-        }
+    if config.encoder_source != BevyJepaEncoderSource::TinyTest
+        && let Some(package_manifest_path) = effective_model_manifest_path(config)?
+    {
+        return load_native_package_encoder(&package_manifest_path, image_size, device);
     }
 
     match config.encoder_source {

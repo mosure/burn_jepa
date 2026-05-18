@@ -600,8 +600,8 @@ struct BpkCheckpointParityReport {
 
 #[cfg(feature = "ndarray")]
 enum NativeBpkModel {
-    Base(crate::VJepa2_1Model<burn::backend::NdArray<f32>>),
-    Ttt(crate::VJepaTttModel<burn::backend::NdArray<f32>>),
+    Base(Box<crate::VJepa2_1Model<burn::backend::NdArray<f32>>>),
+    Ttt(Box<crate::VJepaTttModel<burn::backend::NdArray<f32>>>),
 }
 
 #[cfg(feature = "ndarray")]
@@ -625,7 +625,6 @@ fn verify_bpk_ndarray(
     type B = burn::backend::NdArray<f32>;
 
     let package = if let Some(manifest_path) = manifest_path {
-        let manifest_path = manifest_path;
         let manifest_json = std::fs::read_to_string(&manifest_path)?;
         let manifest = crate::BurnJepaPipelinePackageManifest::from_json_str(&manifest_json)?;
         let parts_manifest_path =
@@ -677,7 +676,7 @@ fn verify_bpk_ndarray(
             let (model, result) =
                 crate::load_vjepa_burnpack_parts::<B>(&manifest.jepa_config, &parts, &device)?;
             let dtype_counts = crate::module_dtype_counts::<B, _>(&model);
-            (NativeBpkModel::Base(model), result, dtype_counts)
+            (NativeBpkModel::Base(Box::new(model)), result, dtype_counts)
         }
         crate::BurnJepaPackageModelKind::Ttt => {
             let ttt_config = manifest
@@ -691,7 +690,7 @@ fn verify_bpk_ndarray(
                 &device,
             )?;
             let dtype_counts = crate::module_dtype_counts::<B, _>(&model);
-            (NativeBpkModel::Ttt(model), result, dtype_counts)
+            (NativeBpkModel::Ttt(Box::new(model)), result, dtype_counts)
         }
     };
     ensure!(
@@ -1194,8 +1193,10 @@ fn export_anyup_bpk_ndarray(
     type B = burn::backend::NdArray<f32>;
 
     let device = Default::default();
-    let mut anyup_config = crate::AnyUpConfig::default();
-    anyup_config.input_dim = 3;
+    let anyup_config = crate::AnyUpConfig {
+        input_dim: 3,
+        ..Default::default()
+    };
     let mut anyup = crate::AnyUp::<B>::new(anyup_config.clone(), &device)?;
     let mut load_report = None;
     if weights.exists() {

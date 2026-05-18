@@ -658,7 +658,7 @@ mod gpu_tests {
         init_device as init_burn_device, RuntimeOptions as BurnRuntimeOptions,
         WgpuSetup as BurnWgpuSetup,
     };
-    use futures::executor::block_on;
+    use futures_lite::future::block_on;
     use std::sync::Arc;
     use wgpu::{
         util::TextureDataOrder, CommandEncoderDescriptor, ComputePassDescriptor, DeviceDescriptor,

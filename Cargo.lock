@@ -669,6 +669,7 @@ dependencies = [
  "burn-wgpu",
  "bytemuck",
  "console_error_panic_hook",
+ "futures-lite",
  "getrandom 0.3.4",
  "getrandom 0.4.2",
  "wasm-bindgen",

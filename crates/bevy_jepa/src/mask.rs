@@ -34,6 +34,7 @@ pub(super) fn run_sparse_mask_node(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_sparse_mask_node_with_refresh_state(
     config: &BevyJepaConfig,
     prev_image: Option<&Tensor<JepaBevyBackend, 4>>,
@@ -63,6 +64,7 @@ pub(super) fn run_sparse_mask_node_with_refresh_state(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn patch_diff_mask(
     prev_image: Option<&Tensor<JepaBevyBackend, 4>>,
     prev_rgba: Option<&RgbaImage>,

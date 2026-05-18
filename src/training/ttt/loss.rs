@@ -331,21 +331,21 @@ pub(super) fn latent_regularization_loss<B: Backend>(
         });
         count += 1;
     }
-    if regularization.covariance_weight > 0.0 {
-        if let Some(loss) = covariance_sketch_loss(
+    if regularization.covariance_weight > 0.0
+        && let Some(loss) = covariance_sketch_loss(
             centered,
             valid_mask,
             valid_tokens,
             batch * token_count,
             regularization.covariance_sketch_dim.min(dim),
-        ) {
-            let loss = loss.mul_scalar(regularization.covariance_weight as f64);
-            total = Some(match total {
-                Some(total) => total + loss,
-                None => loss,
-            });
-            count += 1;
-        }
+        )
+    {
+        let loss = loss.mul_scalar(regularization.covariance_weight as f64);
+        total = Some(match total {
+            Some(total) => total + loss,
+            None => loss,
+        });
+        count += 1;
     }
     total.map(|total| {
         total

@@ -104,3 +104,6 @@ features = [
   'Node',
   'Window',
 ]
+
+[dev-dependencies]
+futures-lite = "2"

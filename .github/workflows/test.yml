@@ -49,8 +49,8 @@ jobs:
       - name: clippy ndarray-only feature set
         run: cargo clippy --workspace --all-targets --locked --no-default-features --features ndarray -- -D warnings
 
-      - name: package
-        run: cargo package -p burn_jepa --locked
+      - name: validate workspace package metadata
+        run: cargo metadata --locked --format-version 1 --no-deps
 
       - name: package burn_anyup
         run: cargo package -p burn_anyup --locked

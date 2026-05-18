@@ -328,24 +328,13 @@ impl Default for BurnpackPartsManifest {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BurnpackPartEntry {
     pub path: String,
     pub bytes: u64,
     pub sha256: String,
     pub tensors: usize,
-}
-
-impl Default for BurnpackPartEntry {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            bytes: 0,
-            sha256: String::new(),
-            tensors: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1652,12 +1641,11 @@ fn apply_model_bootstrap_env_overrides(
         config.model_base_url == burn_jepa_model_profile_base_url(config.model_profile);
     if let Ok(value) =
         std::env::var("BURN_JEPA_MODEL_PROFILE").or_else(|_| std::env::var("BURN_JEPA_MODEL_NAME"))
+        && let Ok(profile) = BurnJepaModelProfile::from_str(&value)
     {
-        if let Ok(profile) = BurnJepaModelProfile::from_str(&value) {
-            config.model_profile = profile;
-            if had_profile_default_url {
-                config.model_base_url = burn_jepa_model_profile_base_url(profile);
-            }
+        config.model_profile = profile;
+        if had_profile_default_url {
+            config.model_base_url = burn_jepa_model_profile_base_url(profile);
         }
     }
     if let Some(root) = std::env::var_os("BURN_JEPA_CACHE_DIR") {
@@ -1688,12 +1676,11 @@ fn apply_anyup_bootstrap_env_overrides(
         config.model_base_url == burn_anyup_model_profile_base_url(config.model_profile);
     if let Ok(value) = std::env::var("BURN_ANYUP_MODEL_PROFILE")
         .or_else(|_| std::env::var("BURN_ANYUP_MODEL_NAME"))
+        && let Ok(profile) = BurnAnyUpModelProfile::from_str(&value)
     {
-        if let Ok(profile) = BurnAnyUpModelProfile::from_str(&value) {
-            config.model_profile = profile;
-            if had_profile_default_url {
-                config.model_base_url = burn_anyup_model_profile_base_url(profile);
-            }
+        config.model_profile = profile;
+        if had_profile_default_url {
+            config.model_base_url = burn_anyup_model_profile_base_url(profile);
         }
     }
     if let Some(root) = std::env::var_os("BURN_ANYUP_CACHE_DIR") {

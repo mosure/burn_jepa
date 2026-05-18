@@ -180,8 +180,13 @@ fn default_mask_source_is_patch_diff() {
 
 #[test]
 fn anyup_panel_visibility_follows_high_res_cadence() {
-    let mut config = BevyJepaConfig::default();
-    config.high_res_pca_every = 0;
+    let mut config = BevyJepaConfig {
+        pipeline: FeatureFrameViewerConfig {
+            high_res_pca_every: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     assert!(!high_res_panel_enabled(&config));
     assert_eq!(visible_panel_count(&config), 3);
 
@@ -474,7 +479,10 @@ fn default_viewer_pca_uses_smooth_rolling_updates() {
     assert_eq!(pca_update.every_n_frames, 1);
     assert_eq!(pca_update.sample_window_frames, 16);
     assert_eq!(pca_update.min_sample_frames, 2);
-    assert_eq!(pca_update.iterations_per_update, 1);
+    assert_eq!(
+        pca_update.iterations_per_update,
+        DEFAULT_PCA_UPDATE_ITERATIONS
+    );
 }
 
 #[test]

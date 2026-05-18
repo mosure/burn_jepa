@@ -530,6 +530,7 @@ fn bench_feature_memory_backend<B, MakeDevice>(
     bench_feature_memory_row_reset::<B, _>(c, backend_name, make_device);
 }
 
+#[allow(dead_code)]
 fn bench_feature_memory_backend_without_row_reset<B, MakeDevice>(
     c: &mut Criterion,
     backend_name: &str,
