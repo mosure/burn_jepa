@@ -3,7 +3,7 @@
 use burn::tensor::Tensor;
 use burn::tensor::backend::BackendTypes;
 use burn_jepa::{
-    AnyUp, AnyUpConfig, SparseImageTokenGrid, SparseJepaAnyUpPcaEncodePath,
+    AnyUp, AnyUpConfig, FeatureFrameRequest, SparseImageTokenGrid, SparseJepaAnyUpPcaEncodePath,
     SparseJepaAnyUpPcaMeasurementConfig, SparseJepaAnyUpPcaPipeline,
     SparseJepaAnyUpPcaPipelineConfig, SparseMaskBatch, SparsePatchifyBatchPlan, SparsePatchifyPlan,
     SparseTokenMask, TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TttEncoderConfig,
@@ -110,9 +110,10 @@ fn wgpu_highres_pipeline_uses_sparse_image_patchify_encode_path() {
         SparsePatchifyBatchPlan::new(mask_batch, pipeline.grid(), &device).expect("patchify plan");
 
     let measured = pipeline
-        .step_image_with_sparse_patchify_plan_wgpu_measured(
+        .step_image_with_sparse_patchify_plan_wgpu_nodes_measured(
             image,
             &patchify_plan,
+            FeatureFrameRequest::none(),
             SparseJepaAnyUpPcaMeasurementConfig::enabled(),
         )
         .expect("sparse patchify high-res step");
@@ -126,9 +127,11 @@ fn wgpu_highres_pipeline_uses_sparse_image_patchify_encode_path() {
         [1, 2, 32]
     );
     assert_eq!(
-        measured.output.pca_display.shape().dims::<4>(),
-        [1, 3, config.image_size, config.image_size]
+        measured.output.low_res.features.shape().dims::<4>(),
+        [1, 32, config.grid_height(), config.grid_width()]
     );
+    assert!(!measured.output.has_low_res_pca());
+    assert!(!measured.output.has_high_res_pca());
 }
 
 #[test]

@@ -7,7 +7,7 @@ use crate::{
     TokenGridShape, TttState, VJepa2_1Model, VJepaConfig, VJepaEncoderOutput, VJepaTttModel,
     apply_token_mask, jepa_feature_tokens_to_nchw,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use burn_anyup::{AnyUp, AnyUpImageGrid};
@@ -80,6 +80,165 @@ impl SparseJepaAnyUpPcaMeasurementConfig {
             sync_backend: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TttRuntimeCollapseGuardAction {
+    None,
+    #[default]
+    Decay,
+    Reset,
+    FreezeUpdates,
+}
+
+impl TttRuntimeCollapseGuardAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Decay => "decay",
+            Self::Reset => "reset",
+            Self::FreezeUpdates => "freeze-updates",
+        }
+    }
+}
+
+impl fmt::Display for TttRuntimeCollapseGuardAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TttRuntimeCollapseGuardAction {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "decay" => Ok(Self::Decay),
+            "reset" => Ok(Self::Reset),
+            "freeze-updates" | "freeze_updates" => Ok(Self::FreezeUpdates),
+            other => bail!(
+                "unknown TTT runtime collapse guard action `{other}`; expected none, decay, reset, or freeze-updates"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TttRuntimeStateConfig {
+    /// Apply TTT fast-memory update policy during image-stream inference.
+    pub enabled: bool,
+    /// Update fast weights from the current hidden state. Disable for frozen-memory diagnostics.
+    pub update_fast_weight: bool,
+    /// Multiplicative fast-memory decay applied after each processed frame.
+    pub state_decay_per_frame: f64,
+    /// Periodic reset cadence in processed frames. Zero disables interval resets.
+    pub reset_interval_frames: u64,
+    /// Sample token/state diagnostics every N processed frames. Zero disables diagnostics.
+    pub metrics_interval_frames: u64,
+    /// Enable sampled collapse guard diagnostics and mitigation.
+    pub collapse_guard_enabled: bool,
+    /// Action taken when the sampled rollout looks collapsed or numerically unstable.
+    pub collapse_guard_action: TttRuntimeCollapseGuardAction,
+    /// Extra fast-memory decay factor used by the decay collapse guard action.
+    pub collapse_guard_decay: f64,
+    /// Trigger guard when per-token spatial standard deviation RMS falls below this value.
+    pub min_token_spatial_std_rms: f64,
+    /// Trigger guard when sampled mean pairwise token cosine exceeds this value.
+    pub max_mean_pairwise_token_cosine: f64,
+    /// Trigger guard when fast-weight RMS exceeds this value. Non-positive disables this check.
+    pub max_state_fast_weight_rms: f64,
+}
+
+impl Default for TttRuntimeStateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            update_fast_weight: true,
+            state_decay_per_frame: 0.998_1,
+            reset_interval_frames: 64,
+            metrics_interval_frames: 0,
+            collapse_guard_enabled: false,
+            collapse_guard_action: TttRuntimeCollapseGuardAction::Decay,
+            collapse_guard_decay: 0.25,
+            min_token_spatial_std_rms: 1.0e-3,
+            max_mean_pairwise_token_cosine: 0.995,
+            max_state_fast_weight_rms: 0.0,
+        }
+    }
+}
+
+impl TttRuntimeStateConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            update_fast_weight: false,
+            collapse_guard_enabled: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.state_decay_per_frame.is_finite()
+                && (0.0..=1.0).contains(&self.state_decay_per_frame),
+            "TTT runtime state decay must be finite and in [0, 1]"
+        );
+        ensure!(
+            self.collapse_guard_decay.is_finite()
+                && (0.0..=1.0).contains(&self.collapse_guard_decay),
+            "TTT runtime collapse guard decay must be finite and in [0, 1]"
+        );
+        ensure!(
+            self.min_token_spatial_std_rms.is_finite() && self.min_token_spatial_std_rms >= 0.0,
+            "TTT runtime min token spatial std must be finite and non-negative"
+        );
+        ensure!(
+            self.max_mean_pairwise_token_cosine.is_finite()
+                && (-1.0..=1.0).contains(&self.max_mean_pairwise_token_cosine),
+            "TTT runtime max mean pairwise token cosine must be finite and in [-1, 1]"
+        );
+        ensure!(
+            self.max_state_fast_weight_rms.is_finite(),
+            "TTT runtime max state fast-weight RMS must be finite"
+        );
+        ensure!(
+            !self.collapse_guard_enabled || self.metrics_interval_frames > 0,
+            "TTT runtime collapse guard requires metrics_interval_frames > 0"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FeatureTokenStabilityMetrics {
+    pub measured: bool,
+    pub token_spatial_std_rms: f64,
+    pub token_norm_mean: f64,
+    pub token_norm_std: f64,
+    pub mean_pairwise_token_cosine: f64,
+    pub collapse_score: f64,
+    pub sampled_tokens: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TttRuntimeStateMetrics {
+    pub enabled: bool,
+    pub update_fast_weight: bool,
+    pub frame_index: u64,
+    pub frames_since_reset: u64,
+    pub reset_count: u64,
+    pub decay_count: u64,
+    pub collapse_guard_triggers: u64,
+    pub state_decay_applied: bool,
+    pub collapse_guard_triggered: bool,
+    pub collapse_guard_action: Option<TttRuntimeCollapseGuardAction>,
+    pub state_fast_weight_rms: Option<f64>,
+    pub token_stability: Option<FeatureTokenStabilityMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -240,8 +399,17 @@ pub struct SparseJepaAnyUpPcaStageMetrics {
     pub encode_path: SparseJepaAnyUpPcaEncodePath,
     pub frame_count: usize,
     pub dense_tokens_per_frame: usize,
+    /// Backward-compatible sparse width for cache writes.
     pub sparse_width: usize,
     pub valid_sparse_tokens: usize,
+    /// Fixed row width used for cache writes.
+    pub write_width: usize,
+    /// Non-padding cache-write tokens across the batch.
+    pub valid_write_tokens: usize,
+    /// Fixed row width supplied to the encoder.
+    pub encode_width: usize,
+    /// Non-padding encoder tokens across the batch.
+    pub valid_encode_tokens: usize,
     pub output_pixels: usize,
     pub encode_us: u64,
     pub cache_update_us: u64,
@@ -256,7 +424,15 @@ pub struct SparseJepaAnyUpPcaStageMetrics {
     pub pca_sample_frames: usize,
     pub pca_update_applied: bool,
     pub pca_update_tokens: usize,
+    pub ttt_runtime: TttRuntimeStateMetrics,
     pub total_us: u64,
+}
+
+impl SparseJepaAnyUpPcaStageMetrics {
+    fn set_encode_mask<B: Backend>(&mut self, mask: &SparseMaskBatch<B>) {
+        self.encode_width = mask.len();
+        self.valid_encode_tokens = mask.valid_token_count();
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -268,6 +444,7 @@ pub struct SparseJepaAnyUpPcaPipelineConfig {
     pub anyup_q_chunk_size: Option<usize>,
     pub update_pca_online: bool,
     pub measurement: SparseJepaAnyUpPcaMeasurementConfig,
+    pub ttt_runtime: TttRuntimeStateConfig,
 }
 
 impl Default for SparseJepaAnyUpPcaPipelineConfig {
@@ -279,6 +456,7 @@ impl Default for SparseJepaAnyUpPcaPipelineConfig {
             anyup_q_chunk_size: Some(16),
             update_pca_online: false,
             measurement: SparseJepaAnyUpPcaMeasurementConfig::disabled(),
+            ttt_runtime: TttRuntimeStateConfig::default(),
         }
     }
 }
@@ -292,6 +470,7 @@ impl SparseJepaAnyUpPcaPipelineConfig {
             self.anyup_q_chunk_size.is_none_or(|chunk| chunk > 0),
             "AnyUp q chunk size must be positive when set"
         );
+        self.ttt_runtime.validate()?;
         Ok(())
     }
 
@@ -412,7 +591,19 @@ pub enum FeatureFrameJepaEncoder<B: Backend> {
     Ttt {
         model: Box<VJepaTttModel<B>>,
         state: TttState<B>,
+        runtime: TttRuntimeStateTracker,
     },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct TttRuntimeStateTracker {
+    frame_index: u64,
+    frames_since_reset: u64,
+    reset_count: u64,
+    decay_count: u64,
+    collapse_guard_triggers: u64,
+    update_fast_weight: bool,
 }
 
 impl<B: Backend> FeatureFrameJepaEncoder<B> {
@@ -425,6 +616,10 @@ impl<B: Backend> FeatureFrameJepaEncoder<B> {
         Self::Ttt {
             model: Box::new(model),
             state,
+            runtime: TttRuntimeStateTracker {
+                update_fast_weight: true,
+                ..TttRuntimeStateTracker::default()
+            },
         }
     }
 
@@ -450,8 +645,17 @@ impl<B: Backend> FeatureFrameJepaEncoder<B> {
     }
 
     pub fn reset_state(&mut self) {
-        if let Self::Ttt { model, state } = self {
+        if let Self::Ttt {
+            model,
+            state,
+            runtime,
+        } = self
+        {
             *state = model.fresh_state();
+            *runtime = TttRuntimeStateTracker {
+                update_fast_weight: true,
+                ..TttRuntimeStateTracker::default()
+            };
         }
     }
 
@@ -462,25 +666,186 @@ impl<B: Backend> FeatureFrameJepaEncoder<B> {
     ) -> Result<VJepaEncoderOutput<B>> {
         match self {
             Self::Base(model) => model.encode_image_batch(image, mask),
-            Self::Ttt { model, state } => {
+            Self::Ttt { model, state, .. } => {
                 model.encode_image_batch_with_state(image, mask, None, state)
             }
         }
     }
+
+    pub fn encode_image_batch_with_runtime(
+        &mut self,
+        image: Tensor<B, 4>,
+        mask: SparseMaskBatch<B>,
+        runtime_config: &TttRuntimeStateConfig,
+    ) -> Result<(VJepaEncoderOutput<B>, TttRuntimeStateMetrics)> {
+        match self {
+            Self::Base(model) => Ok((
+                model.encode_image_batch(image, mask)?,
+                TttRuntimeStateMetrics::default(),
+            )),
+            Self::Ttt {
+                model,
+                state,
+                runtime,
+            } => encode_ttt_image_batch_with_runtime(
+                model,
+                state,
+                runtime,
+                image,
+                mask,
+                runtime_config,
+            ),
+        }
+    }
+}
+
+fn encode_ttt_image_batch_with_runtime<B: Backend>(
+    model: &VJepaTttModel<B>,
+    state: &mut TttState<B>,
+    runtime: &mut TttRuntimeStateTracker,
+    image: Tensor<B, 4>,
+    mask: SparseMaskBatch<B>,
+    runtime_config: &TttRuntimeStateConfig,
+) -> Result<(VJepaEncoderOutput<B>, TttRuntimeStateMetrics)> {
+    let batch = image.shape().dims::<4>()[0] as u64;
+    let update_fast_weight = begin_ttt_runtime_step(model, state, runtime, runtime_config)?;
+    let output = model.encode_image_batch_with_state_options(
+        image,
+        mask,
+        None,
+        state,
+        update_fast_weight,
+    )?;
+    let metrics = finish_ttt_runtime_step(
+        model,
+        state,
+        runtime,
+        &output,
+        batch,
+        runtime_config,
+        update_fast_weight,
+    )?;
+    Ok((output, metrics))
+}
+
+fn begin_ttt_runtime_step<B: Backend>(
+    model: &VJepaTttModel<B>,
+    state: &mut TttState<B>,
+    runtime: &mut TttRuntimeStateTracker,
+    runtime_config: &TttRuntimeStateConfig,
+) -> Result<bool> {
+    runtime_config.validate()?;
+    if runtime_config.enabled
+        && runtime_config.reset_interval_frames > 0
+        && runtime.frames_since_reset >= runtime_config.reset_interval_frames
+    {
+        *state = model.fresh_state();
+        runtime.frames_since_reset = 0;
+        runtime.reset_count = runtime.reset_count.saturating_add(1);
+        runtime.update_fast_weight = true;
+    }
+
+    Ok(runtime_config.enabled && runtime_config.update_fast_weight && runtime.update_fast_weight)
+}
+
+fn finish_ttt_runtime_step<B: Backend>(
+    model: &VJepaTttModel<B>,
+    state: &mut TttState<B>,
+    runtime: &mut TttRuntimeStateTracker,
+    output: &VJepaEncoderOutput<B>,
+    batch: u64,
+    runtime_config: &TttRuntimeStateConfig,
+    update_fast_weight: bool,
+) -> Result<TttRuntimeStateMetrics> {
+    runtime.frame_index = runtime.frame_index.saturating_add(batch);
+    runtime.frames_since_reset = runtime.frames_since_reset.saturating_add(batch);
+
+    let mut metrics = TttRuntimeStateMetrics {
+        enabled: runtime_config.enabled,
+        update_fast_weight,
+        frame_index: runtime.frame_index,
+        frames_since_reset: runtime.frames_since_reset,
+        reset_count: runtime.reset_count,
+        decay_count: runtime.decay_count,
+        collapse_guard_triggers: runtime.collapse_guard_triggers,
+        ..TttRuntimeStateMetrics::default()
+    };
+
+    if runtime_config.enabled && runtime_config.state_decay_per_frame < 1.0 {
+        let decay = runtime_config.state_decay_per_frame.powf(batch as f64);
+        state.decay(decay);
+        runtime.decay_count = runtime.decay_count.saturating_add(batch);
+        metrics.decay_count = runtime.decay_count;
+        metrics.state_decay_applied = true;
+    }
+
+    let should_sample = runtime_config.enabled
+        && runtime_config.metrics_interval_frames > 0
+        && runtime.frame_index % runtime_config.metrics_interval_frames < batch;
+    if should_sample && !cfg!(target_arch = "wasm32") {
+        let token_stability = measure_feature_token_stability(output.tokens.clone())?;
+        let state_rms = measure_ttt_state_fast_weight_rms(state)?;
+        let collapsed = runtime_config.collapse_guard_enabled
+            && (token_stability.token_spatial_std_rms < runtime_config.min_token_spatial_std_rms
+                || token_stability.mean_pairwise_token_cosine
+                    > runtime_config.max_mean_pairwise_token_cosine
+                || runtime_config.max_state_fast_weight_rms > 0.0
+                    && state_rms.is_some_and(|rms| rms > runtime_config.max_state_fast_weight_rms));
+        metrics.token_stability = Some(token_stability);
+        metrics.state_fast_weight_rms = state_rms;
+        if collapsed {
+            metrics.collapse_guard_triggered = true;
+            metrics.collapse_guard_action = Some(runtime_config.collapse_guard_action);
+            runtime.collapse_guard_triggers = runtime.collapse_guard_triggers.saturating_add(1);
+            metrics.collapse_guard_triggers = runtime.collapse_guard_triggers;
+            match runtime_config.collapse_guard_action {
+                TttRuntimeCollapseGuardAction::None => {}
+                TttRuntimeCollapseGuardAction::Decay => {
+                    state.decay(runtime_config.collapse_guard_decay);
+                    runtime.decay_count = runtime.decay_count.saturating_add(1);
+                    metrics.decay_count = runtime.decay_count;
+                    metrics.state_decay_applied = true;
+                    runtime.update_fast_weight = true;
+                }
+                TttRuntimeCollapseGuardAction::Reset => {
+                    *state = model.fresh_state();
+                    runtime.frames_since_reset = 0;
+                    runtime.reset_count = runtime.reset_count.saturating_add(1);
+                    runtime.update_fast_weight = true;
+                    metrics.frames_since_reset = 0;
+                    metrics.reset_count = runtime.reset_count;
+                }
+                TttRuntimeCollapseGuardAction::FreezeUpdates => {
+                    runtime.update_fast_weight = false;
+                }
+            }
+        }
+    }
+
+    Ok(metrics)
 }
 
 #[cfg(feature = "sparse-patchify-wgpu")]
 impl FeatureFrameJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
-    fn encode_image_sparse_patchify_wgpu_batch(
+    fn encode_image_sparse_patchify_wgpu_batch_with_runtime(
         &mut self,
         image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
         patchify_plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
-    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        runtime_config: &TttRuntimeStateConfig,
+    ) -> Result<(
+        VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        TttRuntimeStateMetrics,
+    )> {
         match self {
-            Self::Base(model) => {
-                model.encode_image_sparse_patchify_wgpu_batch(image, patchify_plan)
-            }
-            Self::Ttt { model, state } => {
+            Self::Base(model) => Ok((
+                model.encode_image_sparse_patchify_wgpu_batch(image, patchify_plan)?,
+                TttRuntimeStateMetrics::default(),
+            )),
+            Self::Ttt {
+                model,
+                state,
+                runtime,
+            } => {
                 let Some(mask) = patchify_plan.mask.uniform_mask() else {
                     bail!(
                         "TTT sparse patchify currently requires a uniform sparse mask batch; group variable masks or use dense patch embed"
@@ -491,12 +856,25 @@ impl FeatureFrameJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
                     batch == patchify_plan.batch,
                     "image batch does not match sparse patchify batch plan"
                 );
-                model.forward_single_frame_rollout_sparse_patchify_wgpu(
+                let update_fast_weight =
+                    begin_ttt_runtime_step(model, state, runtime, runtime_config)?;
+                let output = model.forward_single_frame_rollout_sparse_patchify_wgpu_options(
                     image.reshape([batch, channels, 1, height, width]),
                     mask,
                     None,
                     state,
-                )
+                    update_fast_weight,
+                )?;
+                let metrics = finish_ttt_runtime_step(
+                    model,
+                    state,
+                    runtime,
+                    &output,
+                    batch as u64,
+                    runtime_config,
+                    update_fast_weight,
+                )?;
+                Ok((output, metrics))
             }
         }
     }
@@ -504,22 +882,46 @@ impl FeatureFrameJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
 
 #[cfg(feature = "sparse-patchify-wgpu")]
 impl FeatureFrameJepaEncoder<burn::backend::Wgpu<f32, i32>> {
-    fn encode_image_sparse_patchify_wgpu_fusion_batch(
+    fn encode_image_sparse_patchify_wgpu_fusion_batch_with_runtime(
         &mut self,
         image: Tensor<burn::backend::Wgpu<f32, i32>, 4>,
         patchify_plan: &SparsePatchifyBatchPlan<burn::backend::Wgpu<f32, i32>>,
-    ) -> Result<VJepaEncoderOutput<burn::backend::Wgpu<f32, i32>>> {
+        runtime_config: &TttRuntimeStateConfig,
+    ) -> Result<(
+        VJepaEncoderOutput<burn::backend::Wgpu<f32, i32>>,
+        TttRuntimeStateMetrics,
+    )> {
         match self {
-            Self::Base(model) => {
-                model.encode_image_sparse_patchify_wgpu_fusion_batch(image, patchify_plan)
-            }
-            Self::Ttt { model, state } => model
-                .forward_image_sparse_patchify_wgpu_fusion_batch_state(
+            Self::Base(model) => Ok((
+                model.encode_image_sparse_patchify_wgpu_fusion_batch(image, patchify_plan)?,
+                TttRuntimeStateMetrics::default(),
+            )),
+            Self::Ttt {
+                model,
+                state,
+                runtime,
+            } => {
+                let batch = image.shape().dims::<4>()[0];
+                let update_fast_weight =
+                    begin_ttt_runtime_step(model, state, runtime, runtime_config)?;
+                let output = model.forward_image_sparse_patchify_wgpu_fusion_batch_state_options(
                     image,
                     patchify_plan,
                     None,
                     state,
-                ),
+                    update_fast_weight,
+                )?;
+                let metrics = finish_ttt_runtime_step(
+                    model,
+                    state,
+                    runtime,
+                    &output,
+                    batch as u64,
+                    runtime_config,
+                    update_fast_weight,
+                )?;
+                Ok((output, metrics))
+            }
         }
     }
 }
@@ -840,6 +1242,10 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
             dense_tokens_per_frame: self.grid.len(),
             sparse_width: mask.len(),
             valid_sparse_tokens: mask.valid_token_count(),
+            write_width: mask.len(),
+            valid_write_tokens: mask.valid_token_count(),
+            encode_width: mask.len(),
+            valid_encode_tokens: mask.valid_token_count(),
             output_pixels: batch * height * width,
             ..SparseJepaAnyUpPcaStageMetrics::default()
         }
@@ -1042,9 +1448,12 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         );
         let mut timer = StageTimer::new(measurement);
 
-        let encoded = self
-            .encoder
-            .encode_image_batch(image.clone(), mask.clone())?;
+        let (encoded, ttt_runtime) = self.encoder.encode_image_batch_with_runtime(
+            image.clone(),
+            mask.clone(),
+            &self.config.ttt_runtime,
+        )?;
+        metrics.ttt_runtime = ttt_runtime;
         metrics.encode_us = timer.mark::<B>(&self.device)?;
         self.finish_encoded_batch_nodes(image, mask, encoded, request, timer, metrics)
     }
@@ -1071,11 +1480,15 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
             measurement,
             SparseJepaAnyUpPcaEncodePath::DensePatchEmbed,
         );
+        metrics.set_encode_mask(&encode_mask);
         let mut timer = StageTimer::new(measurement);
 
-        let encoded = self
-            .encoder
-            .encode_image_batch(image.clone(), encode_mask.clone())?;
+        let (encoded, ttt_runtime) = self.encoder.encode_image_batch_with_runtime(
+            image.clone(),
+            encode_mask.clone(),
+            &self.config.ttt_runtime,
+        )?;
+        metrics.ttt_runtime = ttt_runtime;
         metrics.encode_us = timer.mark::<B>(&self.device)?;
         let encoded =
             restrict_encoded_to_write_mask(encoded, &encode_mask, &write_mask, &self.device)?;
@@ -1099,9 +1512,12 @@ impl<B: Backend> SparseJepaAnyUpPcaPipeline<B> {
         );
         let mut timer = StageTimer::new(measurement);
 
-        let encoded = self
-            .encoder
-            .encode_image_batch(image.clone(), mask.clone())?;
+        let (encoded, ttt_runtime) = self.encoder.encode_image_batch_with_runtime(
+            image.clone(),
+            mask.clone(),
+            &self.config.ttt_runtime,
+        )?;
+        metrics.ttt_runtime = ttt_runtime;
         metrics.encode_us = timer.mark::<B>(&self.device)?;
         self.finish_encoded_batch_step(image, mask, encoded, timer, metrics)
     }
@@ -1275,9 +1691,14 @@ impl SparseJepaAnyUpPcaPipeline<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             SparseJepaAnyUpPcaEncodePath::SparsePatchify,
         );
         let mut timer = StageTimer::new(measurement);
-        let encoded = self
+        let (encoded, ttt_runtime) = self
             .encoder
-            .encode_image_sparse_patchify_wgpu_batch(image.clone(), patchify_plan)?;
+            .encode_image_sparse_patchify_wgpu_batch_with_runtime(
+                image.clone(),
+                patchify_plan,
+                &self.config.ttt_runtime,
+            )?;
+        metrics.ttt_runtime = ttt_runtime;
         metrics.encode_us = timer.mark::<burn_flex_gmm::wgpu::DefaultWgpuBackend>(&self.device)?;
         let token_cache = if mask.is_dense_ordered() {
             self.token_memory
@@ -1329,10 +1750,16 @@ impl SparseJepaAnyUpPcaPipeline<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
             measurement,
             SparseJepaAnyUpPcaEncodePath::SparsePatchify,
         );
+        metrics.set_encode_mask(&encode_mask);
         let mut timer = StageTimer::new(measurement);
-        let encoded = self
+        let (encoded, ttt_runtime) = self
             .encoder
-            .encode_image_sparse_patchify_wgpu_batch(image.clone(), patchify_plan)?;
+            .encode_image_sparse_patchify_wgpu_batch_with_runtime(
+                image.clone(),
+                patchify_plan,
+                &self.config.ttt_runtime,
+            )?;
+        metrics.ttt_runtime = ttt_runtime;
         metrics.encode_us = timer.mark::<burn_flex_gmm::wgpu::DefaultWgpuBackend>(&self.device)?;
         let encoded =
             restrict_encoded_to_write_mask(encoded, &encode_mask, &write_mask, &self.device)?;
@@ -1384,9 +1811,14 @@ impl SparseJepaAnyUpPcaPipeline<burn::backend::Wgpu<f32, i32>> {
             SparseJepaAnyUpPcaEncodePath::SparsePatchify,
         );
         let mut timer = StageTimer::new(measurement);
-        let encoded = self
+        let (encoded, ttt_runtime) = self
             .encoder
-            .encode_image_sparse_patchify_wgpu_fusion_batch(image.clone(), patchify_plan)?;
+            .encode_image_sparse_patchify_wgpu_fusion_batch_with_runtime(
+                image.clone(),
+                patchify_plan,
+                &self.config.ttt_runtime,
+            )?;
+        metrics.ttt_runtime = ttt_runtime;
         metrics.encode_us = timer.mark::<burn::backend::Wgpu<f32, i32>>(&self.device)?;
         let token_cache = if mask.is_dense_ordered() {
             self.token_memory
@@ -1437,10 +1869,16 @@ impl SparseJepaAnyUpPcaPipeline<burn::backend::Wgpu<f32, i32>> {
             measurement,
             SparseJepaAnyUpPcaEncodePath::SparsePatchify,
         );
+        metrics.set_encode_mask(&encode_mask);
         let mut timer = StageTimer::new(measurement);
-        let encoded = self
+        let (encoded, ttt_runtime) = self
             .encoder
-            .encode_image_sparse_patchify_wgpu_fusion_batch(image.clone(), patchify_plan)?;
+            .encode_image_sparse_patchify_wgpu_fusion_batch_with_runtime(
+                image.clone(),
+                patchify_plan,
+                &self.config.ttt_runtime,
+            )?;
+        metrics.ttt_runtime = ttt_runtime;
         metrics.encode_us = timer.mark::<burn::backend::Wgpu<f32, i32>>(&self.device)?;
         let encoded =
             restrict_encoded_to_write_mask(encoded, &encode_mask, &write_mask, &self.device)?;
@@ -1754,6 +2192,138 @@ impl StageTimer {
     fn total_us(&self) -> u64 {
         self.start.map(pipeline_elapsed_us).unwrap_or(0)
     }
+}
+
+pub fn measure_feature_token_stability<B: Backend>(
+    tokens: Tensor<B, 3>,
+) -> Result<FeatureTokenStabilityMetrics> {
+    let [_batch, token_count, dim] = tokens.shape().dims::<3>();
+    if token_count == 0 || dim == 0 {
+        return Ok(FeatureTokenStabilityMetrics::default());
+    }
+    let values = tokens
+        .to_data()
+        .to_vec::<f32>()
+        .context("read token stability diagnostics")?;
+    measure_feature_token_stability_values(&values, token_count, dim)
+}
+
+fn measure_ttt_state_fast_weight_rms<B: Backend>(state: &TttState<B>) -> Result<Option<f64>> {
+    let mut sum_sq = 0.0f64;
+    let mut count = 0usize;
+    for layer in &state.layers {
+        let Some(weight) = &layer.fast_weight else {
+            continue;
+        };
+        let values = weight
+            .clone()
+            .to_data()
+            .to_vec::<f32>()
+            .context("read TTT fast-weight diagnostics")?;
+        count += values.len();
+        for value in values {
+            let value = value as f64;
+            sum_sq += value * value;
+        }
+    }
+    Ok((count > 0).then(|| (sum_sq / count as f64).sqrt()))
+}
+
+fn measure_feature_token_stability_values(
+    values: &[f32],
+    token_count: usize,
+    dim: usize,
+) -> Result<FeatureTokenStabilityMetrics> {
+    ensure!(
+        token_count > 0 && dim > 0 && values.len().is_multiple_of(token_count * dim),
+        "token stability diagnostics require a non-empty [batch, tokens, dim] buffer"
+    );
+    let batch = values.len() / (token_count * dim);
+    let mut spatial_var_sum = 0.0;
+    for b in 0..batch {
+        let base = b * token_count * dim;
+        for d in 0..dim {
+            let mut mean = 0.0;
+            for t in 0..token_count {
+                mean += values[base + t * dim + d] as f64;
+            }
+            mean /= token_count as f64;
+            let mut var = 0.0;
+            for t in 0..token_count {
+                let diff = values[base + t * dim + d] as f64 - mean;
+                var += diff * diff;
+            }
+            spatial_var_sum += var / token_count as f64;
+        }
+    }
+    let token_spatial_std_rms = (spatial_var_sum / (batch * dim) as f64).sqrt();
+
+    let token_total = batch * token_count;
+    let mut norms = Vec::with_capacity(token_total);
+    for chunk in values.chunks_exact(dim) {
+        let norm_sq = chunk
+            .iter()
+            .map(|value| {
+                let value = *value as f64;
+                value * value
+            })
+            .sum::<f64>();
+        norms.push(norm_sq.sqrt());
+    }
+    let token_norm_mean = norms.iter().sum::<f64>() / token_total as f64;
+    let token_norm_std = (norms
+        .iter()
+        .map(|norm| {
+            let diff = *norm - token_norm_mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / token_total as f64)
+        .sqrt();
+
+    let sample_tokens = token_count.min(64);
+    let mut cosine_sum = 0.0;
+    let mut cosine_count = 0usize;
+    for b in 0..batch {
+        let base = b * token_count * dim;
+        for left in 0..sample_tokens {
+            for right in left + 1..sample_tokens {
+                let mut dot = 0.0;
+                let mut left_norm = 0.0;
+                let mut right_norm = 0.0;
+                for d in 0..dim {
+                    let l = values[base + left * dim + d] as f64;
+                    let r = values[base + right * dim + d] as f64;
+                    dot += l * r;
+                    left_norm += l * l;
+                    right_norm += r * r;
+                }
+                let denom = left_norm.sqrt() * right_norm.sqrt();
+                if denom > 1.0e-12 {
+                    cosine_sum += dot / denom;
+                    cosine_count += 1;
+                }
+            }
+        }
+    }
+    let mean_pairwise_token_cosine = if cosine_count == 0 {
+        0.0
+    } else {
+        cosine_sum / cosine_count as f64
+    };
+    let relative_spread = (token_spatial_std_rms / (token_norm_mean + 1.0e-12)).clamp(0.0, 1.0);
+    let collapse_score =
+        (1.0 - relative_spread) * mean_pairwise_token_cosine.max(0.0).clamp(0.0, 1.0);
+
+    Ok(FeatureTokenStabilityMetrics {
+        measured: true,
+        token_spatial_std_rms,
+        token_norm_mean,
+        token_norm_std,
+        mean_pairwise_token_cosine,
+        collapse_score,
+        sampled_tokens: sample_tokens,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

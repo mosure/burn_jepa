@@ -1,6 +1,6 @@
 use super::*;
 use burn_jepa::{
-    AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest,
+    AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, FeatureFrameEncodePath,
     FeatureFrameJepaEncoder, FeatureFrameJepaEncoderKind, PatchDiffRefreshState, TttEncoderConfig,
     VJepa2_1Model, VJepaTttModel, coords_to_token_index, write_burnpack_parts_for_browser,
     write_pipeline_package_manifest,
@@ -62,6 +62,13 @@ fn default_mask_source_is_patch_diff() {
         default_model_manifest_path_for_profile(BevyJepaModelPackageProfile::Vjepa21Base),
         std::path::PathBuf::from("target/burn-jepa-web/model/vjepa2_1_base/manifest.json")
     );
+    assert!(DEFAULT_ANYUP_MODEL_MANIFEST_PATH.ends_with("anyup_multi_backbone/manifest.json"));
+    assert_eq!(
+        default_anyup_model_manifest_path_for_profile(
+            BevyJepaAnyUpModelPackageProfile::AnyupMultiBackbone
+        ),
+        std::path::PathBuf::from("target/burn_anyup/anyup_multi_backbone/manifest.json")
+    );
     assert!(DEFAULT_TTT_MODEL_PATH.contains("burn-jepa-production-final"));
     assert!(BevyJepaConfig::default().model_manifest_path.is_none());
     assert!(BevyJepaConfig::default().model_cache_dir.is_none());
@@ -74,6 +81,23 @@ fn default_mask_source_is_patch_diff() {
         burn_jepa::burn_jepa_model_profile_base_url(BevyJepaModelPackageProfile::Vjepa21Ttt)
     );
     assert!(BevyJepaConfig::default().model_auto_download);
+    assert!(
+        BevyJepaConfig::default()
+            .anyup_model_manifest_path
+            .is_none()
+    );
+    assert!(BevyJepaConfig::default().anyup_model_cache_dir.is_none());
+    assert_eq!(
+        BevyJepaConfig::default().anyup_model_profile,
+        BevyJepaAnyUpModelPackageProfile::AnyupMultiBackbone
+    );
+    assert_eq!(
+        BevyJepaConfig::default().anyup_model_base_url,
+        burn_jepa::burn_anyup_model_profile_base_url(
+            BevyJepaAnyUpModelPackageProfile::AnyupMultiBackbone
+        )
+    );
+    assert!(BevyJepaConfig::default().anyup_model_auto_download);
     assert!(BevyJepaConfig::default().ttt_model_path.is_none());
     assert!(DEFAULT_VJEPA21_CHECKPOINT_DIR.starts_with("~/"));
     assert!(DEFAULT_VJEPA21_CONFIG_PATH.starts_with("~/"));
@@ -215,15 +239,14 @@ fn control_actions_update_patch_diff_refresh_without_model_rebuild() {
     let blue = config.patch_diff_refresh.blue_noise_enabled;
 
     assert_eq!(
-        apply_control_action(&mut config, JepaControlAction::ThresholdUp),
+        apply_control_slider_value(&mut config, JepaControlSliderKind::PatchDiffThreshold, 1.0),
         JepaControlReset::Visual
     );
     assert!(config.patch_diff_threshold > threshold);
     assert_eq!(
-        apply_control_action(&mut config, JepaControlAction::ThresholdDown),
+        apply_control_slider_value(&mut config, JepaControlSliderKind::PatchDiffThreshold, 0.5),
         JepaControlReset::Visual
     );
-    assert!((config.patch_diff_threshold - threshold).abs() <= 1.0e-6);
 
     assert_eq!(
         apply_control_action(&mut config, JepaControlAction::SubthresholdRefresh),
@@ -262,6 +285,114 @@ fn control_actions_toggle_anyup_panel_cadence() {
     );
     assert_eq!(config.high_res_pca_every, 0);
     assert_eq!(visible_panel_count(&config), 3);
+}
+
+#[test]
+fn control_actions_switch_anyup_attention_mode() {
+    let mut config = BevyJepaConfig::default();
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::AnyUpUpstreamMasked),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(
+        config.anyup_attention_mode,
+        burn_jepa::AnyUpAttentionMode::UpstreamMasked
+    );
+    assert!(control_button_active(
+        &config,
+        JepaControlAction::AnyUpUpstreamMasked,
+        &JepaControlsState::default()
+    ));
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::AnyUpEfficientLocal),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(
+        config.anyup_attention_mode,
+        burn_jepa::AnyUpAttentionMode::EfficientLocal
+    );
+}
+
+#[test]
+fn control_actions_switch_dense_and_sparse_pipeline_presets() {
+    let mut config = BevyJepaConfig::default();
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::PipelineDense),
+        JepaControlReset::Rebuild
+    );
+    assert!(dense_pipeline_enabled(&config));
+    assert_eq!(config.encode_path, BevyJepaEncodePath::DensePatchEmbed);
+    assert_eq!(config.context_density, 1.0);
+    assert_eq!(config.min_context_density, 1.0);
+    assert_eq!(config.bootstrap_context_density, 1.0);
+    assert_eq!(config.patch_diff_threshold, 0.0);
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::PipelineSparse),
+        JepaControlReset::Rebuild
+    );
+    assert!(!dense_pipeline_enabled(&config));
+    assert_eq!(config.encode_path, BevyJepaEncodePath::Auto);
+    assert_eq!(
+        config.sparse_encode_mode,
+        BevyJepaSparseEncodeMode::BucketedContext
+    );
+}
+
+#[test]
+fn control_sliders_update_numeric_pipeline_fields() {
+    let mut config = BevyJepaConfig::default();
+
+    assert_eq!(
+        apply_control_slider_value(&mut config, JepaControlSliderKind::PatchDiffThreshold, 0.5),
+        JepaControlReset::Visual
+    );
+    assert!((config.patch_diff_threshold - 0.10).abs() <= 1.0e-6);
+
+    apply_control_slider_value(&mut config, JepaControlSliderKind::MinContextDensity, 0.25);
+    assert!((config.min_context_density - 0.25).abs() <= 1.0e-6);
+    apply_control_slider_value(&mut config, JepaControlSliderKind::ContextDensity, 0.0);
+    assert!(config.context_density >= config.min_context_density);
+
+    apply_control_slider_value(&mut config, JepaControlSliderKind::AgeIntervalFrames, 1.0);
+    assert_eq!(config.patch_diff_refresh.age_refresh_interval_frames, 300);
+}
+
+#[test]
+fn control_slider_relative_coordinates_map_to_unit_range() {
+    assert_eq!(slider_normalized_from_relative_x(-0.75), 0.0);
+    assert_eq!(slider_normalized_from_relative_x(-0.5), 0.0);
+    assert!((slider_normalized_from_relative_x(0.0) - 0.5).abs() <= f32::EPSILON);
+    assert_eq!(slider_normalized_from_relative_x(0.5), 1.0);
+    assert_eq!(slider_normalized_from_relative_x(0.75), 1.0);
+}
+
+#[test]
+fn control_slider_ignores_tiny_drag_jitter() {
+    let mut config = BevyJepaConfig::default();
+    let current = slider_normalized_value(&config, JepaControlSliderKind::PatchDiffThreshold);
+
+    assert_eq!(
+        apply_control_slider_value_if_changed(
+            &mut config,
+            JepaControlSliderKind::PatchDiffThreshold,
+            current + CONTROL_SLIDER_UPDATE_EPSILON * 0.5,
+        ),
+        JepaControlReset::None
+    );
+}
+
+#[test]
+fn controls_ui_system_has_disjoint_text_queries() {
+    let mut app = App::new();
+    app.insert_resource(BevyJepaConfig::default())
+        .init_resource::<JepaControlsState>()
+        .add_systems(Update, update_controls_ui);
+
+    app.update();
 }
 
 #[test]
@@ -1493,6 +1624,90 @@ fn metrics_overlay_line_uses_stable_field_widths() {
         format_metrics_waiting_line().len(),
         format_metrics_line(&config, &first).len()
     );
+}
+
+#[test]
+fn metrics_overlay_updates_structured_fields_and_graph() {
+    let mut app = App::new();
+    app.insert_resource(BevyJepaConfig {
+        source: BevyJepaFrameSource::SyntheticLocalMotion,
+        show_metrics: true,
+        ..tiny_viewer_config()
+    })
+    .insert_resource(BevyJepaMetrics {
+        frame_ready: true,
+        frame_index: 1,
+        input_frame_index: 2,
+        completed_frames: 1,
+        frame_source: BevyJepaFrameSource::SyntheticLocalMotion,
+        mask_source: BevyJepaMaskSource::PatchDiff,
+        context_tokens: 64,
+        dense_tokens: 256,
+        grid_height: 16,
+        grid_width: 16,
+        patch_size: 16,
+        input_fps: 60.0,
+        low_res_fps: 31.0,
+        high_res_fps: 7.5,
+        viewer_total_us: 33_000,
+        encode_us: 2_100,
+        cache_update_us: 300,
+        token_view_us: 120,
+        low_res_pca_us: 450,
+        pca_update_us: 90,
+        pca_sample_frames: 8,
+        pca_sample_window_frames: 16,
+        ..BevyJepaMetrics::default()
+    })
+    .init_resource::<JepaRuntime>()
+    .init_resource::<MetricsRollingState>()
+    .add_systems(Startup, setup_metrics_overlay)
+    .add_systems(Update, update_metrics_overlay);
+
+    app.update();
+    for frame in 2..5 {
+        {
+            let mut metrics = app.world_mut().resource_mut::<BevyJepaMetrics>();
+            metrics.frame_index = frame;
+            metrics.completed_frames = frame;
+            metrics.low_res_fps = 30.0 + frame as f64;
+            metrics.viewer_total_us = 33_000 - frame * 1_000;
+        }
+        app.update();
+    }
+
+    let world = app.world_mut();
+    let mut text_query = world.query::<(&MetricValueText, &Text)>();
+    let rendered = text_query
+        .iter(world)
+        .map(|(_, text)| text.0.clone())
+        .collect::<Vec<_>>();
+    assert!(rendered.iter().any(|line| line.contains("Tokens")));
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("write 64") && line.contains("encode 64"))
+    );
+    assert!(rendered.iter().any(|line| line.contains("JEPA")));
+    assert!(rendered.iter().any(|line| line.contains("2.10 ms")));
+    assert!(rendered.iter().any(|line| line.contains("Cache")));
+    assert!(rendered.iter().any(|line| line.contains("Rolling")));
+
+    let mut bar_query = world.query::<(&MetricGraphBar, &Node)>();
+    assert!(
+        bar_query
+            .iter(world)
+            .any(|(_, node)| matches!(node.height, Val::Px(height) if height > 1.0))
+    );
+}
+
+#[test]
+fn controls_help_text_documents_dense_sparse_and_threshold_controls() {
+    assert!(default_controls_help().contains("Hover"));
+    assert!(control_help_text(JepaControlAction::PipelineSparse).contains("patch-diff"));
+    assert!(control_help_text(JepaControlAction::PipelineDense).contains("full-frame"));
+    assert!(slider_help_text(JepaControlSliderKind::PatchDiffThreshold).contains("Lower"));
+    assert!(slider_help_text(JepaControlSliderKind::DenseFallbackDensity).contains("dense JEPA"));
 }
 
 #[test]
