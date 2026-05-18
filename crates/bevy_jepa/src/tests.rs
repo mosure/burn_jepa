@@ -1,6 +1,6 @@
 use super::*;
 use burn_jepa::{
-    AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest,
+    AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, FeatureFrameEncodePath,
     FeatureFrameJepaEncoder, FeatureFrameJepaEncoderKind, PatchDiffRefreshState, TttEncoderConfig,
     VJepa2_1Model, VJepaTttModel, coords_to_token_index, write_burnpack_parts_for_browser,
     write_pipeline_package_manifest,

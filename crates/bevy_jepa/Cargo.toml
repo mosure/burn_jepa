@@ -11,8 +11,8 @@ readme = "README.md"
 publish = false
 
 [features]
-default = []
-sparse-patchify-wgpu = ["burn_jepa/sparse-patchify-wgpu"]
+default = ["sparse-patchify-wgpu"]
+sparse-patchify-wgpu = ["bevy_burn/fusion", "burn_jepa/sparse-patchify-wgpu"]
 wasm-fusion = ["bevy_burn/fusion", "burn/fusion", "burn_jepa/wasm-fusion"]
 
 [dependencies]

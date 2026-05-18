@@ -43,7 +43,7 @@ token-cache PCA, and high-res AnyUp PCA.
 | `dispatch` | no | native/web | Burn dispatch backend experiments |
 | `wasm` | no | wasm32 | wasm-bindgen API over Burn WebGPU |
 | `wasm-fusion` | no | wasm32 | experimental Burn fusion path; browser WebGPU validation still prefers the default non-fused build |
-| `sparse-patchify-wgpu` | no | native/web | flex-gmm sparse patchify + sparse feature memory on WGPU |
+| `sparse-patchify-wgpu` | no | native/web | flex-gmm sparse patchify + sparse feature memory on WGPU; enabled by default in `bevy_jepa` |
 | `sparse-patchify-cuda` | no | native | flex-gmm sparse patchify + sparse feature memory on CUDA |
 | `autogaze-*` | no | native/web | optional `burn_autogaze` mask projection adapters |
 
@@ -91,6 +91,13 @@ cargo run -p bevy_jepa
 cargo run -p bevy_jepa -- --source camera --image-size 256
 cargo run -p bevy_jepa -- --encoder-source base-checkpoint --sparse-encode-mode dense
 cargo run -p bevy_jepa -- --encoder-source trained-ttt --mask-source patch-diff
+```
+
+install the viewer from git main with the package name as the positional crate
+argument. Some Cargo versions do not support `cargo install --package`:
+
+```sh
+cargo install --git https://github.com/mosure/burn_jepa.git --branch main bevy_jepa --locked --force
 ```
 
 the no-arg native default starts the live sparse feature pipeline with camera

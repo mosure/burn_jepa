@@ -19,6 +19,13 @@ cargo run -p bevy_jepa -- --source camera --anyup-weights /path/to/anyup_multi_b
 cargo run -p bevy_jepa -- --encoder-source tiny-test --source synthetic-local-motion
 ```
 
+Install from git main with the package name as Cargo's positional crate
+argument; `cargo install --package` is not available on all Cargo versions:
+
+```bash
+cargo install --git https://github.com/mosure/burn_jepa.git --branch main bevy_jepa --locked --force
+```
+
 The default source is the camera. Synthetic/local-motion input is only used when
 `--source synthetic-local-motion` is selected explicitly; camera mode waits for a
 real camera frame instead of feeding generated warmup imagery into the pipeline.
@@ -249,16 +256,16 @@ skip full patch-diff scoring when the frame is already clearly near-dense.
 the Bevy adaptive threshold path does not top-k cap tokens that pass the
 threshold.
 
-`--encode-path auto` is the default. Native `bevy_jepa` keeps the dense-patch
-path as the default startup lane because WGPU sparse-patchify kernels have a
-large cold compile cost. Bucketed-context sparse encode is the default; use
-`--sparse-encode-mode exact` when stable token-width buckets are not worth the
-extra real context tokens. Build with
-`--features sparse-patchify-wgpu` to opt into flex-gmm sparse patchify; auto then
-routes non-dense masks through sparse patchify while dense ordered masks stay on
-the dense path. Use `--encode-path dense-patch` to force the portable
-dense-patch-embed plus sparse-token path, or `--encode-path sparse-patchify` when
-you want the app to force sparse patchify for diagnostics.
+`--encode-path auto` is the default. `bevy_jepa` enables flex-gmm WGPU sparse
+patchify by default, including the matching fused Burn-to-Bevy texture bridge
+needed by the WGPU kernel stack. Auto routes non-dense masks through sparse
+patchify while dense ordered masks stay on the dense path. Bucketed-context
+sparse encode is also the default; use `--sparse-encode-mode exact` when stable
+token-width buckets are not worth the extra real context tokens. Use
+`--encode-path dense-patch` to force the portable dense-patch-embed plus
+sparse-token path, or `--encode-path sparse-patchify` when you want the app to
+force sparse patchify for diagnostics. Build with `--no-default-features` only
+when you explicitly want the portable non-flex-gmm path.
 
 ## Benchmarks
 
