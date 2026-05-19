@@ -2185,6 +2185,70 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
         .map(|tokens| tokens.reshape([batch, plan.token_count(), self.config.encoder.embed_dim]))
     }
 
+    pub fn sparse_patchify_image_wgpu_batch(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>> {
+        self.base.sparse_patchify_image_wgpu_batch(image, plan)
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_batch_state(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
+        state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.forward_image_sparse_patchify_wgpu_batch_state_options(
+            image,
+            plan,
+            target_tokens,
+            state,
+            true,
+        )
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_batch_state_options(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
+        state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        let [batch, channels, height, width] = image.shape().dims::<4>();
+        ensure!(
+            batch == plan.batch,
+            "image batch does not match sparse patchify batch plan"
+        );
+        ensure!(
+            channels == self.config.in_channels,
+            "image channel count does not match V-JEPA config"
+        );
+        let grid = TokenGridShape::new(
+            1,
+            height / self.config.patch_size.max(1),
+            width / self.config.patch_size.max(1),
+        );
+        ensure!(
+            plan.mask.dense_len() == grid.len() && !plan.mask.is_empty(),
+            "sparse image mask batch must match a non-empty image token grid"
+        );
+        let device = image.device();
+        let tokens = self.sparse_patchify_image_wgpu_batch(image, plan)?;
+        let encoder_plan =
+            SparseEncoderBatchPlan::new(&self.config, plan.mask.clone(), grid, false, &device)?;
+        self.forward_sparse_tokens_with_batch_plan_options(
+            tokens,
+            &encoder_plan,
+            target_tokens,
+            state,
+            update_fast_weight,
+            None,
+        )
+    }
+
     pub fn forward_single_frame_rollout_sparse_patchify_wgpu(
         &self,
         video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,

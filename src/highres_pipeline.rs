@@ -846,21 +846,16 @@ impl FeatureFrameJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
                 state,
                 runtime,
             } => {
-                let Some(mask) = patchify_plan.mask.uniform_mask() else {
-                    bail!(
-                        "TTT sparse patchify currently requires a uniform sparse mask batch; group variable masks or use dense patch embed"
-                    );
-                };
-                let [batch, channels, height, width] = image.shape().dims::<4>();
+                let [batch, _channels, _height, _width] = image.shape().dims::<4>();
                 ensure!(
                     batch == patchify_plan.batch,
                     "image batch does not match sparse patchify batch plan"
                 );
                 let update_fast_weight =
                     begin_ttt_runtime_step(model, state, runtime, runtime_config)?;
-                let output = model.forward_single_frame_rollout_sparse_patchify_wgpu_options(
-                    image.reshape([batch, channels, 1, height, width]),
-                    mask,
+                let output = model.forward_image_sparse_patchify_wgpu_batch_state_options(
+                    image,
+                    patchify_plan,
                     None,
                     state,
                     update_fast_weight,

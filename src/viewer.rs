@@ -826,7 +826,7 @@ pub fn sparse_mask_bucket_widths(
                 Some(density_tokens(
                     grid.len(),
                     *density,
-                    DensityRound::Round,
+                    DensityRound::Ceil,
                     0.0,
                 ))
             } else {
@@ -1234,7 +1234,7 @@ mod tests {
             finalize_patch_diff_masks(changed.clone(), grid, &FeatureFrameViewerConfig::default());
 
         assert_eq!(masks.write_mask, changed);
-        assert_eq!(masks.encode_mask.len(), 102);
+        assert_eq!(masks.encode_mask.len(), 103);
         assert!(
             masks
                 .encode_mask
@@ -1249,7 +1249,7 @@ mod tests {
         let masks = shape_prewarm_masks(grid, &FeatureFrameViewerConfig::default());
         let widths: Vec<_> = masks.iter().map(SparseTokenMask::len).collect();
 
-        assert_eq!(widths, vec![102, 256, 512, 1024]);
+        assert_eq!(widths, vec![103, 256, 512, 1024]);
         assert!(masks.last().expect("dense mask").is_dense_ordered());
     }
 

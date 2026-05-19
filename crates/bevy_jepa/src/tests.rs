@@ -1871,7 +1871,7 @@ fn sparse_mask_bucket_padding_does_not_become_write_mask() {
     let masks = finalize_patch_diff_masks(changed.clone(), grid, &config);
 
     assert_eq!(masks.write_mask, changed);
-    assert_eq!(masks.encode_mask.len(), 102);
+    assert_eq!(masks.encode_mask.len(), 103);
     assert!(
         masks
             .encode_mask
@@ -1890,7 +1890,7 @@ fn default_sparse_encode_mode_keeps_writes_exact_and_buckets_encode() {
     let masks = finalize_patch_diff_masks(changed.clone(), grid, &config);
 
     assert_eq!(masks.write_mask, changed);
-    assert_eq!(masks.encode_mask.len(), 102);
+    assert_eq!(masks.encode_mask.len(), 103);
     assert!(
         masks
             .encode_mask
@@ -1931,7 +1931,7 @@ fn shape_prewarm_masks_cover_bucket_widths_once() {
     let masks = shape_prewarm_masks(grid, &config);
     let widths: Vec<_> = masks.iter().map(SparseTokenMask::len).collect();
 
-    assert_eq!(widths, vec![102, 256, 512, 1024]);
+    assert_eq!(widths, vec![103, 256, 512, 1024]);
     assert!(masks.last().expect("dense mask").is_dense_ordered());
 }
 
@@ -2587,6 +2587,7 @@ fn highres_pipeline_can_run_ttt_sparse_patchify_branch() {
         output.output.encoded.tokens.shape().dims::<3>()[1],
         pipeline.grid().len()
     );
+    JepaBevyBackend::sync(&device).expect("sync backend before dropping sparse TTT tensors");
 }
 
 #[test]

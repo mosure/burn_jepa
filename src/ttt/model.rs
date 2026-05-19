@@ -336,6 +336,39 @@ impl<B: Backend> VJepaTttModel<B> {
 
 #[cfg(feature = "sparse-patchify-wgpu")]
 impl VJepaTttModel<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
+    pub fn forward_image_sparse_patchify_wgpu_batch_state(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &crate::SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
+        state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.encoder.forward_image_sparse_patchify_wgpu_batch_state(
+            image,
+            plan,
+            target_tokens,
+            state,
+        )
+    }
+
+    pub fn forward_image_sparse_patchify_wgpu_batch_state_options(
+        &self,
+        image: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 4>,
+        plan: &crate::SparsePatchifyBatchPlan<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        target_tokens: Option<Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 3>>,
+        state: &mut TttState<burn_flex_gmm::wgpu::DefaultWgpuBackend>,
+        update_fast_weight: bool,
+    ) -> Result<VJepaEncoderOutput<burn_flex_gmm::wgpu::DefaultWgpuBackend>> {
+        self.encoder
+            .forward_image_sparse_patchify_wgpu_batch_state_options(
+                image,
+                plan,
+                target_tokens,
+                state,
+                update_fast_weight,
+            )
+    }
+
     pub fn forward_single_frame_rollout_sparse_patchify_wgpu(
         &self,
         video: Tensor<burn_flex_gmm::wgpu::DefaultWgpuBackend, 5>,
