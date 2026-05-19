@@ -293,6 +293,7 @@ fn case_config(args: &Args) -> BevyJepaConfig {
             pipeline.bootstrap_context_density = 1.0;
             pipeline.patch_diff_threshold = 0.0;
             pipeline.patch_diff_dense_fallback_density = 0.0;
+            pipeline.patch_diff_dilation_tiles = 0;
             pipeline.sparse_encode_mode = BevyJepaSparseEncodeMode::Exact;
             pipeline.patch_diff_refresh = PatchDiffRefreshConfig::disabled();
         }

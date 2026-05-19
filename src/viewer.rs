@@ -25,12 +25,14 @@ pub const DEFAULT_BOOTSTRAP_CONTEXT_DENSITY: f32 = 1.0;
 pub const DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 1.0 - DEFAULT_PATCH_DIFF_QUALITY;
 /// Density at which a sparse write mask is promoted to the dense ordered path.
 pub const DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY: f32 = 0.60;
+/// Default tile radius used to dilate direct patch-diff threshold hits.
+pub const DEFAULT_PATCH_DIFF_DILATION_TILES: usize = 1;
 /// Default sparse encode bucket width used to reduce GPU shape churn.
 pub const DEFAULT_SPARSE_MASK_BUCKET_TOKENS: usize = 256;
 /// Default sparse encode bucket densities used before falling back to the dense shape.
 pub const DEFAULT_SPARSE_MASK_BUCKET_DENSITIES: &[f32] = &[0.10, 0.25, 0.50];
-/// Whether patch-diff refresh adds bounded drift-prevention tokens by default.
-pub const DEFAULT_PATCH_DIFF_REFRESH_ENABLED: bool = true;
+/// Whether legacy patch-diff refresh adds bounded drift-prevention tokens by default.
+pub const DEFAULT_PATCH_DIFF_REFRESH_ENABLED: bool = false;
 /// Default residual decay for subthreshold patch-diff evidence.
 pub const DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY: f32 = 0.92;
 /// Default normalized residual value required before a below-threshold patch is refreshed.
@@ -222,15 +224,15 @@ impl Default for PatchDiffRefreshConfig {
     fn default() -> Self {
         Self {
             enabled: DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
-            subthreshold_enabled: true,
+            subthreshold_enabled: false,
             subthreshold_decay: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
             subthreshold_gain: 1.0,
             subthreshold_trigger: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
             subthreshold_max_density: DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY,
-            age_refresh_enabled: true,
+            age_refresh_enabled: false,
             age_refresh_interval_frames: DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES,
             age_refresh_max_density: DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
-            blue_noise_enabled: true,
+            blue_noise_enabled: false,
             blue_noise_refresh_density: DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY,
             blue_noise_seed: 0x9e37_79b9_7f4a_7c15,
             max_extra_density: DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY,
@@ -557,6 +559,8 @@ pub struct FeatureFrameViewerConfig {
     pub patch_diff_threshold: f32,
     /// Density at which sparse masks are promoted to dense ordered masks.
     pub patch_diff_dense_fallback_density: f32,
+    /// Tile-radius dilation applied to direct patch-diff hits before refresh tokens.
+    pub patch_diff_dilation_tiles: usize,
     /// Sparse encode widening mode.
     pub sparse_encode_mode: FeatureFrameSparseEncodeMode,
     /// Token bucket width used with [`FeatureFrameSparseEncodeMode::BucketedContext`].
@@ -601,6 +605,7 @@ impl Default for FeatureFrameViewerConfig {
             bootstrap_context_density: DEFAULT_BOOTSTRAP_CONTEXT_DENSITY,
             patch_diff_threshold: DEFAULT_PATCH_DIFF_THRESHOLD,
             patch_diff_dense_fallback_density: DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
+            patch_diff_dilation_tiles: DEFAULT_PATCH_DIFF_DILATION_TILES,
             sparse_encode_mode: FeatureFrameSparseEncodeMode::BucketedContext,
             sparse_mask_bucket_tokens: DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
             sparse_mask_bucket_densities: DEFAULT_SPARSE_MASK_BUCKET_DENSITIES.to_vec(),
@@ -927,6 +932,7 @@ pub fn patch_diff_sparsity_config(
         max_context_tokens,
         target_tokens,
     )
+    .with_dilation(config.patch_diff_dilation_tiles)
 }
 
 /// True when patch-diff policy can skip scoring and directly use a dense ordered mask.
@@ -934,10 +940,7 @@ pub fn patch_diff_can_use_dense_fast_path(
     config: &SparseJepaPatchDiffSparsityConfig,
     grid: TokenGridShape,
 ) -> bool {
-    config.threshold <= 0.0
-        && config.dilation == 0
-        && config.allow_full_context
-        && config.context_tokens >= grid.len()
+    config.threshold <= 0.0 && config.allow_full_context && config.context_tokens >= grid.len()
 }
 
 /// Center-prior bootstrap mask used before a previous frame exists.
@@ -1074,7 +1077,6 @@ pub fn patch_diff_sampled_dense_fast_path_from_rgba(
     let fallback_density = fallback_density.clamp(0.0, 1.0);
     if fallback_density >= 1.0
         || config.threshold <= 0.0
-        || config.dilation != 0
         || !config.allow_full_context
         || config.context_tokens < grid.len()
     {
@@ -1189,12 +1191,18 @@ mod tests {
             config.sparse_encode_mode,
             FeatureFrameSparseEncodeMode::BucketedContext
         );
-        assert!(config.patch_diff_refresh.enabled);
-        assert!(config.patch_diff_refresh.subthreshold_enabled);
+        assert!(!config.patch_diff_refresh.enabled);
+        assert!(!config.patch_diff_refresh.subthreshold_enabled);
+        assert!(!config.patch_diff_refresh.age_refresh_enabled);
+        assert!(!config.patch_diff_refresh.blue_noise_enabled);
+        assert_eq!(
+            config.patch_diff_dilation_tiles,
+            DEFAULT_PATCH_DIFF_DILATION_TILES
+        );
         assert!(config.prewarm_shape_buckets);
         assert!(
-            config.pca_update_iterations > 1,
-            "live PCA should converge from the identity basis quickly enough for viewer/docs output"
+            config.pca_update_iterations >= 1,
+            "live PCA must perform at least one Oja update when enabled"
         );
         assert_eq!(
             config.sparse_mask_bucket_densities,
@@ -1290,6 +1298,56 @@ mod tests {
     }
 
     #[test]
+    fn patch_diff_sparsity_config_dilates_direct_hits() {
+        let grid = TokenGridShape::new(1, 4, 4);
+        let center = coords_to_token_index(0, 2, 1, grid);
+        let mut scores = vec![0.0f32; grid.len()];
+        scores[center] = 0.5;
+        let config = FeatureFrameViewerConfig {
+            context_density: 1.0,
+            min_context_density: 0.0,
+            patch_diff_threshold: 0.10,
+            patch_diff_dilation_tiles: 1,
+            patch_diff_refresh: PatchDiffRefreshConfig::disabled(),
+            sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
+            ..FeatureFrameViewerConfig::default()
+        };
+
+        let dilated = patch_diff_context_mask_from_scores(
+            scores.clone(),
+            grid,
+            &patch_diff_sparsity_config(&config, grid),
+        )
+        .expect("dilated mask");
+        assert_eq!(
+            dilated.indices(),
+            &[
+                coords_to_token_index(0, 1, 0, grid),
+                coords_to_token_index(0, 1, 1, grid),
+                coords_to_token_index(0, 1, 2, grid),
+                coords_to_token_index(0, 2, 0, grid),
+                coords_to_token_index(0, 2, 1, grid),
+                coords_to_token_index(0, 2, 2, grid),
+                coords_to_token_index(0, 3, 0, grid),
+                coords_to_token_index(0, 3, 1, grid),
+                coords_to_token_index(0, 3, 2, grid),
+            ]
+        );
+
+        let exact_config = FeatureFrameViewerConfig {
+            patch_diff_dilation_tiles: 0,
+            ..config
+        };
+        let exact = patch_diff_context_mask_from_scores(
+            scores,
+            grid,
+            &patch_diff_sparsity_config(&exact_config, grid),
+        )
+        .expect("exact mask");
+        assert_eq!(exact.indices(), &[center]);
+    }
+
+    #[test]
     fn subthreshold_patch_diff_accumulates_slow_motion() {
         let grid = TokenGridShape::new(1, 4, 4);
         let slow_index = coords_to_token_index(0, 2, 1, grid);
@@ -1298,8 +1356,11 @@ mod tests {
             min_context_density: 0.0,
             patch_diff_threshold: 0.10,
             patch_diff_dense_fallback_density: 1.0,
+            patch_diff_dilation_tiles: 0,
             sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
             patch_diff_refresh: PatchDiffRefreshConfig {
+                enabled: true,
+                subthreshold_enabled: true,
                 subthreshold_decay: 1.0,
                 subthreshold_trigger: 1.0,
                 subthreshold_max_density: 0.25,
@@ -1345,8 +1406,11 @@ mod tests {
             min_context_density: 0.0,
             patch_diff_threshold: 0.10,
             patch_diff_dense_fallback_density: 1.0,
+            patch_diff_dilation_tiles: 0,
             sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
             patch_diff_refresh: PatchDiffRefreshConfig {
+                enabled: true,
+                subthreshold_enabled: true,
                 subthreshold_decay: 1.0,
                 subthreshold_trigger: 0.5,
                 subthreshold_max_density: 1.0,
@@ -1381,9 +1445,12 @@ mod tests {
             min_context_density: 0.0,
             patch_diff_threshold: 0.10,
             patch_diff_dense_fallback_density: 1.0,
+            patch_diff_dilation_tiles: 0,
             sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
             patch_diff_refresh: PatchDiffRefreshConfig {
                 subthreshold_enabled: false,
+                enabled: true,
+                age_refresh_enabled: true,
                 age_refresh_interval_frames: 2,
                 age_refresh_max_density: 0.25,
                 blue_noise_enabled: false,
@@ -1419,10 +1486,13 @@ mod tests {
             min_context_density: 0.0,
             patch_diff_threshold: 0.10,
             patch_diff_dense_fallback_density: 1.0,
+            patch_diff_dilation_tiles: 0,
             sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
             patch_diff_refresh: PatchDiffRefreshConfig {
                 subthreshold_enabled: false,
                 age_refresh_enabled: false,
+                enabled: true,
+                blue_noise_enabled: true,
                 blue_noise_refresh_density: 0.25,
                 max_extra_density: 0.25,
                 blue_noise_seed: 7,

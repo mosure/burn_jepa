@@ -22,6 +22,7 @@ const PATCH_SIZE: usize = 16;
 const DEFAULT_FRAMES: usize = 18;
 const DEFAULT_WARMUP: usize = 4;
 const THRESHOLDS: [f32; 4] = [0.0, 0.01, 0.03, 0.06];
+const DILATIONS: [usize; 2] = [0, 1];
 const RESOLUTIONS: [usize; 2] = [256, 512];
 
 #[derive(Clone, Copy)]
@@ -117,6 +118,7 @@ struct SummaryRow {
     mode: &'static str,
     resolution: usize,
     threshold: f32,
+    dilation: usize,
     motion: &'static str,
     frames: usize,
     mean_write_density: f64,
@@ -152,10 +154,12 @@ fn main() -> Result<()> {
     for mode in SWEEP_MODES {
         for resolution in RESOLUTIONS {
             for threshold in THRESHOLDS {
-                for motion in MOTION_CASES {
-                    rows.push(run_case(
-                        &sender, mode, resolution, threshold, motion, frames, warmup,
-                    )?);
+                for dilation in DILATIONS {
+                    for motion in MOTION_CASES {
+                        rows.push(run_case(
+                            &sender, mode, resolution, threshold, dilation, motion, frames, warmup,
+                        )?);
+                    }
                 }
             }
         }
@@ -188,6 +192,7 @@ fn run_case(
     mode: SweepMode,
     resolution: usize,
     threshold: f32,
+    dilation: usize,
     motion: MotionCase,
     frames: usize,
     warmup: usize,
@@ -208,6 +213,7 @@ fn run_case(
             min_context_density: 0.0,
             bootstrap_context_density: 1.0,
             patch_diff_threshold: threshold,
+            patch_diff_dilation_tiles: dilation,
             sparse_encode_mode: mode.sparse_encode_mode,
             high_res_pca_every: 0,
             measure_stages: true,
@@ -232,18 +238,16 @@ fn run_case(
         if frame >= warmup {
             let metrics = output.metrics;
             let dense_tokens = metrics.dense_tokens.max(1);
-            let encode_tokens = encode_width_for_mode(
-                metrics.context_tokens,
-                dense_tokens,
-                mode.sparse_encode_mode,
-            );
+            let stage = &metrics.stage_metrics;
+            let encode_tokens = stage.valid_encode_tokens.max(stage.encode_width).max(1);
             samples.push(FrameSample {
                 write_density: metrics.density(),
                 encode_density: encode_tokens as f64 / dense_tokens as f64,
                 write_tokens: metrics.context_tokens,
                 encode_tokens,
                 write_dense_ordered: metrics.context_tokens == metrics.dense_tokens,
-                encode_dense_ordered: encode_tokens == metrics.dense_tokens,
+                encode_dense_ordered: stage.encode_width == metrics.dense_tokens
+                    || stage.valid_encode_tokens == metrics.dense_tokens,
                 outer_us,
                 viewer_us: metrics.viewer_total_us,
                 encode_us: metrics.encode_us,
@@ -258,6 +262,7 @@ fn run_case(
         mode.label,
         resolution,
         threshold,
+        dilation,
         motion.label,
         samples,
     ))
@@ -334,26 +339,6 @@ fn motion_density(motion: MotionCase, frame_index: u64) -> f32 {
     (motion.base_density + motion.jitter_density * phase).clamp(0.0, 1.0)
 }
 
-fn encode_width_for_mode(
-    write_tokens: usize,
-    dense_tokens: usize,
-    mode: BevyJepaSparseEncodeMode,
-) -> usize {
-    match mode {
-        BevyJepaSparseEncodeMode::Exact => write_tokens,
-        BevyJepaSparseEncodeMode::BucketedContext => {
-            if write_tokens >= dense_tokens || dense_tokens < 256 {
-                return write_tokens;
-            }
-            let bucket = 256.min((dense_tokens / 4).max(1));
-            write_tokens
-                .div_ceil(bucket)
-                .saturating_mul(bucket)
-                .min(dense_tokens)
-        }
-    }
-}
-
 fn active_patch_set(dense_tokens: usize, active_tokens: usize, seed: u64) -> Vec<usize> {
     let mut ranked = (0..dense_tokens)
         .map(|index| {
@@ -383,6 +368,7 @@ fn summarize(
     mode: &'static str,
     resolution: usize,
     threshold: f32,
+    dilation: usize,
     motion: &'static str,
     samples: Vec<FrameSample>,
 ) -> SummaryRow {
@@ -413,6 +399,7 @@ fn summarize(
         mode,
         resolution,
         threshold,
+        dilation,
         motion,
         frames,
         mean_write_density,
@@ -462,14 +449,15 @@ fn mean_f64(values: impl Iterator<Item = f64>) -> f64 {
 
 fn rows_to_csv(rows: &[SummaryRow]) -> String {
     let mut out = String::from(
-        "mode,resolution,threshold,motion,frames,mean_write_density,mean_encode_density,p50_write_density,p95_write_density,unique_write_widths,unique_encode_widths,dense_write_frames,dense_encode_frames,p50_outer_ms,p95_outer_ms,max_outer_ms,p50_viewer_ms,p95_viewer_ms,p95_encode_ms,p95_cache_ms,p95_low_res_pca_ms,p95_pca_update_ms,p95_display_ms\n",
+        "mode,resolution,threshold,dilation,motion,frames,mean_write_density,mean_encode_density,p50_write_density,p95_write_density,unique_write_widths,unique_encode_widths,dense_write_frames,dense_encode_frames,p50_outer_ms,p95_outer_ms,max_outer_ms,p50_viewer_ms,p95_viewer_ms,p95_encode_ms,p95_cache_ms,p95_low_res_pca_ms,p95_pca_update_ms,p95_display_ms\n",
     );
     for row in rows {
         out.push_str(&format!(
-            "{},{},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
+            "{},{},{:.3},{},{},{},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}\n",
             row.mode,
             row.resolution,
             row.threshold,
+            row.dilation,
             row.motion,
             row.frames,
             row.mean_write_density,
@@ -497,17 +485,18 @@ fn rows_to_csv(rows: &[SummaryRow]) -> String {
 
 fn rows_to_markdown(rows: &[SummaryRow]) -> String {
     let mut out = String::from(
-        "| Mode | Resolution | Threshold | Motion | Mean write density | Mean encode density | Unique write widths | Unique encode widths | Dense write frames | Dense encode frames | p50 outer ms | p95 outer ms | max outer ms | p95 encode ms | p95 cache ms | p95 PCA upd ms | p95 display ms |\n",
+        "| Mode | Resolution | Threshold | Dilation | Motion | Mean write density | Mean encode density | Unique write widths | Unique encode widths | Dense write frames | Dense encode frames | p50 outer ms | p95 outer ms | max outer ms | p95 encode ms | p95 cache ms | p95 PCA upd ms | p95 display ms |\n",
     );
     out.push_str(
-        "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for row in rows {
         out.push_str(&format!(
-            "| {} | {} | {:.2} | {} | {:.1}% | {:.1}% | {} | {} | {}/{} | {}/{} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |\n",
+            "| {} | {} | {:.2} | {} | {} | {:.1}% | {:.1}% | {} | {} | {}/{} | {}/{} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |\n",
             row.mode,
             row.resolution,
             row.threshold,
+            row.dilation,
             row.motion,
             row.mean_write_density * 100.0,
             row.mean_encode_density * 100.0,
@@ -531,14 +520,15 @@ fn rows_to_markdown(rows: &[SummaryRow]) -> String {
 
 fn print_headline(rows: &[SummaryRow]) {
     let mut by_resolution = BTreeMap::<usize, Vec<&SummaryRow>>::new();
-    for row in rows
-        .iter()
-        .filter(|row| row.mode == "bucketed256" && (row.threshold - 0.03).abs() < f32::EPSILON)
-    {
+    for row in rows.iter().filter(|row| {
+        row.mode == "bucketed256"
+            && row.dilation == 1
+            && (row.threshold - 0.03).abs() < f32::EPSILON
+    }) {
         by_resolution.entry(row.resolution).or_default().push(row);
     }
     for (resolution, rows) in by_resolution {
-        println!("\ndefault bucketed threshold 0.03, {resolution}px:");
+        println!("\ndefault bucketed threshold 0.03, dilation 1, {resolution}px:");
         for row in rows {
             println!(
                 "  {:<16} density {:>5.1}% widths {:>2} p50 {:>6.2} ms p95 {:>6.2} ms max {:>6.2} ms",

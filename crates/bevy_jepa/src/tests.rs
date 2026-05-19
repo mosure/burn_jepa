@@ -116,6 +116,10 @@ fn default_mask_source_is_patch_diff() {
         (BevyJepaConfig::default().patch_diff_quality() - DEFAULT_PATCH_DIFF_QUALITY).abs()
             <= f32::EPSILON
     );
+    assert_eq!(
+        BevyJepaConfig::default().patch_diff_dilation_tiles,
+        DEFAULT_PATCH_DIFF_DILATION_TILES
+    );
     assert_eq!(BevyJepaConfig::default().bootstrap_context_density, 1.0);
     assert_eq!(
         BevyJepaConfig::default().pca_update_every,
@@ -257,6 +261,7 @@ fn control_actions_update_patch_diff_refresh_without_model_rebuild() {
         apply_control_action(&mut config, JepaControlAction::SubthresholdRefresh),
         JepaControlReset::Visual
     );
+    assert!(config.patch_diff_refresh.enabled);
     assert_eq!(
         config.patch_diff_refresh.subthreshold_enabled,
         !subthreshold
@@ -271,6 +276,22 @@ fn control_actions_update_patch_diff_refresh_without_model_rebuild() {
         JepaControlReset::Visual
     );
     assert_eq!(config.patch_diff_refresh.blue_noise_enabled, !blue);
+}
+
+#[test]
+fn patch_diff_refresh_control_is_legacy_opt_in() {
+    let mut config = BevyJepaConfig::default();
+    assert!(!config.patch_diff_refresh.enabled);
+    assert!(!config.patch_diff_refresh.subthreshold_enabled);
+    assert!(!config.patch_diff_refresh.age_refresh_enabled);
+    assert!(!config.patch_diff_refresh.blue_noise_enabled);
+
+    apply_control_action(&mut config, JepaControlAction::PatchRefresh);
+
+    assert!(config.patch_diff_refresh.enabled);
+    assert!(config.patch_diff_refresh.subthreshold_enabled);
+    assert!(!config.patch_diff_refresh.age_refresh_enabled);
+    assert!(!config.patch_diff_refresh.blue_noise_enabled);
 }
 
 #[test]
@@ -458,6 +479,7 @@ fn control_actions_switch_dense_and_sparse_pipeline_presets() {
     assert_eq!(config.min_context_density, 1.0);
     assert_eq!(config.bootstrap_context_density, 1.0);
     assert_eq!(config.patch_diff_threshold, 0.0);
+    assert_eq!(config.patch_diff_dilation_tiles, 0);
 
     assert_eq!(
         apply_control_action(&mut config, JepaControlAction::PipelineSparse),
@@ -468,6 +490,10 @@ fn control_actions_switch_dense_and_sparse_pipeline_presets() {
     assert_eq!(
         config.sparse_encode_mode,
         BevyJepaSparseEncodeMode::BucketedContext
+    );
+    assert_eq!(
+        config.patch_diff_dilation_tiles,
+        DEFAULT_PATCH_DIFF_DILATION_TILES
     );
 }
 
@@ -532,6 +558,7 @@ fn control_sliders_preserve_pca_settings_for_non_pca_fields() {
 
     for kind in [
         JepaControlSliderKind::PatchDiffThreshold,
+        JepaControlSliderKind::PatchDiffDilationTiles,
         JepaControlSliderKind::ContextDensity,
         JepaControlSliderKind::MinContextDensity,
         JepaControlSliderKind::DenseFallbackDensity,
@@ -557,6 +584,18 @@ fn control_sliders_update_numeric_pipeline_fields() {
         JepaControlReset::Visual
     );
     assert!((config.patch_diff_threshold - 0.10).abs() <= 1.0e-6);
+    apply_control_slider_value(
+        &mut config,
+        JepaControlSliderKind::PatchDiffDilationTiles,
+        0.0,
+    );
+    assert_eq!(config.patch_diff_dilation_tiles, 0);
+    apply_control_slider_value(
+        &mut config,
+        JepaControlSliderKind::PatchDiffDilationTiles,
+        0.5,
+    );
+    assert_eq!(config.patch_diff_dilation_tiles, 2);
 
     apply_control_slider_value(&mut config, JepaControlSliderKind::MinContextDensity, 0.25);
     assert!((config.min_context_density - 0.25).abs() <= 1.0e-6);
@@ -931,15 +970,16 @@ fn default_patch_diff_quality_keeps_subtle_motion_patches() {
     )
     .expect("patch-diff mask");
 
-    assert_eq!(output.write_mask.len(), changed.len());
-    assert_eq!(
-        output.write_mask.indices(),
-        &[
-            coords_to_token_index(0, 0, 0, grid),
-            coords_to_token_index(0, 2, 3, grid),
-            coords_to_token_index(0, 3, 1, grid),
-        ]
-    );
+    assert!(output.write_mask.len() >= changed.len());
+    for &(row, col) in &changed {
+        assert!(
+            output
+                .write_mask
+                .indices()
+                .contains(&coords_to_token_index(0, row, col, grid)),
+            "default dilation must preserve every direct threshold hit"
+        );
+    }
 }
 
 #[test]
@@ -1024,10 +1064,12 @@ fn patch_diff_relative_luma_detects_dark_region_motion() {
     )
     .expect("patch-diff mask");
 
-    assert_eq!(output.write_mask.len(), 1);
-    assert_eq!(
-        output.write_mask.indices(),
-        &[coords_to_token_index(0, 1, 2, grid)]
+    assert_eq!(output.write_mask.len(), 9);
+    assert!(
+        output
+            .write_mask
+            .indices()
+            .contains(&coords_to_token_index(0, 1, 2, grid))
     );
 }
 
@@ -1303,6 +1345,7 @@ fn patch_diff_mask_selects_changed_camera_patch() {
         pipeline: FeatureFrameViewerConfig {
             context_density: 1.0 / 16.0,
             patch_diff_threshold: 0.01,
+            patch_diff_dilation_tiles: 0,
             ..FeatureFrameViewerConfig::default()
         },
         ..BevyJepaConfig::default()
@@ -1337,6 +1380,61 @@ fn patch_diff_mask_selects_changed_camera_patch() {
 }
 
 #[test]
+fn patch_diff_mask_dilates_changed_camera_patch_by_default() {
+    let device = JepaBevyDevice::default();
+    let config = BevyJepaConfig {
+        source: BevyJepaFrameSource::Camera,
+        mask_source: BevyJepaMaskSource::PatchDiff,
+        pipeline: FeatureFrameViewerConfig {
+            context_density: 1.0,
+            patch_diff_threshold: 0.01,
+            patch_diff_dense_fallback_density: 0.98,
+            sparse_encode_mode: BevyJepaSparseEncodeMode::Exact,
+            patch_diff_refresh: PatchDiffRefreshConfig::disabled(),
+            ..FeatureFrameViewerConfig::default()
+        },
+        ..BevyJepaConfig::default()
+    };
+    let mut model_config = VJepaConfig::tiny_for_tests();
+    model_config.image_size = 64;
+    model_config.num_frames = 2;
+    model_config.tubelet_size = 2;
+    model_config.patch_size = 16;
+    let grid = TokenGridShape::new(1, 4, 4);
+    let previous_rgba = RgbaImage::new(64, 64);
+    let current_rgba = rgba_with_patches(64, 64, &[(2, 1)], 16, image::Rgba([255, 255, 255, 255]));
+    let previous = rgba_image_to_tensor(previous_rgba.clone(), 64, &device).expect("prev");
+    let current = rgba_image_to_tensor(current_rgba.clone(), 64, &device).expect("current");
+
+    let output = run_sparse_mask_node(
+        &config,
+        Some(&previous),
+        Some(&previous_rgba),
+        Some(&current_rgba),
+        &current,
+        &model_config,
+        grid,
+    )
+    .expect("patch-diff mask");
+
+    assert_eq!(output.write_mask.len(), 9);
+    assert_eq!(
+        output.write_mask.indices(),
+        &[
+            coords_to_token_index(0, 1, 0, grid),
+            coords_to_token_index(0, 1, 1, grid),
+            coords_to_token_index(0, 1, 2, grid),
+            coords_to_token_index(0, 2, 0, grid),
+            coords_to_token_index(0, 2, 1, grid),
+            coords_to_token_index(0, 2, 2, grid),
+            coords_to_token_index(0, 3, 0, grid),
+            coords_to_token_index(0, 3, 1, grid),
+            coords_to_token_index(0, 3, 2, grid),
+        ]
+    );
+}
+
+#[test]
 fn patch_diff_mask_includes_all_patches_above_threshold() {
     let device = JepaBevyDevice::default();
     let config = BevyJepaConfig {
@@ -1345,6 +1443,7 @@ fn patch_diff_mask_includes_all_patches_above_threshold() {
         pipeline: FeatureFrameViewerConfig {
             context_density: 1.0 / 16.0,
             patch_diff_threshold: 0.01,
+            patch_diff_dilation_tiles: 0,
             ..FeatureFrameViewerConfig::default()
         },
         ..BevyJepaConfig::default()
@@ -1398,8 +1497,11 @@ fn patch_diff_refresh_state_promotes_subthreshold_camera_motion() {
             context_density: 0.25,
             patch_diff_threshold: 0.10,
             patch_diff_dense_fallback_density: 1.0,
+            patch_diff_dilation_tiles: 0,
             sparse_encode_mode: BevyJepaSparseEncodeMode::Exact,
             patch_diff_refresh: PatchDiffRefreshConfig {
+                enabled: true,
+                subthreshold_enabled: true,
                 subthreshold_decay: 1.0,
                 subthreshold_trigger: 1.0,
                 subthreshold_max_density: 0.25,
@@ -1481,6 +1583,7 @@ fn patch_diff_mask_uses_adaptive_density_for_changed_patches() {
             context_density: 1.0,
             patch_diff_threshold: 0.01,
             patch_diff_dense_fallback_density: 0.98,
+            patch_diff_dilation_tiles: 0,
             ..FeatureFrameViewerConfig::default()
         },
         ..BevyJepaConfig::default()
@@ -1574,6 +1677,7 @@ fn patch_diff_high_density_promotes_to_dense_ordered_mask() {
             context_density: 1.0,
             patch_diff_threshold: 0.01,
             patch_diff_dense_fallback_density: 0.98,
+            patch_diff_dilation_tiles: 0,
             ..FeatureFrameViewerConfig::default()
         },
         ..BevyJepaConfig::default()
@@ -1632,6 +1736,7 @@ fn patch_diff_below_dense_fallback_cutoff_remains_sparse() {
             context_density: 1.0,
             patch_diff_threshold: 0.01,
             patch_diff_dense_fallback_density: 0.98,
+            patch_diff_dilation_tiles: 0,
             ..FeatureFrameViewerConfig::default()
         },
         ..BevyJepaConfig::default()
@@ -2113,6 +2218,7 @@ fn controls_help_text_documents_dense_sparse_and_threshold_controls() {
     assert!(control_help_text(JepaControlAction::PipelineDense).contains("full-frame"));
     assert!(control_help_text(JepaControlAction::PcaLock).contains("fixed"));
     assert!(slider_help_text(JepaControlSliderKind::PatchDiffThreshold).contains("Lower"));
+    assert!(slider_help_text(JepaControlSliderKind::PatchDiffDilationTiles).contains("expansion"));
     assert!(slider_help_text(JepaControlSliderKind::DenseFallbackDensity).contains("dense JEPA"));
     assert!(slider_help_text(JepaControlSliderKind::PcaUpdateEvery).contains("Zero locks"));
 }

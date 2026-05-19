@@ -56,11 +56,12 @@ pub use config::{
     DEFAULT_MIN_CONTEXT_DENSITY, DEFAULT_MODEL_MANIFEST_PATH, DEFAULT_MODEL_PACKAGE_DIR,
     DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES, DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
     DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
-    DEFAULT_PATCH_DIFF_QUALITY, DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
-    DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
-    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
-    DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES,
-    DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
+    DEFAULT_PATCH_DIFF_DILATION_TILES, DEFAULT_PATCH_DIFF_QUALITY,
+    DEFAULT_PATCH_DIFF_REFRESH_ENABLED, DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY,
+    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY,
+    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER, DEFAULT_PATCH_DIFF_THRESHOLD,
+    DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES, DEFAULT_PCA_UPDATE_EVERY,
+    DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
     DEFAULT_SPARSE_MASK_BUCKET_DENSITIES, DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
     DEFAULT_TTT_MODEL_PATH, DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH,
     DEFAULT_VJEPA21_WEIGHTS_NAME, FeatureFrameViewerConfig, MIN_PIPELINE_IMAGE_SIZE,
@@ -98,6 +99,7 @@ const CONTROL_LABEL_WIDTH_PX: f32 = 128.0;
 const CONTROL_SLIDER_WIDTH_PX: f32 = 206.0;
 const CONTROL_SLIDER_HEIGHT_PX: f32 = 18.0;
 const CONTROL_SLIDER_UPDATE_EPSILON: f32 = 0.001;
+const PATCH_DIFF_DILATION_MAX_TILES: usize = 4;
 const METRICS_TOP_WIDTH_PX: f32 = 560.0;
 const METRICS_STAGE_HEIGHT_PX: f32 = 138.0;
 const METRICS_GRAPH_BARS: usize = 64;
@@ -288,6 +290,7 @@ struct RuntimePipelineSignature {
     min_context_density_bits: u32,
     bootstrap_context_density_bits: u32,
     patch_diff_dense_fallback_bits: u32,
+    patch_diff_dilation_tiles: usize,
     patch_diff_refresh_enabled: bool,
     patch_diff_subthreshold_enabled: bool,
     patch_diff_subthreshold_decay_bits: u32,
@@ -343,6 +346,7 @@ impl RuntimePipelineSignature {
             min_context_density_bits: config.min_context_density.to_bits(),
             bootstrap_context_density_bits: config.bootstrap_context_density.to_bits(),
             patch_diff_dense_fallback_bits: config.patch_diff_dense_fallback_density.to_bits(),
+            patch_diff_dilation_tiles: config.patch_diff_dilation_tiles,
             patch_diff_refresh_enabled: config.patch_diff_refresh.enabled,
             patch_diff_subthreshold_enabled: config.patch_diff_refresh.subthreshold_enabled,
             patch_diff_subthreshold_decay_bits: config
@@ -647,6 +651,7 @@ struct JepaControlButtonText {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JepaControlSliderKind {
     PatchDiffThreshold,
+    PatchDiffDilationTiles,
     ContextDensity,
     MinContextDensity,
     DenseFallbackDensity,
@@ -1579,12 +1584,17 @@ fn setup_controls_ui(mut commands: Commands) {
                         spawn_control_section_title(
                             tab,
                             "Patch-Diff Mask",
-                            "Threshold selects changed patches; refresh prevents stale tokens.",
+                            "Dilation expands changed patches. Refresh modes are legacy and off by default.",
                         );
                         spawn_slider_row(
                             tab,
                             "Diff threshold",
                             JepaControlSliderKind::PatchDiffThreshold,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Expansion",
+                            JepaControlSliderKind::PatchDiffDilationTiles,
                         );
                         spawn_slider_row(tab, "Max density", JepaControlSliderKind::ContextDensity);
                         spawn_slider_row(
@@ -4343,21 +4353,27 @@ fn apply_control_action(
         }
         JepaControlAction::PatchRefresh => {
             config.patch_diff_refresh.enabled = !config.patch_diff_refresh.enabled;
+            if config.patch_diff_refresh.enabled && !patch_diff_refresh_has_mode(config) {
+                config.patch_diff_refresh.subthreshold_enabled = true;
+            }
             JepaControlReset::Visual
         }
         JepaControlAction::SubthresholdRefresh => {
             config.patch_diff_refresh.subthreshold_enabled =
                 !config.patch_diff_refresh.subthreshold_enabled;
+            normalize_patch_diff_refresh_toggle(config);
             JepaControlReset::Visual
         }
         JepaControlAction::AgeRefresh => {
             config.patch_diff_refresh.age_refresh_enabled =
                 !config.patch_diff_refresh.age_refresh_enabled;
+            normalize_patch_diff_refresh_toggle(config);
             JepaControlReset::Visual
         }
         JepaControlAction::BlueNoiseRefresh => {
             config.patch_diff_refresh.blue_noise_enabled =
                 !config.patch_diff_refresh.blue_noise_enabled;
+            normalize_patch_diff_refresh_toggle(config);
             JepaControlReset::Visual
         }
     };
@@ -4376,6 +4392,11 @@ fn apply_control_slider_value(
     let reset = match kind {
         JepaControlSliderKind::PatchDiffThreshold => {
             config.patch_diff_threshold = slider_lerp(0.0, 0.20, normalized);
+            JepaControlReset::Visual
+        }
+        JepaControlSliderKind::PatchDiffDilationTiles => {
+            config.patch_diff_dilation_tiles =
+                slider_lerp(0.0, PATCH_DIFF_DILATION_MAX_TILES as f32, normalized).round() as usize;
             JepaControlReset::Visual
         }
         JepaControlSliderKind::ContextDensity => {
@@ -4435,6 +4456,16 @@ fn apply_control_slider_value(
     reset
 }
 
+fn patch_diff_refresh_has_mode(config: &BevyJepaConfig) -> bool {
+    config.patch_diff_refresh.subthreshold_enabled
+        || config.patch_diff_refresh.age_refresh_enabled
+        || config.patch_diff_refresh.blue_noise_enabled
+}
+
+fn normalize_patch_diff_refresh_toggle(config: &mut BevyJepaConfig) {
+    config.patch_diff_refresh.enabled = patch_diff_refresh_has_mode(config);
+}
+
 fn set_model_profile(config: &mut BevyJepaConfig, profile: BevyJepaModelPackageProfile) {
     config.model_profile = profile;
     config.model_base_url = burn_jepa::burn_jepa_model_profile_base_url(profile);
@@ -4458,6 +4489,7 @@ fn set_sparse_pipeline_preset(config: &mut BevyJepaConfig) {
     config.bootstrap_context_density = defaults.bootstrap_context_density;
     config.patch_diff_threshold = defaults.patch_diff_threshold;
     config.patch_diff_dense_fallback_density = defaults.patch_diff_dense_fallback_density;
+    config.patch_diff_dilation_tiles = defaults.patch_diff_dilation_tiles;
     config.sparse_encode_mode = FeatureFrameSparseEncodeMode::BucketedContext;
     config.patch_diff_refresh = defaults.patch_diff_refresh;
 }
@@ -4469,6 +4501,7 @@ fn set_dense_pipeline_preset(config: &mut BevyJepaConfig) {
     config.bootstrap_context_density = 1.0;
     config.patch_diff_threshold = 0.0;
     config.patch_diff_dense_fallback_density = DENSE_PIPELINE_FALLBACK_DENSITY;
+    config.patch_diff_dilation_tiles = 0;
     config.sparse_encode_mode = FeatureFrameSparseEncodeMode::Exact;
     config.patch_diff_refresh.enabled = false;
 }
@@ -4480,6 +4513,7 @@ fn dense_pipeline_enabled(config: &BevyJepaConfig) -> bool {
         && config.bootstrap_context_density >= 1.0
         && config.patch_diff_threshold <= f32::EPSILON
         && config.patch_diff_dense_fallback_density <= f32::EPSILON
+        && config.patch_diff_dilation_tiles == 0
 }
 
 fn slider_lerp(min: f32, max: f32, normalized: f32) -> f32 {
@@ -4498,6 +4532,11 @@ fn slider_normalized_value(config: &BevyJepaConfig, kind: JepaControlSliderKind)
         JepaControlSliderKind::PatchDiffThreshold => {
             slider_unlerp(0.0, 0.20, config.patch_diff_threshold)
         }
+        JepaControlSliderKind::PatchDiffDilationTiles => slider_unlerp(
+            0.0,
+            PATCH_DIFF_DILATION_MAX_TILES as f32,
+            config.patch_diff_dilation_tiles as f32,
+        ),
         JepaControlSliderKind::ContextDensity => slider_unlerp(0.01, 1.0, config.context_density),
         JepaControlSliderKind::MinContextDensity => {
             slider_unlerp(0.0, 1.0, config.min_context_density)
@@ -4538,6 +4577,11 @@ fn slider_value_label(config: &BevyJepaConfig, kind: JepaControlSliderKind) -> S
         JepaControlSliderKind::PatchDiffThreshold => {
             format!("{:.3}", config.patch_diff_threshold)
         }
+        JepaControlSliderKind::PatchDiffDilationTiles => match config.patch_diff_dilation_tiles {
+            0 => "off".to_string(),
+            1 => "1 tile".to_string(),
+            tiles => format!("{tiles} tiles"),
+        },
         JepaControlSliderKind::ContextDensity => {
             format!("{:.0}%", config.context_density * 100.0)
         }
@@ -4580,7 +4624,7 @@ fn slider_value_label(config: &BevyJepaConfig, kind: JepaControlSliderKind) -> S
 
 fn controls_summary(config: &BevyJepaConfig) -> String {
     format!(
-        "{} | {} {}px | patch thr {:.3} ({:>4.1}% quality) | refresh {} / sub {} / age {} / blue {} | PCA {} | AnyUp {} {}",
+        "{} | {} {}px | patch thr {:.3} ({:>4.1}% quality) | expand {} | refresh {} / sub {} / age {} / blue {} | PCA {} | AnyUp {} {}",
         config.model_profile,
         if dense_pipeline_enabled(config) {
             "dense"
@@ -4588,8 +4632,13 @@ fn controls_summary(config: &BevyJepaConfig) -> String {
             "sparse"
         },
         config.pipeline_image_size(),
-        config.patch_diff_quality() * 100.0,
         config.patch_diff_threshold,
+        config.patch_diff_quality() * 100.0,
+        if config.patch_diff_dilation_tiles == 0 {
+            "off".to_string()
+        } else {
+            format!("{}t", config.patch_diff_dilation_tiles)
+        },
         on_off(config.patch_diff_refresh.enabled),
         on_off(config.patch_diff_refresh.subthreshold_enabled),
         on_off(config.patch_diff_refresh.age_refresh_enabled),
@@ -4646,7 +4695,7 @@ fn control_help_text(action: JepaControlAction) -> &'static str {
             "Show model package, sparse/dense pipeline, and input resolution settings."
         }
         JepaControlAction::TabMask => {
-            "Show patch-diff threshold, density, and stale-token refresh settings."
+            "Show patch-diff threshold, dilation, density, and legacy refresh settings."
         }
         JepaControlAction::TabPca => "Show PCA basis fitting and projection stability settings.",
         JepaControlAction::TabAnyUp => {
@@ -4690,16 +4739,16 @@ fn control_help_text(action: JepaControlAction) -> &'static str {
             "Stop rolling PCA updates and keep the current projection fixed to reduce color drift."
         }
         JepaControlAction::PatchRefresh => {
-            "Enable extra refresh patches beyond direct threshold hits to reduce stale tokens."
+            "Legacy: enable extra refresh patches beyond direct threshold hits. Usually leave this off with dilation enabled."
         }
         JepaControlAction::SubthresholdRefresh => {
-            "Accumulate weak patch differences over time so slow semantic motion still refreshes."
+            "Legacy: accumulate weak patch differences over time. Usually unnecessary after patch-diff dilation."
         }
         JepaControlAction::AgeRefresh => {
-            "Periodically refresh old token-cache slots even when patch difference is low."
+            "Legacy: periodically refresh old token-cache slots. Usually unnecessary after patch-diff dilation."
         }
         JepaControlAction::BlueNoiseRefresh => {
-            "Add a low-density spatially distributed refresh pattern to avoid clustered drift."
+            "Legacy: add low-density spatial refresh probes. Usually unnecessary after patch-diff dilation."
         }
     }
 }
@@ -4708,6 +4757,9 @@ fn slider_help_text(kind: JepaControlSliderKind) -> &'static str {
     match kind {
         JepaControlSliderKind::PatchDiffThreshold => {
             "Patch difference threshold. Lower values admit more changed patches."
+        }
+        JepaControlSliderKind::PatchDiffDilationTiles => {
+            "Tile-radius expansion applied to direct patch-diff hits before refresh tokens."
         }
         JepaControlSliderKind::ContextDensity => {
             "Maximum context density used to cap patch-diff masks before JEPA encoding."
@@ -4731,12 +4783,14 @@ fn slider_help_text(kind: JepaControlSliderKind) -> &'static str {
             "Oja iterations per PCA update. Higher values stabilize color at extra cost."
         }
         JepaControlSliderKind::SubthresholdTrigger => {
-            "Accumulated weak-diff score required before a subthreshold patch refreshes."
+            "Legacy subthreshold refresh trigger. Only used when subthreshold refresh is enabled."
         }
         JepaControlSliderKind::AgeIntervalFrames => {
-            "Maximum token age before eligible age-priority refresh."
+            "Legacy age-refresh interval. Only used when age refresh is enabled."
         }
-        JepaControlSliderKind::BlueNoiseDensity => "Extra blue-noise refresh density per frame.",
+        JepaControlSliderKind::BlueNoiseDensity => {
+            "Legacy blue-noise refresh density. Only used when blue refresh is enabled."
+        }
     }
 }
 

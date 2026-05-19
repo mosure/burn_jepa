@@ -13,11 +13,11 @@ use bevy_jepa::{
     DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE, DEFAULT_MIN_CONTEXT_DENSITY,
     DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES, DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
     DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
-    DEFAULT_PATCH_DIFF_REFRESH_ENABLED, DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY,
-    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY,
-    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER, DEFAULT_PATCH_DIFF_THRESHOLD,
-    DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES, DEFAULT_PCA_UPDATE_EVERY,
-    DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
+    DEFAULT_PATCH_DIFF_DILATION_TILES, DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
+    DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
+    DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
+    DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES,
+    DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
     DEFAULT_SPARSE_MASK_BUCKET_DENSITIES, DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
     DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME,
 };
@@ -113,28 +113,85 @@ struct Cli {
     patch_diff_dense_fallback_density: f32,
     #[arg(
         long,
+        visible_alias = "patch-diff-dilation-tiles",
+        default_value_t = DEFAULT_PATCH_DIFF_DILATION_TILES,
+        help = "Tile-radius dilation applied to direct patch-diff hits before refresh/noise/age additions. Use 0 to disable expansion."
+    )]
+    patch_diff_dilation: usize,
+    #[arg(
+        long,
         action = ArgAction::SetTrue,
         default_value_t = DEFAULT_PATCH_DIFF_REFRESH_ENABLED,
-        help = "Enable bounded age/subthreshold/blue-noise patch-diff refresh tokens."
+        help = "Legacy master switch for extra patch-diff refresh tokens. Off by default; dilation is usually the preferred mask expansion path."
     )]
     patch_diff_refresh: bool,
     #[arg(long = "no-patch-diff-refresh", action = ArgAction::SetTrue, hide = true)]
     no_patch_diff_refresh: bool,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY)]
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Legacy opt-in for accumulated subthreshold patch refresh. Usually unnecessary after patch-diff dilation."
+    )]
+    patch_diff_subthreshold_refresh: bool,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY,
+        help = "Legacy subthreshold-refresh decay; only used with --patch-diff-subthreshold-refresh."
+    )]
     patch_diff_subthreshold_decay: f32,
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        help = "Legacy subthreshold-refresh gain; only used with --patch-diff-subthreshold-refresh."
+    )]
     patch_diff_subthreshold_gain: f32,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
+        help = "Legacy subthreshold-refresh trigger; only used with --patch-diff-subthreshold-refresh."
+    )]
     patch_diff_subthreshold_trigger: f32,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY,
+        help = "Legacy subthreshold-refresh density cap; only used with --patch-diff-subthreshold-refresh."
+    )]
     patch_diff_subthreshold_max_density: f32,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES)]
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Legacy opt-in for stale-token age refresh. Off by default; dilation is usually preferred."
+    )]
+    patch_diff_age_refresh: bool,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES,
+        help = "Legacy age-refresh interval; only used with --patch-diff-age-refresh."
+    )]
     patch_diff_age_refresh_interval_frames: u64,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
+        help = "Legacy age-refresh density cap; only used with --patch-diff-age-refresh."
+    )]
     patch_diff_age_refresh_max_density: f32,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY)]
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Legacy opt-in for deterministic blue-noise refresh. Off by default; dilation is usually preferred."
+    )]
+    patch_diff_blue_noise_refresh: bool,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY,
+        help = "Legacy blue-noise refresh density; only used with --patch-diff-blue-noise-refresh."
+    )]
     patch_diff_blue_noise_refresh_density: f32,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_REFRESH_MAX_DENSITY,
+        help = "Legacy total refresh-token density cap; only used when at least one refresh mode is enabled."
+    )]
     patch_diff_refresh_max_density: f32,
     #[arg(
         long,
@@ -229,6 +286,11 @@ impl From<Cli> for BevyJepaConfig {
         let model_base_url = resolve_model_profile_base_url(cli.model_profile, cli.model_base_url);
         let anyup_model_base_url =
             resolve_anyup_model_profile_base_url(cli.anyup_model_profile, cli.anyup_model_base_url);
+        let any_legacy_refresh_mode = cli.patch_diff_subthreshold_refresh
+            || cli.patch_diff_age_refresh
+            || cli.patch_diff_blue_noise_refresh;
+        let subthreshold_refresh = cli.patch_diff_subthreshold_refresh
+            || (cli.patch_diff_refresh && !any_legacy_refresh_mode);
         Self {
             encoder_source: cli.encoder_source,
             model_manifest_path: cli.model_manifest,
@@ -268,16 +330,24 @@ impl From<Cli> for BevyJepaConfig {
                 patch_diff_dense_fallback_density: cli
                     .patch_diff_dense_fallback_density
                     .clamp(0.0, 1.0),
+                patch_diff_dilation_tiles: cli.patch_diff_dilation,
                 patch_diff_refresh: PatchDiffRefreshConfig {
-                    enabled: cli.patch_diff_refresh && !cli.no_patch_diff_refresh,
+                    enabled: (cli.patch_diff_refresh
+                        || cli.patch_diff_subthreshold_refresh
+                        || cli.patch_diff_age_refresh
+                        || cli.patch_diff_blue_noise_refresh)
+                        && !cli.no_patch_diff_refresh,
+                    subthreshold_enabled: subthreshold_refresh,
                     subthreshold_decay: cli.patch_diff_subthreshold_decay.clamp(0.0, 1.0),
                     subthreshold_gain: cli.patch_diff_subthreshold_gain.max(0.0),
                     subthreshold_trigger: cli.patch_diff_subthreshold_trigger.max(1.0e-6),
                     subthreshold_max_density: cli
                         .patch_diff_subthreshold_max_density
                         .clamp(0.0, 1.0),
+                    age_refresh_enabled: cli.patch_diff_age_refresh,
                     age_refresh_interval_frames: cli.patch_diff_age_refresh_interval_frames,
                     age_refresh_max_density: cli.patch_diff_age_refresh_max_density.clamp(0.0, 1.0),
+                    blue_noise_enabled: cli.patch_diff_blue_noise_refresh,
                     blue_noise_refresh_density: cli
                         .patch_diff_blue_noise_refresh_density
                         .clamp(0.0, 1.0),
@@ -381,6 +451,55 @@ mod tests {
         ]));
 
         assert!((config.patch_diff_dense_fallback_density - 0.9).abs() <= 1.0e-6);
+    }
+
+    #[test]
+    fn patch_diff_dilation_is_configurable() {
+        let default_config = BevyJepaConfig::from(Cli::parse_from(["bevy_jepa"]));
+        assert_eq!(
+            default_config.patch_diff_dilation_tiles,
+            DEFAULT_PATCH_DIFF_DILATION_TILES
+        );
+
+        let config =
+            BevyJepaConfig::from(Cli::parse_from(["bevy_jepa", "--patch-diff-dilation", "2"]));
+
+        assert_eq!(config.patch_diff_dilation_tiles, 2);
+    }
+
+    #[test]
+    fn patch_diff_refresh_modes_are_opt_in() {
+        let default_config = BevyJepaConfig::from(Cli::parse_from(["bevy_jepa"]));
+        assert!(!default_config.patch_diff_refresh.enabled);
+        assert!(!default_config.patch_diff_refresh.subthreshold_enabled);
+        assert!(!default_config.patch_diff_refresh.age_refresh_enabled);
+        assert!(!default_config.patch_diff_refresh.blue_noise_enabled);
+
+        let age_config =
+            BevyJepaConfig::from(Cli::parse_from(["bevy_jepa", "--patch-diff-age-refresh"]));
+        assert!(age_config.patch_diff_refresh.enabled);
+        assert!(age_config.patch_diff_refresh.age_refresh_enabled);
+        assert!(!age_config.patch_diff_refresh.subthreshold_enabled);
+        assert!(!age_config.patch_diff_refresh.blue_noise_enabled);
+
+        let master_config =
+            BevyJepaConfig::from(Cli::parse_from(["bevy_jepa", "--patch-diff-refresh"]));
+        assert!(master_config.patch_diff_refresh.enabled);
+        assert!(master_config.patch_diff_refresh.subthreshold_enabled);
+        assert!(!master_config.patch_diff_refresh.age_refresh_enabled);
+        assert!(!master_config.patch_diff_refresh.blue_noise_enabled);
+
+        let all_config = BevyJepaConfig::from(Cli::parse_from([
+            "bevy_jepa",
+            "--patch-diff-refresh",
+            "--patch-diff-subthreshold-refresh",
+            "--patch-diff-age-refresh",
+            "--patch-diff-blue-noise-refresh",
+        ]));
+        assert!(all_config.patch_diff_refresh.enabled);
+        assert!(all_config.patch_diff_refresh.subthreshold_enabled);
+        assert!(all_config.patch_diff_refresh.age_refresh_enabled);
+        assert!(all_config.patch_diff_refresh.blue_noise_enabled);
     }
 
     #[test]
@@ -634,8 +753,19 @@ fn wasm_config_from_url() -> BevyJepaConfig {
             Some(quality),
         );
     }
+    if let Some(dilation) =
+        param_usize("patch-diff-dilation").or_else(|| param_usize("patch-diff-dilation-tiles"))
+    {
+        config.patch_diff_dilation_tiles = dilation;
+    }
     if let Some(enabled) = param_bool("patch-diff-refresh") {
         config.patch_diff_refresh.enabled = enabled;
+    }
+    if let Some(enabled) = param_bool("patch-diff-subthreshold-refresh") {
+        config.patch_diff_refresh.subthreshold_enabled = enabled;
+        if enabled && query_param("patch-diff-refresh").is_none() {
+            config.patch_diff_refresh.enabled = true;
+        }
     }
     if let Some(decay) = param_f32("patch-diff-subthreshold-decay") {
         config.patch_diff_refresh.subthreshold_decay = decay.clamp(0.0, 1.0);
@@ -646,11 +776,23 @@ fn wasm_config_from_url() -> BevyJepaConfig {
     if let Some(density) = param_f32("patch-diff-subthreshold-density") {
         config.patch_diff_refresh.subthreshold_max_density = density.clamp(0.0, 1.0);
     }
+    if let Some(enabled) = param_bool("patch-diff-age-refresh") {
+        config.patch_diff_refresh.age_refresh_enabled = enabled;
+        if enabled && query_param("patch-diff-refresh").is_none() {
+            config.patch_diff_refresh.enabled = true;
+        }
+    }
     if let Some(frames) = param_u64("patch-diff-age-refresh-frames") {
         config.patch_diff_refresh.age_refresh_interval_frames = frames;
     }
     if let Some(density) = param_f32("patch-diff-age-refresh-density") {
         config.patch_diff_refresh.age_refresh_max_density = density.clamp(0.0, 1.0);
+    }
+    if let Some(enabled) = param_bool("patch-diff-blue-noise-refresh") {
+        config.patch_diff_refresh.blue_noise_enabled = enabled;
+        if enabled && query_param("patch-diff-refresh").is_none() {
+            config.patch_diff_refresh.enabled = true;
+        }
     }
     if let Some(density) = param_f32("patch-diff-blue-noise-density") {
         config.patch_diff_refresh.blue_noise_refresh_density = density.clamp(0.0, 1.0);
