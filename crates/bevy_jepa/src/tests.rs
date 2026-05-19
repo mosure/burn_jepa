@@ -1,11 +1,11 @@
 use super::*;
 use burn_jepa::{
     AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest,
-    BurnJepaReconstructionPackageManifest, FeatureFrameEncodePath, FeatureFrameJepaEncoder,
-    FeatureFrameJepaEncoderKind, JepaReconstructionConfig, JepaReconstructionDecoder,
-    PatchDiffRefreshState, TttEncoderConfig, VJepa2_1Model, VJepaTttModel, coords_to_token_index,
-    save_jepa_reconstruction_burnpack, write_burnpack_parts_for_browser,
-    write_jepa_reconstruction_package_manifest, write_pipeline_package_manifest,
+    BurnJepaReconstructionPackageManifest, FeatureFrameJepaEncoder, FeatureFrameJepaEncoderKind,
+    JepaReconstructionConfig, JepaReconstructionDecoder, PatchDiffRefreshState, TttEncoderConfig,
+    VJepa2_1Model, VJepaTttModel, coords_to_token_index, save_jepa_reconstruction_burnpack,
+    write_burnpack_parts_for_browser, write_jepa_reconstruction_package_manifest,
+    write_pipeline_package_manifest,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -2546,7 +2546,7 @@ fn highres_pipeline_can_run_ttt_sparse_patchify_branch() {
         .expect("TTT sparse patchify pipeline step");
     assert_eq!(
         output.metrics.encode_path,
-        FeatureFrameEncodePath::SparsePatchify
+        burn_jepa::FeatureFrameEncodePath::SparsePatchify
     );
     assert_eq!(output.output.encoded.grid, pipeline.grid());
     assert_eq!(

@@ -330,29 +330,28 @@ fn train_reconstruction_bpk_backend<B: AutodiffBackend>(
     write_reconstruction_package(
         decoder,
         reconstruction_config,
-        options,
-        backend_name,
-        sample_count,
-        split.train.len(),
-        split.val.len(),
-        train_eval.len(),
-        val_eval.len(),
-        grid,
-        data.cache_mode(),
-        train_initial,
-        train_final,
-        val_initial,
-        val_final,
-        last_train_loss,
-        feature_extract_ms,
-        train_ms,
+        ReconstructionPackageWriteInput {
+            options,
+            backend_name,
+            sample_count,
+            train_samples: split.train.len(),
+            val_samples: split.val.len(),
+            train_eval_samples: train_eval.len(),
+            val_eval_samples: val_eval.len(),
+            grid,
+            data_cache_mode: data.cache_mode(),
+            train_initial,
+            train_final,
+            val_initial,
+            val_final,
+            last_train_loss,
+            feature_extract_ms,
+            train_ms,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_reconstruction_package<B: Backend>(
-    decoder: JepaReconstructionDecoder<B>,
-    reconstruction_config: JepaReconstructionConfig,
+struct ReconstructionPackageWriteInput {
     options: ReconstructionTrainingOptions,
     backend_name: &'static str,
     sample_count: usize,
@@ -369,7 +368,32 @@ fn write_reconstruction_package<B: Backend>(
     last_train_loss: Option<f64>,
     feature_extract_ms: u128,
     train_ms: u128,
+}
+
+fn write_reconstruction_package<B: Backend>(
+    decoder: JepaReconstructionDecoder<B>,
+    reconstruction_config: JepaReconstructionConfig,
+    input: ReconstructionPackageWriteInput,
 ) -> Result<ReconstructionTrainingReport> {
+    let ReconstructionPackageWriteInput {
+        options,
+        backend_name,
+        sample_count,
+        train_samples,
+        val_samples,
+        train_eval_samples,
+        val_eval_samples,
+        grid,
+        data_cache_mode,
+        train_initial,
+        train_final,
+        val_initial,
+        val_final,
+        last_train_loss,
+        feature_extract_ms,
+        train_ms,
+    } = input;
+
     std::fs::create_dir_all(options.output.parent().unwrap_or_else(|| Path::new(".")))
         .with_context(|| format!("create output directory for {}", options.output.display()))?;
     let output = options.output.with_extension("bpk");

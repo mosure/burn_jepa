@@ -141,6 +141,16 @@ fn viewer_seconds_since(now: ViewerInstant, previous: ViewerInstant) -> f64 {
     (now - previous) / 1000.0
 }
 
+fn update_interval_fps(last: &mut Option<ViewerInstant>, fps: &mut f64, now: ViewerInstant) {
+    if let Some(previous) = *last {
+        let seconds = viewer_seconds_since(now, previous);
+        if seconds.is_finite() && seconds > 0.0 {
+            *fps = 1.0 / seconds;
+        }
+    }
+    *last = Some(now);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn viewer_elapsed_us(start: ViewerInstant) -> u64 {
     micros_u64(start.elapsed().as_micros())
@@ -903,10 +913,7 @@ impl JepaRuntime {
             self.high_res_runtime = None;
             self.high_res_signature = None;
             self.reconstruction_frames = 0;
-            self.reconstruction_fps = 0.0;
-            self.last_reconstruction_completion_at = None;
-            self.last_reconstruction_decode_us = 0;
-            self.last_reconstruction_psnr_db = None;
+            self.reset_reconstruction_metrics();
             self.high_res_task = None;
             self.pending_high_res = None;
             self.prev_image = None;
@@ -914,14 +921,8 @@ impl JepaRuntime {
             self.prev_stage_image = None;
             self.prev_stage_rgba = None;
             self.frame_index = 0;
-            self.last_high_res_completion_at = None;
-            self.last_pca_update_at = None;
-            self.pca_update_events = 0;
-            self.pca_update_fps = 0.0;
-            self.last_high_res_anyup_context_us = 0;
-            self.last_high_res_anyup_decode_us = 0;
-            self.last_high_res_pca_us = 0;
-            self.last_high_res_display_tensor_us = 0;
+            self.reset_high_res_metrics();
+            self.reset_pca_update_metrics();
         }
         let model_config = self
             .model_config
@@ -1117,26 +1118,14 @@ impl JepaRuntime {
 
     fn record_input_frame(&mut self, sequence: u64) {
         let now = viewer_now();
-        if let Some(previous) = self.last_input_at {
-            let seconds = viewer_seconds_since(now, previous);
-            if seconds.is_finite() && seconds > 0.0 {
-                self.input_fps = 1.0 / seconds;
-            }
-        }
-        self.last_input_at = Some(now);
+        update_interval_fps(&mut self.last_input_at, &mut self.input_fps, now);
         self.input_frames_seen = self.input_frames_seen.saturating_add(1);
         self.latest_input_sequence = sequence;
     }
 
     fn record_completion(&mut self, high_res_updated: bool, pca_update_applied: bool) {
         let now = viewer_now();
-        if let Some(previous) = self.last_completion_at {
-            let seconds = viewer_seconds_since(now, previous);
-            if seconds.is_finite() && seconds > 0.0 {
-                self.low_res_fps = 1.0 / seconds;
-            }
-        }
-        self.last_completion_at = Some(now);
+        update_interval_fps(&mut self.last_completion_at, &mut self.low_res_fps, now);
         self.completed_frames = self.completed_frames.saturating_add(1);
         if high_res_updated {
             self.record_high_res_completion();
@@ -1147,38 +1136,51 @@ impl JepaRuntime {
     }
 
     fn record_pca_update(&mut self, now: ViewerInstant) {
-        if let Some(previous) = self.last_pca_update_at {
-            let seconds = viewer_seconds_since(now, previous);
-            if seconds.is_finite() && seconds > 0.0 {
-                self.pca_update_fps = 1.0 / seconds;
-            }
-        }
-        self.last_pca_update_at = Some(now);
+        update_interval_fps(&mut self.last_pca_update_at, &mut self.pca_update_fps, now);
         self.pca_update_events = self.pca_update_events.saturating_add(1);
     }
 
     fn record_high_res_completion(&mut self) {
         let now = viewer_now();
-        if let Some(previous) = self.last_high_res_completion_at {
-            let seconds = viewer_seconds_since(now, previous);
-            if seconds.is_finite() && seconds > 0.0 {
-                self.high_res_fps = 1.0 / seconds;
-            }
-        }
-        self.last_high_res_completion_at = Some(now);
+        update_interval_fps(
+            &mut self.last_high_res_completion_at,
+            &mut self.high_res_fps,
+            now,
+        );
         self.high_res_frames = self.high_res_frames.saturating_add(1);
     }
 
     fn record_reconstruction_completion(&mut self) {
         let now = viewer_now();
-        if let Some(previous) = self.last_reconstruction_completion_at {
-            let seconds = viewer_seconds_since(now, previous);
-            if seconds.is_finite() && seconds > 0.0 {
-                self.reconstruction_fps = 1.0 / seconds;
-            }
-        }
-        self.last_reconstruction_completion_at = Some(now);
+        update_interval_fps(
+            &mut self.last_reconstruction_completion_at,
+            &mut self.reconstruction_fps,
+            now,
+        );
         self.reconstruction_frames = self.reconstruction_frames.saturating_add(1);
+    }
+
+    fn reset_high_res_metrics(&mut self) {
+        self.last_high_res_completion_at = None;
+        self.high_res_fps = 0.0;
+        self.last_high_res_anyup_context_us = 0;
+        self.last_high_res_anyup_decode_us = 0;
+        self.last_high_res_pca_us = 0;
+        self.last_high_res_display_tensor_us = 0;
+    }
+
+    fn reset_reconstruction_metrics(&mut self) {
+        self.last_reconstruction_completion_at = None;
+        self.reconstruction_fps = 0.0;
+        self.last_reconstruction_decode_us = 0;
+        self.last_reconstruction_display_tensor_us = 0;
+        self.last_reconstruction_psnr_db = None;
+    }
+
+    fn reset_pca_update_metrics(&mut self) {
+        self.last_pca_update_at = None;
+        self.pca_update_events = 0;
+        self.pca_update_fps = 0.0;
     }
 
     fn apply_high_res_timings(&mut self, processed: &HighResProcessedFrame) {
@@ -1251,10 +1253,7 @@ impl JepaRuntime {
         }
         self.pending_stage = None;
         self.pending_high_res = None;
-        self.last_reconstruction_completion_at = None;
-        self.last_reconstruction_decode_us = 0;
-        self.last_reconstruction_display_tensor_us = 0;
-        self.last_reconstruction_psnr_db = None;
+        self.reset_reconstruction_metrics();
         self.prev_image = None;
         self.prev_rgba = None;
         self.prev_stage_image = None;
@@ -1283,20 +1282,10 @@ impl JepaRuntime {
         self.prev_stage_image = None;
         self.prev_stage_rgba = None;
         self.frame_index = 0;
-        self.last_high_res_completion_at = None;
-        self.last_reconstruction_completion_at = None;
-        self.last_pca_update_at = None;
-        self.pca_update_events = 0;
-        self.pca_update_fps = 0.0;
-        self.last_high_res_anyup_context_us = 0;
-        self.last_high_res_anyup_decode_us = 0;
-        self.last_high_res_pca_us = 0;
-        self.last_high_res_display_tensor_us = 0;
+        self.reset_high_res_metrics();
+        self.reset_pca_update_metrics();
         self.reconstruction_frames = 0;
-        self.reconstruction_fps = 0.0;
-        self.last_reconstruction_decode_us = 0;
-        self.last_reconstruction_display_tensor_us = 0;
-        self.last_reconstruction_psnr_db = None;
+        self.reset_reconstruction_metrics();
         self.status_message = None;
         self.last_error = None;
     }
@@ -2862,8 +2851,7 @@ struct ReconstructionProcessedFrame {
     psnr_db: Option<f64>,
 }
 
-fn stage_request_for_frame(config: &BevyJepaConfig, frame_index: u64) -> FeatureFrameRequest {
-    let _ = (config, frame_index);
+fn stage_request_for_frame(_config: &BevyJepaConfig, _frame_index: u64) -> FeatureFrameRequest {
     FeatureFrameRequest::low_res()
 }
 

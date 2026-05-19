@@ -85,6 +85,10 @@ impl JepaReconstructionConfig {
             "reconstruction norm_groups must be positive"
         );
         ensure!(
+            self.hidden_dim.is_multiple_of(self.norm_groups),
+            "reconstruction hidden_dim must be divisible by norm_groups"
+        );
+        ensure!(
             self.epsilon > 0.0,
             "reconstruction epsilon must be positive"
         );

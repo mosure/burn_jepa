@@ -283,8 +283,18 @@ fn ttt_training_benchmark_has_sparse_density_training_step_matrix() {
 fn cargo_features_expose_burn_021_flex_and_dispatch_lanes() {
     let manifest = include_str!("../Cargo.toml");
 
-    assert!(manifest.contains("flex = [\"burn/flex\", \"burn_anyup/flex\"]"));
-    assert!(manifest.contains("dispatch = [\"burn/dispatch\", \"burn_anyup/dispatch\"]"));
+    assert!(
+        manifest.contains(
+            "flex = [\"burn/flex\", \"burn_anyup/flex\", \"burn_jepa_reconstruction/flex\"]"
+        ),
+        "root flex feature should cover all Burn-backed model crates"
+    );
+    assert!(
+        manifest.contains(
+            "dispatch = [\"burn/dispatch\", \"burn_anyup/dispatch\", \"burn_jepa_reconstruction/dispatch\"]"
+        ),
+        "root dispatch feature should cover all Burn-backed model crates"
+    );
     assert!(
         manifest.contains("features = [\"autodiff\", \"fusion\", \"std\"]"),
         "Burn dependency should keep fusion enabled for GPU/backend benches"
@@ -463,6 +473,7 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     let preprint = include_str!("../docs/papers/vjepa21_ttt_sparse_temporal_preprint.tex");
     let manifest = include_str!("../crates/bevy_jepa/Cargo.toml");
     let pca = include_str!("../src/pca.rs");
+    let pca_runtime = pca.split("#[cfg(test)]").next().unwrap_or(pca);
     let pca_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
     let workflow = include_str!("../.github/workflows/test.yml");
     let safetensors = include_str!("../src/safetensors_io.rs");
@@ -559,10 +570,16 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(fps_stability.contains("fps-stability-summary.csv"));
     assert!(fps_stability.contains("unique_encode_widths"));
     assert!(fps_stability.contains("p95_outer_ms"));
-    assert!(manifest.contains("default = []"));
-    assert!(manifest.contains("sparse-patchify-wgpu = [\"burn_jepa/sparse-patchify-wgpu\"]"));
+    assert!(manifest.contains("default = [\"sparse-patchify-wgpu\"]"));
     assert!(
-        viewer_bench.contains("const VIEWER_IMAGE_SIZES: [usize; 2] = [256, DEFAULT_IMAGE_SIZE]")
+        manifest.contains(
+            "sparse-patchify-wgpu = [\"bevy_burn/fusion\", \"burn_jepa/sparse-patchify-wgpu\"]"
+        ),
+        "bevy_jepa sparse patchify feature should keep native Bevy/Burn fusion enabled"
+    );
+    assert!(
+        viewer_bench.contains("fn viewer_image_sizes() -> Vec<usize>")
+            && viewer_bench.contains("BURN_JEPA_BENCH_1024")
     );
     assert!(viewer_docs.contains("--source camera"));
     assert!(viewer_docs.contains("default `--high-res-pca-every 0`"));
@@ -592,7 +609,7 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(pca.contains("display_center"));
     assert!(pca.contains("display_spread"));
     assert!(
-        !pca.contains("into_data()") && !pca.contains("to_vec::<"),
+        !pca_runtime.contains("into_data()") && !pca_runtime.contains("to_vec::<"),
         "PCA visualization must not require host readback for display statistics"
     );
     assert!(pca_bench.contains("highres_semantic_pca_stats_update"));

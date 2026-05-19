@@ -143,12 +143,7 @@ fn load_native_package_encoder(
     image_size: usize,
     device: &JepaBevyDevice,
 ) -> Result<(FeatureFrameJepaEncoder<JepaBevyBackend>, VJepaConfig)> {
-    let manifest_json = fs::read_to_string(manifest_path).with_context(|| {
-        format!(
-            "read burn_jepa package manifest `{}`",
-            manifest_path.display()
-        )
-    })?;
+    let manifest_json = read_package_manifest_json(manifest_path, "burn_jepa")?;
     let mut manifest = BurnJepaPipelinePackageManifest::from_json_str(&manifest_json)
         .with_context(|| {
             format!(
@@ -156,17 +151,7 @@ fn load_native_package_encoder(
                 manifest_path.display()
             )
         })?;
-    let parts_manifest_path =
-        resolve_package_manifest_entry_path(manifest_path, &manifest.parts_manifest)?;
-    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
-    let parts = parts_manifest
-        .parts
-        .iter()
-        .map(|entry| {
-            let path = resolve_part_entry_path(&parts_manifest_path, &entry.path)?;
-            fs::read(&path).with_context(|| format!("read burnpack shard `{}`", path.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let parts = read_package_parts(manifest_path, &manifest.parts_manifest, "burnpack")?;
     log(&format!(
         "bevy_jepa: loading {} burn_jepa package `{}` from {} shard(s)",
         manifest.model_kind.as_str(),
@@ -208,6 +193,36 @@ fn load_package_encoder_from_manifest_and_parts(
             Ok((FeatureFrameJepaEncoder::ttt(model), model_config))
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_package_manifest_json(manifest_path: &Path, package_label: &str) -> Result<String> {
+    fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "read {package_label} package manifest `{}`",
+            manifest_path.display()
+        )
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_package_parts(
+    manifest_path: &Path,
+    parts_manifest_entry: &str,
+    shard_label: &str,
+) -> Result<Vec<Vec<u8>>> {
+    let parts_manifest_path =
+        resolve_package_manifest_entry_path(manifest_path, parts_manifest_entry)?;
+    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
+    parts_manifest
+        .parts
+        .iter()
+        .map(|entry| {
+            let path = resolve_part_entry_path(&parts_manifest_path, &entry.path)?;
+            fs::read(&path)
+                .with_context(|| format!("read {shard_label} shard `{}`", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()
 }
 
 fn ensure_apply_report_ok(report: &burn_jepa::BurnStoreApplyResult) -> Result<()> {
@@ -695,29 +710,14 @@ fn load_native_anyup_package(
     config: &BevyJepaConfig,
     device: &JepaBevyDevice,
 ) -> Result<AnyUp<JepaBevyBackend>> {
-    let manifest_json = fs::read_to_string(manifest_path).with_context(|| {
-        format!(
-            "read burn_anyup package manifest `{}`",
-            manifest_path.display()
-        )
-    })?;
+    let manifest_json = read_package_manifest_json(manifest_path, "burn_anyup")?;
     let manifest = BurnAnyUpPackageManifest::from_json_str(&manifest_json).with_context(|| {
         format!(
             "parse burn_anyup package manifest `{}`",
             manifest_path.display()
         )
     })?;
-    let parts_manifest_path =
-        resolve_package_manifest_entry_path(manifest_path, &manifest.parts_manifest)?;
-    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
-    let parts = parts_manifest
-        .parts
-        .iter()
-        .map(|entry| {
-            let path = resolve_part_entry_path(&parts_manifest_path, &entry.path)?;
-            fs::read(&path).with_context(|| format!("read AnyUp bpk shard `{}`", path.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let parts = read_package_parts(manifest_path, &manifest.parts_manifest, "AnyUp bpk")?;
     log(&format!(
         "bevy_jepa: loading burn_anyup package `{}` from {} shard(s)",
         manifest_path.display(),
@@ -797,12 +797,7 @@ fn load_native_reconstruction_package(
     model_config: &VJepaConfig,
     device: &JepaBevyDevice,
 ) -> Result<JepaReconstructionDecoder<JepaBevyBackend>> {
-    let manifest_json = fs::read_to_string(manifest_path).with_context(|| {
-        format!(
-            "read burn_jepa_reconstruction package manifest `{}`",
-            manifest_path.display()
-        )
-    })?;
+    let manifest_json = read_package_manifest_json(manifest_path, "burn_jepa_reconstruction")?;
     let manifest = BurnJepaReconstructionPackageManifest::from_json_str(&manifest_json)
         .with_context(|| {
             format!(
@@ -810,22 +805,11 @@ fn load_native_reconstruction_package(
                 manifest_path.display()
             )
         })?;
-    let parts_manifest_path =
-        resolve_package_manifest_entry_path(manifest_path, &manifest.parts_manifest)?;
-    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
-    let parts = parts_manifest
-        .parts
-        .iter()
-        .map(|entry| {
-            let path = resolve_part_entry_path(&parts_manifest_path, &entry.path)?;
-            fs::read(&path).with_context(|| {
-                format!(
-                    "read JEPA reconstruction burnpack shard `{}`",
-                    path.display()
-                )
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let parts = read_package_parts(
+        manifest_path,
+        &manifest.parts_manifest,
+        "JEPA reconstruction burnpack",
+    )?;
     log(&format!(
         "bevy_jepa: loading burn_jepa_reconstruction package `{}` from {} shard(s)",
         manifest_path.display(),
@@ -848,6 +832,23 @@ fn load_reconstruction_from_manifest_and_parts(
     device: &JepaBevyDevice,
 ) -> Result<JepaReconstructionDecoder<JepaBevyBackend>> {
     let config = manifest.reconstruction_config;
+    validate_reconstruction_package_config(&config, model_config, label)?;
+    let (decoder, report) =
+        load_jepa_reconstruction_burnpack_parts::<JepaBevyBackend>(&config, parts, device)
+            .context("load JEPA reconstruction burnpack parts")?;
+    ensure_reconstruction_apply_report_has_critical_weights(&report, label)?;
+    log(&format!(
+        "bevy_jepa: loaded JEPA reconstruction bpk package `{label}` ({} tensors applied)",
+        report.applied.len()
+    ));
+    Ok(decoder)
+}
+
+fn validate_reconstruction_package_config(
+    config: &JepaReconstructionConfig,
+    model_config: &VJepaConfig,
+    label: &str,
+) -> Result<()> {
     if config.input_dim != model_config.encoder.embed_dim {
         bail!(
             "JEPA reconstruction package `{label}` input_dim {} does not match active encoder dim {}",
@@ -862,15 +863,7 @@ fn load_reconstruction_from_manifest_and_parts(
             model_config.patch_size
         );
     }
-    let (decoder, report) =
-        load_jepa_reconstruction_burnpack_parts::<JepaBevyBackend>(&config, parts, device)
-            .context("load JEPA reconstruction burnpack parts")?;
-    ensure_reconstruction_apply_report_has_critical_weights(&report, label)?;
-    log(&format!(
-        "bevy_jepa: loaded JEPA reconstruction bpk package `{label}` ({} tensors applied)",
-        report.applied.len()
-    ));
-    Ok(decoder)
+    Ok(())
 }
 
 fn ensure_reconstruction_apply_report_has_critical_weights(

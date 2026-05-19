@@ -669,10 +669,7 @@ mod gpu_tests {
         },
     };
     use burn_wgpu::Wgpu as BurnBackend;
-    use burn_wgpu::{
-        init_device as init_burn_device, RuntimeOptions as BurnRuntimeOptions,
-        WgpuSetup as BurnWgpuSetup,
-    };
+    use burn_wgpu::{init_device as init_burn_device, WgpuSetup as BurnWgpuSetup};
     use futures_lite::future::block_on;
     use std::sync::Arc;
     use wgpu::{
