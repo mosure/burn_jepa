@@ -29,24 +29,20 @@ state-of-the-art video representation learning.  The implementation maps all
 matches the upstream \texttt{torch.hub} sparse encoder/predictor to
 $2.92\times 10^{-5}$ max absolute error.  A verified SC-TTT checkpoint trained
 with packed-stream TBPTT, sparse context rollout, dense stabilization samples,
-state decay, state/update regularization, and a low-weight LeJEPA-style latent
-Gaussian regularizer achieves sparse free-run loss/cosine $0.3209/0.8674$ over
-the 164-window held-out manifest, improving over a base sparse V-JEPA 2.1 lane
-at $0.4273/0.8187$ and over a reset-each-window trained-adapter lane at
-$0.3990/0.8309$.  That manifest alone is too short for a long-run stability
-claim: its longest contiguous stream is only 33 windows.  We therefore add
-explicit repeated-stream, scene-stitch, and adversarial-stitch stress gates.
-Those gates show that unbounded carried state is not stable: same-stream
-carry over 136 windows drifts by $+0.1772$ loss and forced scene stitching
-drifts by $+0.2124$ loss without resets.  A long-stable continuation with
-periodic reset every 16 windows and scene-change reset recovers: the repeated
-same-stream gate has near-zero late--early drift ($+0.0049$ loss over 136
-windows), scene stitching improves after switches, and adversarial stitching
-remains bounded by resetting on every detected scene switch.  The claim is
-therefore bounded-horizon arbitrary-duration operation under an explicit
-reset/decay policy, not unlimited memory carry.  The main remaining gates are
-larger open-set video, repeated measurements, downstream baselines, and
-lower-cost backward/optimizer kernels.
+state/update regularization, Memory-ALiBi carried state, and a small
+norm-only continuation closes most of the sparse image-token gap to a dense
+image baseline when distilling to the 3D video teacher: on a matched slice,
+base sparse image tokens score $0.4631/0.8048$ loss/cosine, dense image tokens
+score $0.3288/0.8636$, and sparse SC-TTT scores $0.3410/0.8576$.  The current
+stage2 checkpoint remains stable in explicit long-run stress gates:
+$0.2794/0.8851$ over a 1088-window same-stream repeat with late--early loss
+$-0.0009$, and $0.2573/0.8924$ over a 512-window adversarial stitch with
+late--early loss $-0.0193$.  We separately implement an
+In-Place-TTT-inspired MLP path and a stricter conformance lane, but the shipped
+result remains the SC-TTT adapter/Memory-ALiBi model because the strict lane is
+currently only smoke-validated and not quality-promoted.  The main remaining
+gates are larger open-set video, repeated measurements, downstream baselines,
+and lower-cost backward/optimizer kernels.
 \end{abstract}
 
 \section{Introduction}
@@ -83,13 +79,16 @@ distillation.
 \section{Problem Statement and Scope}
 
 \paragraph{Problem statement.}
-Let $V_i\in\mathbb{R}^{B\times C\times T\times H\times W}$ be the $i$-th
-video window from a stream and let $G$ be the V-JEPA tubelet grid.  A sparse
-context mask $M_i\subseteq G$ selects the tokens refreshed for that window.
-Given a frozen dense V-JEPA teacher $E_\theta$, learn an encoder-only student
-$S_\psi$ with recurrent TTT state $F_i$ such that
+Let $W_i\in\mathbb{R}^{B\times C\times T\times H\times W}$ be the current
+rolling teacher window from a stream, with $T=16$ frames in the reported runs,
+and let $G$ be the V-JEPA tubelet grid.  The window contains only the current
+teacher target horizon; earlier context must reach the student through carried
+state rather than by extending the teacher sample with future or privileged
+frames.  A sparse context mask $M_i\subseteq G$ selects the tokens refreshed for
+that window.  Given a frozen dense V-JEPA teacher $E_\theta$, learn an
+encoder-only student $S_\psi$ with recurrent TTT state $F_i$ such that
 \begin{equation}
-  S_\psi(V_i,M_i,F_{i-1}) \approx E_\theta(V_i)
+  S_\psi(W_i,M_i,F_{i-1}) \approx E_\theta(W_i)
 \end{equation}
 on the selected evaluation tokens, while avoiding dense patchification and
 while updating $F_i$ without privileged teacher tokens at inference time.
@@ -103,10 +102,14 @@ The experiments and system design rely on the following assumptions.
   from AutoGaze, patch-difference logic, or precomputed manifests.
 \item The deployed student updates TTT state from detached student hidden
   states.  Teacher-forced updates are diagnostics only.
-\item Long-running streams use the trained reset/decay policy.  The current
-  production policy resets carried TTT state every 16 windows and on scene
-  changes.  Unbounded state carry is a measured failure case, not a supported
-  deployment mode.
+\item Teacher supervision is a rolling 16-frame V-JEPA video target in the
+  production configs.  Longer temporal context is supplied by carried TTT state,
+  not by giving the teacher future frames inside one target sample.
+\item Long-running streams use the trained state dynamics and diagnostic
+  reset/decay policies.  Simple unbounded carried state was a measured failure
+  in earlier stress gates; the current Memory-ALiBi continuation is evaluated
+  with much longer same-stream and adversarial-stitch gates, but still should
+  not be read as a broad arbitrary-distribution stability guarantee.
 \item Feature distillation against the dense teacher is a proxy objective.  We
   do not yet report downstream task accuracy.
 \item Frozen sparse-patchify training is the intended adapter-training bridge.
@@ -115,9 +118,9 @@ The experiments and system design rely on the following assumptions.
 
 When these assumptions are violated, the expected failure mode changes.  If
 the mask misses semantic updates, the feature cache can become stale.  If state
-is carried far beyond the trained horizon without reset or decay, fast weights
-decohere in the repeated-stream stress gate.  If scene switches are stitched
-without resetting the TTT state, the state contaminates the next scene.  If
+is carried with dynamics that were not trained or measured, fast weights can
+decohere.  If scene switches are stitched without state dynamics or reset
+coverage that matches training, the state can contaminate the next scene.  If
 dense diagnostic probes are enabled over large full-token tensors, the current
 CUDA backend can exhaust allocator pages.
 
@@ -193,6 +196,26 @@ Proposition 1.  We place TTT modules only in the encoder because the shipped
 artifact is an encoder representation; predictor-side adapters would adapt a
 training head and add work after sparse token extraction.
 
+\subsection{In-Place TTT Conformance Lane}
+
+In-Place TTT \cite{feng2026inplace} motivates a different integration point:
+selected pretrained MLP down-projections become the base fast weights rather
+than adding standalone residual adapters.  We implement this as an ablation,
+not as the default SC-TTT model.  The non-strict \texttt{in\_place\_mlp} lane
+reuses selected V-JEPA MLP down-projections but keeps older local update
+semantics.  The stricter \texttt{in\_place\_mlp\_strict} lane is the
+conformance-oriented path: it uses the selected MLP \texttt{fc2} as the
+fast-weight base, uses causal target generation, applies the current fast
+weight before updating it, and updates only on full chunks.  It intentionally
+does not use Memory-ALiBi, because multi-bank state is a local SC-TTT extension
+rather than the single fast-weight cache used by the In-Place TTT formulation.
+
+The paper's empirical claims therefore stay separated.  Tables and deployment
+results labeled SC-TTT use the residual adapter/Memory-ALiBi path.  The strict
+in-place lane is currently a conformance and performance ablation pending a
+long matched training run and reference-step parity fixture; it is not the
+promoted checkpoint.
+
 \subsection{Latent Stability Regularizer}
 
 The selected run adds a low-weight LeJEPA/SIGReg-inspired penalty to the
@@ -219,8 +242,8 @@ anti-collapse/stability term for the student rollout.
   with zero-output TTT adapters at layers $[3,7,11]$.
 \item For each packed stream batch, restore one fast state per stream key.
 \item Resolve sparse context/target masks from the manifest or mask driver.
-\item Run the frozen dense teacher on the full video window and detach the
-  teacher features.
+\item Run the frozen dense teacher on the current rolling 16-frame video window
+  and detach the teacher features.
 \item Roll the student through sparse frame/tubelet inputs, updating fast
   state from detached student hidden states.
 \item Minimize feature MSE between student tokens and selected teacher tokens,
@@ -236,9 +259,12 @@ anti-collapse/stability term for the student rollout.
 All numerical correctness claims use the official
 \texttt{vjepa2\_1\_vit\_base\_384} checkpoint loaded from Meta's V-JEPA 2.1
 \texttt{torch.hub} entry point.  Quality runs use local open-set video windows
-at 256px with 16-frame student clips and a frozen 3D teacher.  The verified
-SC-TTT run uses sparse context masks with 410 of 2048 tokens (20.0\%) and 103
-target tokens (5.0\%).
+at 256px with 16-frame student clips and a frozen 3D teacher.  The production
+configs set \texttt{dataset.frames=16} and
+\texttt{training.teacher\_window\_frames=16}; this makes each teacher target a
+rolling current-window target rather than an expanding or future-looking
+teacher sample.  The verified SC-TTT run uses sparse context masks with 410 of
+2048 tokens (20.0\%) and 103 target tokens (5.0\%).
 
 Long-rollout eval uses sequential manifest order with batch size 1 so state is
 actually carried across adjacent windows.  Packed-stream eval is useful for
@@ -246,6 +272,13 @@ throughput, but round-robin stream packing can hide whether a single stream is
 being carried continuously.  Diagnostic probes compare the deployable free-run
 state against reset-each-frame, reset-each-tubelet, shuffle, reverse, and
 freeze-fast-update interventions.
+
+Image-to-video controls are required for fair interpretation.  A sparse
+non-TTT baseline must be trained or measured against the same 3D teacher target;
+otherwise the comparison silently assumes that pretrained image-token features
+and video-tubelet features already live in the same distribution.  We therefore
+report dense image, sparse image, SC-TTT, no-TTT norm-only, no-TTT last-block,
+and TTT continuation probes separately where available.
 
 Backend labels are conservative.  Burn exposes both \texttt{webgpu} and
 \texttt{wgpu} feature gates; they are related WebGPU-family lanes unless a row
@@ -279,10 +312,9 @@ ordering.
 
 \begin{table}[t]
 \centering
-\caption{Verified checkpoints and rejected continuation.  The full-manifest
-quality row uses \texttt{stage1-stream-tbptt-sigreg/ttt-model.mpk}; the
-long-rollout stress gates select the continued
-\texttt{stage1-stream-tbptt-longstable/ttt-model.mpk} checkpoint.}
+\caption{Verified checkpoints and continuations.  The current active candidate
+is the norm-only stage2 continuation from the Memory-ALiBi checkpoint; the
+earlier SIGReg and long-stable rows are retained as historical ablations.}
 \label{tab:verified}
 \begin{tabular}{lrrrr}
 \toprule
@@ -290,6 +322,7 @@ Run & Steps & Samples & Best train loss & Final sampled loss \\
 \midrule
 SC-TTT + SIGReg selected & 160 & 320 & 0.1829 & 0.3111 \\
 SC-TTT long-stable continuation & 128 & 256 & 0.1653 & 0.2479 \\
+SC-TTT Memory-ALiBi + norms & 512 & 1024 & 0.1649 & 0.2549 \\
 SC-TTT unregularized & 160 & 320 & 0.1828 & 0.3111 \\
 Low-LR continuation & 96 & 192 & 0.2555 & 0.2555 \\
 \bottomrule
@@ -303,7 +336,10 @@ keeps the same encoder-only adapter placement, trains on repeated continuous
 streams, and ends with a reset interval of 16 windows.  It contributes 184
 carried windows, 72 reset windows, and 256 detached/decayed states.  The low-LR
 continuation improved sampled training loss but is not selected because its
-long-rollout eval worsened.
+long-rollout eval worsened.  The stage2-norms continuation starts from the
+Memory-ALiBi candidate, keeps sparse patchify frozen, adds only 43,008
+pretrained LayerNorm trainable parameters, and is the current promoted
+checkpoint in this draft.
 
 \begin{table}[t]
 \centering
@@ -322,6 +358,65 @@ Run & Reg weight & Eval samples & Feature loss & Cosine & Reg loss \\
 64-step low & 1e-5 & 24 & 0.3478668 & 0.8516874 & 5.82e-6 \\
 64-step high & 5e-5 & 24 & 0.3478670 & 0.8516872 & 2.91e-5 \\
 160-step selected & 1e-5 & 164 & 0.3208972 & 0.8674483 & 6.19e-6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{Image-student to video-teacher alignment controls.  The sparse
+SC-TTT row uses the deployed recurrent path; dense and sparse image rows are
+base V-JEPA 2.1 image-token baselines against the same rolling 3D teacher
+target.  Lower loss and higher cosine are better.}
+\label{tab:image-video-alignment}
+\begin{tabular}{lrrr}
+\toprule
+Lane & Student tokens & Loss & Cosine \\
+\midrule
+Dense image V-JEPA 2.1 baseline & 2048 / 2048 & 0.3288 & 0.8636 \\
+Sparse image V-JEPA 2.1 baseline & 410 / 2048 & 0.4631 & 0.8048 \\
+Sparse Memory-ALiBi SC-TTT & 410 / 2048 & 0.3410 & 0.8576 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{Stage2 trainable-capacity probes.  No-TTT controls train the image
+pathway against the same video-teacher feature loss, so TTT is not compared
+only against an unfine-tuned image baseline.}
+\label{tab:stage2-probes}
+\begin{tabular}{lrrrrr}
+\toprule
+Lane & Steps & Dense/sparse steps & Trainable params & Pre loss/cos & Post loss/cos \\
+\midrule
+No-TTT image-to-video, norms & 96 & 65 / 31 & 43K & 0.3981 / 0.8293 & 0.3954 / 0.8304 \\
+No-TTT image-to-video, last 2 blocks & 96 & 65 / 31 & 14.18M & 0.3981 / 0.8293 & 0.3967 / 0.8299 \\
+TTT + norms, from Memory-ALiBi best & 96 & 65 / 31 & 3.59M & 0.3557 / 0.8477 & 0.3493 / 0.8504 \\
+TTT + norms, from Memory-ALiBi best & 192 & 66 / 126 & 3.59M & 0.3557 / 0.8477 & 0.3465 / 0.8516 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{Bounded real-checkpoint CUDA conformance smoke for the In-Place TTT
+lanes.  Both rows use rolling 16-frame teacher windows and deployable
+self-hidden memory updates.  This is a four-step initialization and plumbing
+check, not a promotion-quality training result.}
+\label{tab:inplace-smoke}
+\begin{tabular}{lrrrr}
+\toprule
+Lane & Insertion & Eval loss & Eval cosine & Samples/s \\
+\midrule
+Current SC-TTT adapter baseline & adapter & 0.4136 & 0.8261 & 0.0759 \\
+Strict in-place MLP conformance & in\_place\_mlp\_strict & 0.4534 & 0.8091 & 0.0854 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -388,6 +483,27 @@ Adversarial stitch, scene reset & 64 & 63 & 64 & 0.4209 / 0.8215 & -0.0338 \\
 
 \begin{table}[t]
 \centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{Current long-rollout promotion gates after the norm-only continuation.
+The same-stream gate repeats one held-out stream for 1088 windows; the
+adversarial stitch alternates scene boundaries for 512 windows.  These are
+stress gates, not a replacement for broader open-set video evaluation.}
+\label{tab:stage2-long}
+\begin{tabular}{lrrrrr}
+\toprule
+Lane & Windows & Runtime resets & Loss & Cosine & Late--early loss \\
+\midrule
+Stage1 Memory-ALiBi final, same-stream repeat & 1088 & 1 & 0.3273 & 0.8646 & -0.0009 \\
+Stage2 norms final, same-stream repeat & 1088 & 1 & 0.2794 & 0.8851 & -0.0009 \\
+Stage1 Memory-ALiBi final, adversarial stitch & 512 & 1 & 0.2850 & 0.8807 & -0.0229 \\
+Stage2 norms final, adversarial stitch & 512 & 1 & 0.2573 & 0.8924 & -0.0193 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
 \caption{Carried-state coherence interventions for the selected sparse
 checkpoint.  Positive loss gaps mean the persistent state is better.}
 \label{tab:interventions}
@@ -405,7 +521,7 @@ Reverse order & 0.5894 / 0.7520 & +0.2560 \\
 \end{tabular}
 \end{table}
 
-Tables~\ref{tab:coherence}--\ref{tab:stress} are the current long-rollout
+Tables~\ref{tab:coherence}--\ref{tab:stage2-long} are the current long-rollout
 gate.  The selected checkpoint is coherent under the short diagnostic gate:
 persistent memory is better than resetting, freezing, shuffling, or reversing
 temporal order.  The full-manifest gate adds the direct V-JEPA 2.1+sparse
@@ -418,10 +534,13 @@ $0.3208981$ to $0.3208972$.
 The stress gate is deliberately less favorable.  It repeats one stream beyond
 the observed held-out horizon, stitches unrelated streams into one artificial
 state trajectory, and alternates scenes adversarially.  The result is the
-central limitation and the central fix: unbounded carried state fails, while a
-bounded reset-16 policy and scene-change reset recover.  We therefore describe
-SC-TTT as stable for arbitrary-duration processing under the explicit
-reset/decay policy, not as a model with unlimited fast-memory lifetime.
+central limitation and the central fix: simple unbounded carried state fails,
+while explicit state dynamics and reset policies matter.  The later
+Memory-ALiBi + norms continuation improves both the 1088-window same-stream
+gate and the 512-window adversarial-stitch gate, so the draft now treats
+stage2-norms as the active candidate.  The claim is still empirical and scoped:
+these gates exercise longer carried state than the manifest, but they do not
+prove arbitrary-distribution stability.
 
 \subsection{Mask Policies}
 
@@ -534,17 +653,21 @@ carried eval from $0.3334/0.8629$ to $0.3977/0.8410$, so train loss alone is
 not a sufficient model-selection criterion.  Second, the LeJEPA/SIGReg-style
 regularizer is non-regressive but only neutral on the current V-JEPA 2.1
 distillation run; it should be treated as a stability hook, not as evidence
-that Gaussian regularization solves long-rollout drift here.  Third, unbounded
-TTT state carry is a measured failure: the repeated same-stream gate drifts by
-$+0.1772$ loss over 136 windows, and the stitched-scene gate drifts by
-$+0.2124$ loss without scene reset.  Fourth, dense full-grid temporal
-diagnostics over large token tensors currently hit a CubeCL CUDA allocator
-panic; dense primary eval works, but dense diagnostic probes need chunking or
-streaming.  Fifth, the 164-window held-out manifest check improves with
-persistent state on average but has only 33 contiguous windows in one stream,
-so it was insufficient by itself.  Sixth, patch-diff masks can miss slow
-semantic changes; refresh policies such as age-priority, blue-noise refresh, or
-keyframes are required for persistent feature caches.
+that Gaussian regularization solves long-rollout drift here.  Third, simple
+unbounded TTT state carry was a measured failure before the Memory-ALiBi
+continuation: the repeated same-stream gate drifted by $+0.1772$ loss over 136
+windows, and the stitched-scene gate drifted by $+0.2124$ loss without scene
+reset.  Fourth, dense full-grid temporal diagnostics over large token tensors
+currently hit a CubeCL CUDA allocator panic; dense primary eval works, but
+dense diagnostic probes need chunking or streaming.  Fifth, the 164-window
+held-out manifest check improves with persistent state on average but has only
+33 contiguous windows in one stream, so it was insufficient by itself.  Sixth,
+the strict in-place MLP lane is not promoted: it passes causal/update smoke
+tests and a real-checkpoint CUDA smoke, but it has not yet beaten the adapter
+baseline or passed reference-step parity against the upstream implementation.
+Seventh, patch-diff masks can miss slow semantic changes; refresh policies such
+as age-priority, blue-noise refresh, or keyframes are required for persistent
+feature caches.
 
 The largest current quality run is still small compared with open-set video
 pretraining.  The paper reports teacher-feature distillation metrics rather
@@ -574,13 +697,13 @@ Theoretical originality & Theorem/proposition & partial & Proposition 1 is a cor
 Theoretical originality & Checkable proof & yes & Included for Proposition 1. \\
 Theoretical originality & Assumptions & yes & Listed in Section 2. \\
 Theoretical originality & Minimal implementation & yes & SC-TTT maps directly to the encoder adapter path. \\
-Theoretical originality & Benchmark where method can lose & yes & Low-LR continuation and dense diagnostic failure. \\
+Theoretical originality & Benchmark where method can lose & yes & Low-LR continuation, strict in-place smoke, and dense diagnostic failure. \\
 Theoretical originality & Failure case & yes & Section 8. \\
-Novel algorithm & Baseline & yes & Base sparse V-JEPA 2.1, reset, freeze, reverse/shuffle, dense, low-LR continuation, zero/no-op insertion. \\
-Novel algorithm & Measurable improvement & yes & SC-TTT sparse beats base sparse V-JEPA by 0.1064 loss and reset-each-window by 0.0781 loss on the full manifest. \\
-Novel algorithm & Ablation & yes & State reset, freeze, order, mask, density, backend, continuation, latent regularizer. \\
+Novel algorithm & Baseline & yes & Base sparse V-JEPA 2.1, dense/sparse image-to-video, reset, freeze, reverse/shuffle, dense, low-LR continuation, zero/no-op insertion. \\
+Novel algorithm & Measurable improvement & yes & SC-TTT sparse beats base sparse V-JEPA by 0.1064 loss on the full manifest and improves the stage2 1088-window gate over stage1 by 0.0479 loss. \\
+Novel algorithm & Ablation & yes & State reset, freeze, order, mask, density, backend, continuation, latent regularizer, in-place vs adapter. \\
 Novel algorithm & Reason it works & partial & Memory-intervention gaps support the mechanism; more external validation is needed. \\
-Novel algorithm & Case where it does not work & yes & Low-LR continuation, dense diagnostic allocator pressure, unbounded state carry, and unreset scene stitching. \\
+Novel algorithm & Case where it does not work & yes & Low-LR continuation, dense diagnostic allocator pressure, simple unbounded state carry, unreset scene stitching, and strict in-place not yet winning. \\
 Novel algorithm & Short memorable name & yes & Sparse Carried-State TTT (SC-TTT). \\
 \bottomrule
 \end{tabular}
@@ -593,16 +716,17 @@ The proof is algebraic and only covers initialization.  The algorithmic recipe
 is SC-TTT.  It beats base sparse V-JEPA 2.1 on the full 164-window manifest,
 beats reset/freeze/order-intervention baselines on the short verified sparse
 long-rollout eval, and beats reset-each-window on the 164-window held-out
-manifest.  It fails when state is carried without reset beyond the trained
-horizon or through unrelated scene switches.  It recovers when the deployment
-policy resets every 16 windows and on scene changes.  Other failures occur
-when train-loss-only continuation worsens carried eval, when the latent
-Gaussian regularizer is only neutral, when diagnostic dense probes exceed
-backend memory behavior, and when masks miss semantic updates.  Those failures
-violate the assumptions that eval selection matches deployment, diagnostics
-are chunked, sparse masks cover semantic changes, and the reset/decay policy is
-active.  Future work should scale data, add external and downstream baselines,
-repeat measurements, chunk dense diagnostics, and improve sparse TTT
+manifest.  The stage2 Memory-ALiBi + norms continuation improves the long
+same-stream and adversarial-stitch gates further.  It fails when state dynamics
+do not match the deployment stream, when train-loss-only continuation worsens
+carried eval, when the strict in-place MLP lane is used before it beats the
+adapter baseline, when the latent Gaussian regularizer is only neutral, when
+diagnostic dense probes exceed backend memory behavior, and when masks miss
+semantic updates.  Those failures violate the assumptions that eval selection
+matches deployment, diagnostics are chunked, sparse masks cover semantic
+changes, and the measured state dynamics are active.  Future work should scale
+data, add external and downstream baselines, repeat measurements, add an exact
+In-Place TTT reference fixture, chunk dense diagnostics, and improve sparse TTT
 backward/optimizer kernels.
 
 \section{Reproducibility Notes}
@@ -612,11 +736,11 @@ Selected artifact:
 target/burn-jepa-production-final-256/
   stage1-stream-tbptt-sigreg/ttt-model.mpk
   stage1-stream-tbptt-longstable/ttt-model.mpk
+  stage2-norms-low-lr/ttt-model.mpk
 \end{verbatim}
 
 Training command:
 \begin{verbatim}
-MODEL=target/burn-jepa-production-final-256/stage1-stream-tbptt-sigreg/ttt-model.mpk
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- train-ttt \
   --config configs/production/vjepa21-ttt-stage1-stream-tbptt-sigreg-cuda.toml
@@ -624,6 +748,10 @@ cargo run --no-default-features --features cuda,sparse-patchify-cuda \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- train-ttt \
   --config configs/production/vjepa21-ttt-stage1-stream-tbptt-longstable-cuda.toml
+
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- train-ttt \
+  --config configs/production/vjepa21-ttt-stage2-norms-low-lr-cuda.toml
 \end{verbatim}
 
 Sparse long-rollout eval:
@@ -660,7 +788,7 @@ cargo run --no-default-features --features cuda,sparse-patchify-cuda \
 
 Long-rollout stress gates:
 \begin{verbatim}
-LONG=target/burn-jepa-production-final-256/stage1-stream-tbptt-longstable/ttt-model.mpk
+LONG=target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-long-rollout-cactus-repeat-reset16-cuda.toml \
@@ -678,6 +806,13 @@ cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --config configs/production/vjepa21-ttt-long-rollout-adversarial-stitch-reset-4x-cuda.toml \
   --model "$LONG" \
   --steps 64 --batch-size 1 --no-full-grid
+\end{verbatim}
+
+Strict in-place conformance smoke:
+\begin{verbatim}
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- train-ttt \
+  --config configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-strict-thirds-cuda.toml
 \end{verbatim}
 
 Dense carried eval:
@@ -758,14 +893,17 @@ inference is fast, and the verified checkpoint uses carried state more
 effectively than both base sparse V-JEPA and reset-state baselines.  The
 LeJEPA-style regularizer is implemented and safe in this setting, but current
 evidence shows it as a neutral stabilizer rather than the reason SC-TTT works.
-The new stress gates make the long-run claim more precise: unbounded TTT state
-carry is unstable, while reset-16 plus scene-change reset gives stable
-bounded-horizon operation over repeated, stitched, and adversarially stitched
-streams.  The evidence is not yet sufficient for theoretical originality,
+The stress gates make the long-run claim more precise: simple unbounded carry
+was unstable, while Memory-ALiBi plus the norm-only continuation is stable on
+the measured 1088-window same-stream and 512-window adversarial-stitch gates.
+The strict In-Place TTT lane now has causal/update conformance checks and a
+real-checkpoint smoke run, but it remains an ablation rather than the shipped
+model.  The evidence is not yet sufficient for theoretical originality,
 state-of-the-art claims, broad robustness claims, or unlimited-memory
 arbitrary-length rollout claims.  The next step is larger real-mask held-out
-video, repeated statistics, external and downstream baselines, chunked dense
-diagnostics, and lower-overhead TTT backward kernels.
+video, repeated statistics, external and downstream baselines, exact In-Place
+TTT reference parity, chunked dense diagnostics, and lower-overhead TTT
+backward kernels.
 
 \begin{thebibliography}{9}
 

@@ -42,7 +42,8 @@ cargo run --release --no-default-features --features wgpu --bin burn-jepa -- tra
   --jepa-manifest target/burn-jepa-web/model/vjepa2_1_base/manifest.json \
   --image-dir target/burn-jepa-vjepa21-ttt-ablation/data/frames \
   --image-size 256 \
-  --frames 2 \
+  --frames 1 \
+  --feature-source image \
   --max-samples 2048 \
   --steps 12000 \
   --batch-size 4 \
@@ -50,7 +51,7 @@ cargo run --release --no-default-features --features wgpu --bin burn-jepa -- tra
   --reconstruction-architecture patch-conv \
   --output target/burn_jepa_reconstruction-build/low_res_v1/jepa_reconstruction.bpk \
   --hidden-dim 512 \
-  --residual-blocks-per-scale 2 \
+  --residual-blocks-per-scale 4 \
   --shard-mib 20 \
   --deploy-dir target/burn_jepa_reconstruction/low_res_v1 \
   --overwrite-shards \
@@ -59,6 +60,22 @@ cargo run --release --no-default-features --features wgpu --bin burn-jepa -- tra
 cargo run --no-default-features --features ndarray --bin burn-jepa -- verify-reconstruction-bpk \
   --manifest target/burn_jepa_reconstruction/low_res_v1/manifest.json \
   --image-size 384
+```
+
+Use `--feature-source image` for Bevy/live sparse-cache reconstruction. The
+legacy `--feature-source video --frames 2` target trains against repeated-frame
+temporal V-JEPA features and is not compatible with the single-frame
+feature-cache path used by the viewer.
+
+For E2E PSNR from the actual low-res cache path:
+
+```bash
+cargo run --release --example reconstruction_e2e --no-default-features --features cuda -- \
+  --jepa-manifest target/burn_jepa/vjepa2_1_base/manifest.json \
+  --reconstruction-manifest target/burn_jepa_reconstruction/low_res_v1/manifest.json \
+  --frame-dir target/burn_jepa_reconstruction_train_frames/video_023 \
+  --image-size 256 \
+  --frames 32
 ```
 
 For benchmarks:
@@ -75,7 +92,7 @@ latency is completed decoder work rather than command enqueue time. Bevy's live
 pipeline reports reconstruction PSNR only when synchronized measurements are
 enabled; the default reconstruction hot path avoids scalar host reads.
 
-Current caveat: this decoder is trained from dense V-JEPA base encoder tokens.
-Reconstructions from sparse persistent caches or TTT features are useful
-diagnostics, but their PSNR is only directly comparable when the active encoder
-and cache freshness match the training feature distribution.
+Current caveat: this decoder is trained from dense single-frame V-JEPA base
+encoder tokens. Reconstructions from sparse persistent caches or TTT features
+are useful diagnostics, but their PSNR is only directly comparable when the
+active encoder and cache freshness match the training feature distribution.

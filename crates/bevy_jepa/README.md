@@ -57,7 +57,7 @@ less tied to the scene's average brightness.
 When patch-diff activates much of the token grid, the mask is promoted to a
 dense ordered mask so the JEPA feature cache can use its dense update path
 instead of paying sparse gather/scatter overhead for a high-density sparse
-write. The default `--patch-diff-dense-fallback-density 0.60` keeps low- and
+write. The default `--patch-diff-dense-fallback-density 0.75` keeps low- and
 medium-density adaptive motion sparse and routes high-motion frames through the
 dense ordered path. The latest 512px WGPU viewer stability sweep showed that
 exact sparse widths are steady once warm, but live high-density jitter can still
@@ -289,16 +289,18 @@ and into the cache scatter, so the panel marks the cache positions overwritten
 by that stage rather than the newest camera preview frame.
 
 Patch-diff defaults to threshold-gated selection with dynamic density. If only a
-few JEPA patches cross the threshold, only those patches are updated except for
-the independent `--min-context-density` floor; if the whole frame changes, the
-mask can expand to the full token grid. Near-full masks are intentionally
-promoted to the dense ordered path because high-density sparse shape churn and
-scatter can be slower than dense assignment on GPU backends. The default cutoff
-is `0.60`; use
+few JEPA patches cross the threshold, only those direct patches are updated
+before optional dilation and the independent `--min-context-density` floor; if
+the whole frame changes, the mask can expand to the full token grid. Near-full
+direct masks are intentionally promoted to the dense ordered path before
+dilation because high-density sparse shape churn and scatter can be slower than
+dense assignment on GPU backends. The default cutoff is `0.75`; use
 `--patch-diff-dense-fallback-density 1.0` to promote only exactly full masks, or
 lower it after measuring a backend where sparse shape churn is worse than dense
-full-grid inference. A sampled high-motion precheck uses the same cutoff to
-skip full patch-diff scoring when the frame is already clearly near-dense.
+full-grid inference. A sampled high-motion precheck uses the same direct-mask
+cutoff to skip full patch-diff scoring when the frame is already clearly
+near-dense. Dilation then expands the surviving direct patch hits before legacy
+refresh modes are considered.
 `--context-density` is retained for legacy fixed-budget patch-diff configs, but
 the Bevy adaptive threshold path does not top-k cap tokens that pass the
 threshold.

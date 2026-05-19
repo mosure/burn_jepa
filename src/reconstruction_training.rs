@@ -14,13 +14,23 @@ use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData};
 use image::imageops::FilterType;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png"];
 pub const DEFAULT_RECONSTRUCTION_DEVICE_CACHE_MAX_MIB: usize = 4096;
 const TRAIN_EVAL_MAX_SAMPLES: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionFeatureSource {
+    /// Match the live feature-frame pipeline: one image through the image patch embed path.
+    #[default]
+    Image,
+    /// Legacy target: repeated still frames through the temporal/video patch embed path.
+    Video,
+}
 
 #[derive(Clone, Debug)]
 pub struct ReconstructionTrainingOptions {
@@ -34,6 +44,7 @@ pub struct ReconstructionTrainingOptions {
     pub image_dirs: Vec<PathBuf>,
     pub image_size: usize,
     pub frames: usize,
+    pub feature_source: ReconstructionFeatureSource,
     pub max_samples: usize,
     pub val_split: f32,
     pub steps: usize,
@@ -72,6 +83,7 @@ pub struct ReconstructionTrainingReport {
     pub val_eval_samples: usize,
     pub image_size: usize,
     pub frames: usize,
+    pub feature_source: ReconstructionFeatureSource,
     pub grid: [usize; 2],
     pub input_dim: usize,
     pub reconstruction_architecture: JepaReconstructionArchitecture,
@@ -249,6 +261,7 @@ fn train_reconstruction_bpk_backend<B: AutodiffBackend>(
         options.max_samples,
         options.image_size,
         options.frames,
+        options.feature_source,
         input_dim,
         grid,
         device,
@@ -479,6 +492,7 @@ fn write_reconstruction_package<B: Backend>(
         val_eval_samples,
         image_size: options.image_size,
         frames: options.frames,
+        feature_source: options.feature_source,
         grid,
         input_dim: manifest.reconstruction_config.input_dim,
         reconstruction_architecture: manifest.reconstruction_config.architecture,
@@ -550,10 +564,14 @@ struct EvalMetrics {
 
 fn validate_options(options: &ReconstructionTrainingOptions) -> Result<()> {
     ensure!(options.image_size >= 16, "--image-size must be at least 16");
-    ensure!(
-        options.frames >= 2 && options.frames.is_multiple_of(2),
-        "--frames must be an even value >= 2 for V-JEPA tubelets"
-    );
+    if options.feature_source == ReconstructionFeatureSource::Video {
+        ensure!(
+            options.frames >= 2 && options.frames.is_multiple_of(2),
+            "--frames must be an even value >= 2 for V-JEPA video feature extraction"
+        );
+    } else {
+        ensure!(options.frames > 0, "--frames must be nonzero");
+    }
     ensure!(options.max_samples > 0, "--max-samples must be nonzero");
     ensure!(options.steps > 0, "--steps must be nonzero");
     ensure!(options.batch_size > 0, "--batch-size must be nonzero");
@@ -749,6 +767,7 @@ fn extract_samples<B: Backend>(
     max_samples: usize,
     image_size: usize,
     frames: usize,
+    feature_source: ReconstructionFeatureSource,
     input_dim: usize,
     grid: [usize; 2],
     device: &B::Device,
@@ -757,13 +776,21 @@ fn extract_samples<B: Backend>(
     for (sample_index, path) in paths.iter().take(max_samples).enumerate() {
         let target_values = load_target_chw(path, image_size)
             .with_context(|| format!("load reconstruction target image {}", path.display()))?;
-        let rgba = target_chw_to_repeated_rgba(&target_values, image_size, frames);
-        let video = crate::rgba_video_to_tensor::<B>(
-            &rgba,
-            VJepaRgbaVideoShape::new(1, frames, image_size, image_size),
-            device,
-        )?;
-        let output = jepa.encode_video(video, None);
+        let output = match feature_source {
+            ReconstructionFeatureSource::Image => {
+                let image = target_chw_to_model_image::<B>(&target_values, image_size, device);
+                jepa.encode_image(image, None)
+            }
+            ReconstructionFeatureSource::Video => {
+                let rgba = target_chw_to_repeated_rgba(&target_values, image_size, frames);
+                let video = crate::rgba_video_to_tensor::<B>(
+                    &rgba,
+                    VJepaRgbaVideoShape::new(1, frames, image_size, image_size),
+                    device,
+                )?;
+                jepa.encode_video(video, None)
+            }
+        };
         let features = jepa_feature_tokens_to_nchw(output.tokens.detach(), output.grid)?;
         let dims = features.shape().dims::<4>();
         ensure!(
@@ -832,6 +859,26 @@ fn target_chw_to_repeated_rgba(target: &[f32], image_size: usize, frames: usize)
         }
     }
     rgba
+}
+
+fn target_chw_to_model_image<B: Backend>(
+    target: &[f32],
+    image_size: usize,
+    device: &B::Device,
+) -> Tensor<B, 4> {
+    let pixels = image_size * image_size;
+    let mut values = Vec::with_capacity(3 * pixels);
+    for channel in 0..3 {
+        for pixel in 0..pixels {
+            let value = target[channel * pixels + pixel];
+            values
+                .push((value - crate::VJEPA_IMAGE_MEAN[channel]) / crate::VJEPA_IMAGE_STD[channel]);
+        }
+    }
+    Tensor::<B, 4>::from_data(
+        TensorData::new(values, [1, 3, image_size, image_size]),
+        device,
+    )
 }
 
 fn float_to_u8(value: f32) -> u8 {

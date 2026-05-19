@@ -113,7 +113,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
         let hidden_dim = ((model_config.encoder.embed_dim as f32)
             * model_config.encoder.mlp_ratio.max(1.0))
         .round() as usize;
-        let inplace_ttt_layers = if ttt_config.insertion == TttInsertionMode::InPlaceMlp {
+        let inplace_ttt_layers = if ttt_config.insertion.is_in_place() {
             Some(
                 layer_indices
                     .iter()
@@ -201,18 +201,17 @@ impl<B: Backend> VJepaTttEncoder<B> {
         probes: Option<&mut Vec<VJepaTttLayerProbeRecord<B>>>,
     ) -> Tensor<B, 3> {
         match self.layer_indices.binary_search(&layer_index) {
-            Ok(ttt_index) if self.insertion == TttInsertionMode::InPlaceMlp => self
-                .forward_inplace_mlp_block(
-                    layer_index,
-                    ttt_index,
-                    block,
-                    x,
-                    positions,
-                    target_tokens,
-                    state,
-                    update_fast_weight,
-                    probes,
-                ),
+            Ok(ttt_index) if self.insertion.is_in_place() => self.forward_inplace_mlp_block(
+                layer_index,
+                ttt_index,
+                block,
+                x,
+                positions,
+                target_tokens,
+                state,
+                update_fast_weight,
+                probes,
+            ),
             Ok(ttt_index) => {
                 let x = block.forward(x, Some(positions));
                 self.forward_adapter_after_block(
@@ -1714,7 +1713,7 @@ impl<B: Backend> VJepaTttEncoder<B> {
         let mut x = tokens;
         for (layer_index, block) in self.base.blocks.iter().enumerate() {
             match self.layer_indices.binary_search(&layer_index) {
-                Ok(ttt_index) if self.insertion == TttInsertionMode::InPlaceMlp => {
+                Ok(ttt_index) if self.insertion.is_in_place() => {
                     x = self.forward_inplace_mlp_block_recurrent_batch(
                         ttt_index,
                         block,

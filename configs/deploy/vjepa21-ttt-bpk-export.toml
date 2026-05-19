@@ -1,7 +1,7 @@
 [model]
 checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
-ttt_checkpoint_path = "target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk"
+ttt_checkpoint_path = "target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
 output_dir = "target/burn-jepa-web/model/vjepa2_1_ttt"

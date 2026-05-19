@@ -5,12 +5,12 @@ sparse temporal student. It keeps TTT modules encoder-only.
 
 ## Current Answer
 
-It is worth running a longer job, but only after switching from the center-prior
-AutoGaze proxy to real per-window AutoGaze masks and using a staged training
-gate. The existing 1024-step official V-JEPA 2.1 run already shows the
-direction is viable: sparse free-run loss improved from `0.4544` to `0.3021`
-and cosine from `0.8076` to `0.8746`. The unresolved question is
-generalization and scale, not basic wiring.
+The current production candidate is the stage2 norm-only continuation:
+`target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk`.
+It uses real per-window AutoGaze masks, encoder-only TTT adapters, frozen
+sparse patchify, Memory-ALiBi carried state, and a tiny encoder LayerNorm
+finetune. It beat the previous stage1 Memory-ALiBi checkpoint on both
+same-stream and adversarial long-rollout gates.
 
 Do not start with unfrozen V-JEPA weights. The safe order is:
 
@@ -19,8 +19,8 @@ Do not start with unfrozen V-JEPA weights. The safe order is:
    patchification enabled.
 3. Evaluate free-run sparse quality, temporal diagnostics, and cross-domain
    slices.
-4. Only if stage 1 plateaus cleanly, continue with a short, low-LR unfrozen
-   stage as an ablation.
+4. Continue with norm-only LayerNorm finetuning when stage 1 plateaus.
+5. Treat last-block or full unfrozen training as upper-bound ablations only.
 
 The unfrozen stage is useful to test whether a small amount of encoder
 finetuning removes residual teacher-student mismatch. It is also the highest
@@ -45,18 +45,10 @@ in the latest packed launch smoke.
   AutoGaze state per clip/source stream and resets at train/eval split
   boundaries or non-monotonic `start_frame`s.
 - `configs/production/vjepa21-ttt-stage1-stream-tbptt-carry-forever-alibi-cuda.toml`
-  is the current selected carry-forever candidate: it continues from the
-  reset16 `longstable` checkpoint, disables hard stream resets and stream-level
-  decay, and uses three Memory-ALiBi fast-weight banks with half-lives
-  `[8, 64, 512]`. It keeps frozen pretrained V-JEPA, encoder TTT layers
-  `[3, 7, 11]`, sparse context rollout, frozen sparse patchify, real manifest
-  masks, packed-stream TBPTT batches, dense all-token sample steps,
-  final-teacher supervision, warmup/cosine LR, and a low-weight
-  LeJEPA/SIGReg-style latent Gaussian regularizer. The dense sample warmup and
-  periodic dense steps are there so the shipped encoder-only student learns both
-  full-frame initialization and sparse carried-state updates. Best-checkpoint
-  selection is `deploy_rollout`, so dense warmup losses are reported but do not
-  promote the saved `ttt-model-best.mpk` checkpoint.
+  is the previous carry-forever base candidate. It continues from the reset16
+  `longstable` checkpoint, disables hard stream resets and stream-level decay,
+  and uses three Memory-ALiBi fast-weight banks with half-lives
+  `[8, 64, 512]`.
 - `configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-thirds-cuda.toml`
   and
   `configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-every-other-cuda.toml`
@@ -89,9 +81,25 @@ in the latest packed launch smoke.
 - `configs/production/vjepa21-ttt-stage1-adapter-cuda.toml` is retained as a
   single-window adapter baseline. Use it for quick comparisons, not as the
   long-rollout production candidate.
+- `configs/production/vjepa21-ttt-stage2-norms-low-lr-cuda.toml` continues from
+  the carry-forever checkpoint with only encoder LayerNorms trainable in
+  addition to the TTT modules. This is the current promoted production
+  candidate because it preserves frozen sparse patchify and improves
+  long-rollout quality.
+- `configs/production/vjepa21-ttt-stage2-last2-low-lr-cuda.toml` trains the last
+  two encoder blocks plus TTT modules. It keeps patch embedding frozen but is
+  much heavier than norm-only.
+- `configs/production/vjepa21-image2video-stage2-norms-low-lr-cuda.toml` is the
+  matched no-TTT control for the norm-only continuation. It trains only encoder
+  LayerNorms against the same video-teacher feature target with
+  `ttt.layers = []`.
+- `configs/production/vjepa21-image2video-stage2-last2-low-lr-cuda.toml` is the
+  matched no-TTT control for late-block static image-to-video finetuning. Use
+  it to distinguish recurrent TTT gains from static image-path capacity.
 - `configs/production/vjepa21-ttt-stage2-unfrozen-low-lr-cuda.toml` continues
-  from the stage-1 checkpoint with `freeze_pretrained = false` and a much lower
-  scheduled LR. Treat this as a gated ablation, not the default.
+  from the promoted stage2-norms checkpoint with `freeze_pretrained = false`
+  and a much lower scheduled LR. Treat this as an upper-bound ablation, not the
+  default.
 - `configs/production/vjepa21-ttt-final-eval-cuda.toml` evaluates a saved
   stage-1 or stage-2 model with utilization and temporal diagnostics.
 - `configs/production/vjepa21-ttt-stream-eval-fast-cuda.toml` is the lean
@@ -128,27 +136,27 @@ cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --steps 1 --eval-steps 0
 ```
 
-Evaluate the stage-1 checkpoint:
+Evaluate the promoted stage2-norms checkpoint:
 
 ```sh
 BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-cactus-64x-cuda.toml \
-  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk \
+  --model target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk \
   --steps 1088 --batch-size 1 --no-full-grid
 ```
 
 Evaluate the saved best sampled deploy-rollout checkpoint as a diagnostic
-candidate, but do not promote it unless the long-rollout gates beat the final
-checkpoint:
+  candidate, but do not promote it unless the long-rollout gates beat the final
+  checkpoint:
 
 ```sh
 BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-cactus-64x-cuda.toml \
-  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model-best.mpk \
+  --model target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model-best.mpk \
   --steps 1088 --batch-size 1 --no-full-grid
 ```
 
@@ -159,7 +167,7 @@ BURN_JEPA_TRAIN_CUDA_FORCE=1 \
 cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --bin burn-jepa -- eval-ttt \
   --config configs/production/vjepa21-ttt-long-rollout-carry-forever-alibi-adversarial-8x-cuda.toml \
-  --model target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk \
+  --model target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk \
   --steps 512 --batch-size 1 --no-full-grid
 ```
 
@@ -185,7 +193,26 @@ cargo run --no-default-features --features cuda,sparse-patchify-cuda \
   --steps 11 --batch-size 1 --no-full-grid
 ```
 
-Optional low-LR unfrozen continuation:
+Norm-only low-LR continuation, current production path:
+
+```sh
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- train-ttt \
+  --config configs/production/vjepa21-ttt-stage2-norms-low-lr-cuda.toml
+```
+
+Optional last-block low-LR continuation:
+
+```sh
+BURN_JEPA_TRAIN_CUDA_FORCE=1 \
+cargo run --no-default-features --features cuda,sparse-patchify-cuda \
+  --bin burn-jepa -- train-ttt \
+  --config configs/production/vjepa21-ttt-stage2-last2-low-lr-cuda.toml
+```
+
+Optional full low-LR unfrozen upper-bound continuation from the promoted
+stage2-norms checkpoint:
 
 ```sh
 BURN_JEPA_TRAIN_CUDA_FORCE=1 \

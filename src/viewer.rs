@@ -24,7 +24,7 @@ pub const DEFAULT_BOOTSTRAP_CONTEXT_DENSITY: f32 = 1.0;
 /// Default patch-diff score threshold.
 pub const DEFAULT_PATCH_DIFF_THRESHOLD: f32 = 1.0 - DEFAULT_PATCH_DIFF_QUALITY;
 /// Density at which a sparse write mask is promoted to the dense ordered path.
-pub const DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY: f32 = 0.60;
+pub const DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY: f32 = 0.75;
 /// Default tile radius used to dilate direct patch-diff threshold hits.
 pub const DEFAULT_PATCH_DIFF_DILATION_TILES: usize = 1;
 /// Default sparse encode bucket width used to reduce GPU shape churn.
@@ -324,13 +324,19 @@ impl PatchDiffRefreshState {
             "patch-diff refresh received unexpected score length"
         );
         if !config.patch_diff_refresh.can_add_tokens() {
-            let mask = patch_diff_context_mask_from_scores(scores, grid, sparsity)?;
+            let base_mask = patch_diff_base_mask_from_scores(scores, grid, sparsity, config)?;
             self.begin_frame(grid);
-            let masks = finalize_patch_diff_masks(mask, grid, config);
+            let masks = finalize_patch_diff_encode_masks(base_mask, grid, config);
             self.reset_selected(masks.write_mask.indices());
             return Ok(masks);
         }
-        let base_mask = patch_diff_context_mask_from_scores(scores.clone(), grid, sparsity)?;
+        let base_mask = patch_diff_base_mask_from_scores(scores.clone(), grid, sparsity, config)?;
+        if base_mask.is_dense_ordered() {
+            self.begin_frame(grid);
+            let masks = finalize_patch_diff_encode_masks(base_mask, grid, config);
+            self.reset_selected(masks.write_mask.indices());
+            return Ok(masks);
+        }
         self.begin_frame(grid);
         let refreshed = self.augment_mask(
             base_mask,
@@ -339,7 +345,7 @@ impl PatchDiffRefreshState {
             sparsity,
             &config.patch_diff_refresh,
         )?;
-        let masks = finalize_patch_diff_masks(refreshed, grid, config);
+        let masks = finalize_patch_diff_encode_masks(refreshed, grid, config);
         self.reset_selected(masks.write_mask.indices());
         Ok(masks)
     }
@@ -788,6 +794,83 @@ pub fn patch_diff_dense_fallback(
     }
 }
 
+/// Dilates a sparse patch mask by a tile radius without applying density cutoffs.
+pub fn dilate_sparse_patch_mask(
+    mask: SparseTokenMask,
+    grid: TokenGridShape,
+    dilation: usize,
+) -> Result<SparseTokenMask> {
+    ensure!(
+        mask.dense_len() == grid.len(),
+        "patch-diff dilation mask must match the token grid"
+    );
+    if dilation == 0 || mask.is_dense_ordered() {
+        return Ok(mask);
+    }
+    let mut keep = vec![false; grid.len()];
+    let mut selected = Vec::with_capacity(mask.len().saturating_mul(9).min(grid.len()));
+    for &index in mask.indices() {
+        push_dilated_patch_index(index, grid, dilation, &mut keep, &mut selected);
+    }
+    SparseTokenMask::new(selected, grid.len())
+}
+
+fn patch_diff_base_mask_from_scores(
+    scores: Vec<f32>,
+    grid: TokenGridShape,
+    sparsity: &SparseJepaPatchDiffSparsityConfig,
+    config: &FeatureFrameViewerConfig,
+) -> Result<SparseTokenMask> {
+    let direct_sparsity = sparsity.clone().with_dilation(0);
+    let direct_mask = patch_diff_context_mask_from_scores(scores, grid, &direct_sparsity)?;
+    let direct_mask =
+        patch_diff_dense_fallback(direct_mask, grid, config.patch_diff_dense_fallback_density);
+    dilate_sparse_patch_mask(direct_mask, grid, sparsity.dilation)
+}
+
+/// Builds patch-diff masks from scores using the live viewer ordering:
+/// threshold -> direct dense cutoff -> dilation -> encode bucketing.
+pub fn patch_diff_masks_from_scores(
+    scores: Vec<f32>,
+    grid: TokenGridShape,
+    sparsity: &SparseJepaPatchDiffSparsityConfig,
+    config: &FeatureFrameViewerConfig,
+) -> Result<FeatureFrameSparseMasks> {
+    let mask = patch_diff_base_mask_from_scores(scores, grid, sparsity, config)?;
+    Ok(finalize_patch_diff_encode_masks(mask, grid, config))
+}
+
+fn push_dilated_patch_index(
+    index: usize,
+    grid: TokenGridShape,
+    dilation: usize,
+    keep: &mut [bool],
+    selected: &mut Vec<usize>,
+) {
+    if index >= grid.len() {
+        return;
+    }
+    let frame_tokens = grid.tokens_per_frame().max(1);
+    let tubelet = index / frame_tokens;
+    let local = index % frame_tokens;
+    let row = local / grid.width.max(1);
+    let col = local % grid.width.max(1);
+    let row_start = row.saturating_sub(dilation);
+    let row_end = (row + dilation).min(grid.height.saturating_sub(1));
+    let col_start = col.saturating_sub(dilation);
+    let col_end = (col + dilation).min(grid.width.saturating_sub(1));
+    for row in row_start..=row_end {
+        for col in col_start..=col_end {
+            let index = coords_to_token_index(tubelet, row, col, grid);
+            if keep[index] {
+                continue;
+            }
+            keep[index] = true;
+            selected.push(index);
+        }
+    }
+}
+
 /// Pads sparse masks to stable token-width buckets while preserving all selected tokens.
 pub fn bucket_sparse_mask(
     mask: SparseTokenMask,
@@ -859,14 +942,12 @@ pub fn bucket_sparse_mask_with_config(
     mask.padded_to_len(target_len)
 }
 
-/// Applies dense fallback and sparse encode widening to a threshold-selected patch-diff mask.
-pub fn finalize_patch_diff_masks(
-    mask: SparseTokenMask,
+/// Applies sparse encode widening to an already cutoff-applied patch-diff write mask.
+pub fn finalize_patch_diff_encode_masks(
+    write_mask: SparseTokenMask,
     grid: TokenGridShape,
     config: &FeatureFrameViewerConfig,
 ) -> FeatureFrameSparseMasks {
-    let write_mask =
-        patch_diff_dense_fallback(mask, grid, config.patch_diff_dense_fallback_density);
     let encode_mask = match config.sparse_encode_mode {
         FeatureFrameSparseEncodeMode::Exact => write_mask.clone(),
         FeatureFrameSparseEncodeMode::BucketedContext => {
@@ -877,6 +958,17 @@ pub fn finalize_patch_diff_masks(
         write_mask,
         encode_mask,
     }
+}
+
+/// Applies dense fallback and sparse encode widening to a threshold-selected patch-diff mask.
+pub fn finalize_patch_diff_masks(
+    mask: SparseTokenMask,
+    grid: TokenGridShape,
+    config: &FeatureFrameViewerConfig,
+) -> FeatureFrameSparseMasks {
+    let write_mask =
+        patch_diff_dense_fallback(mask, grid, config.patch_diff_dense_fallback_density);
+    finalize_patch_diff_encode_masks(write_mask, grid, config)
 }
 
 /// Applies dense fallback and encode widening, returning only the encoder mask.
@@ -1064,7 +1156,7 @@ pub fn patch_diff_scores_from_rgba(
     Ok(scores)
 }
 
-/// Samples an RGBA frame pair to decide whether scoring can route directly to dense.
+/// Samples direct RGBA patch hits to decide whether scoring can route directly to dense.
 pub fn patch_diff_sampled_dense_fast_path_from_rgba(
     prev: &[u8],
     current: &[u8],
@@ -1098,23 +1190,8 @@ pub fn patch_diff_sampled_dense_fast_path_from_rgba(
             }
         }
     }
-    let required_density =
-        sampled_dense_fast_path_trigger_density(fallback_density, config.dilation);
-    let required = (sampled as f32 * required_density).ceil() as usize;
+    let required = (sampled as f32 * fallback_density).ceil() as usize;
     sampled > 0 && active >= required.max(1)
-}
-
-fn sampled_dense_fast_path_trigger_density(fallback_density: f32, dilation: usize) -> f32 {
-    let fallback_density = fallback_density.clamp(0.0, 1.0);
-    if dilation == 0 || fallback_density >= 1.0 {
-        return fallback_density;
-    }
-    // Dilation turns a moderate number of raw patch hits into a dense write mask.
-    // Lower the sampled trigger only enough to catch those cases before full-grid scoring.
-    let radius = dilation.saturating_mul(2).saturating_add(1);
-    let neighborhood = radius.saturating_mul(radius).max(1) as f32;
-    let conservative_target = (fallback_density + 0.15).min(0.95);
-    (1.0 - (1.0 - conservative_target).powf(1.0 / neighborhood)).clamp(0.0, fallback_density)
 }
 
 fn rgba_patch_diff_score(
@@ -1202,6 +1279,10 @@ mod tests {
         assert_eq!(config.pipeline_image_size(), DEFAULT_IMAGE_SIZE);
         assert_eq!(config.min_context_tokens(1024), 1);
         assert!((config.patch_diff_quality() - DEFAULT_PATCH_DIFF_QUALITY).abs() <= f32::EPSILON);
+        assert!(
+            config.patch_diff_dense_fallback_density >= 0.75,
+            "default dense fallback should stay at least 75%"
+        );
         assert_eq!(
             config.sparse_encode_mode,
             FeatureFrameSparseEncodeMode::BucketedContext
@@ -1373,7 +1454,37 @@ mod tests {
     }
 
     #[test]
-    fn sampled_dense_fast_path_accounts_for_dilation() {
+    fn patch_diff_dense_cutoff_runs_before_dilation() {
+        let grid = TokenGridShape::new(1, 5, 5);
+        let center = coords_to_token_index(0, 2, 2, grid);
+        let mut scores = vec![0.0f32; grid.len()];
+        scores[center] = 0.5;
+        let config = FeatureFrameViewerConfig {
+            context_density: 1.0,
+            min_context_density: 0.0,
+            patch_diff_threshold: 0.10,
+            patch_diff_dense_fallback_density: 0.25,
+            patch_diff_dilation_tiles: 1,
+            patch_diff_refresh: PatchDiffRefreshConfig::disabled(),
+            sparse_encode_mode: FeatureFrameSparseEncodeMode::Exact,
+            ..FeatureFrameViewerConfig::default()
+        };
+
+        let masks = patch_diff_masks_from_scores(
+            scores,
+            grid,
+            &patch_diff_sparsity_config(&config, grid),
+            &config,
+        )
+        .expect("patch-diff masks");
+
+        assert_eq!(masks.write_mask.len(), 9);
+        assert!(!masks.write_mask.is_dense_ordered());
+        assert!(masks.write_mask.indices().contains(&center));
+    }
+
+    #[test]
+    fn sampled_dense_fast_path_uses_direct_density_before_dilation() {
         let grid = TokenGridShape::new(1, 8, 8);
         let patch_size = 16;
         let width = grid.width * patch_size;
@@ -1398,7 +1509,7 @@ mod tests {
             SparseJepaPatchDiffSparsityConfig::adaptive_threshold(0.10, 1, grid.len(), grid.len())
                 .with_dilation(1);
 
-        assert!(patch_diff_sampled_dense_fast_path_from_rgba(
+        assert!(!patch_diff_sampled_dense_fast_path_from_rgba(
             &prev, &current, width, patch_size, grid, &config, 0.60,
         ));
 

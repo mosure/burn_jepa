@@ -20,7 +20,9 @@ use bevy_jepa::{
     BevyJepaSparseEncodeMode, FeatureFrameViewerConfig, JepaBevyBackend, JepaBevyDevice, platform,
 };
 use burn::tensor::backend::Backend;
-use burn_jepa::{FeatureFrameRequest, PatchDiffRefreshConfig};
+use burn_jepa::{
+    DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY, FeatureFrameRequest, PatchDiffRefreshConfig,
+};
 use image::{Rgba, RgbaImage};
 use serde::Serialize;
 
@@ -305,7 +307,7 @@ fn case_config(args: &Args) -> BevyJepaConfig {
             pipeline.min_context_density = 0.0;
             pipeline.bootstrap_context_density = 1.0;
             pipeline.patch_diff_threshold = args.threshold;
-            pipeline.patch_diff_dense_fallback_density = 0.60;
+            pipeline.patch_diff_dense_fallback_density = DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY;
             pipeline.sparse_encode_mode = BevyJepaSparseEncodeMode::BucketedContext;
             pipeline.patch_diff_refresh = PatchDiffRefreshConfig::disabled();
         }

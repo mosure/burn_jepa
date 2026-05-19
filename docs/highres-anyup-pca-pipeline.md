@@ -153,7 +153,7 @@ speculative mask for a newer preview frame.
 High-motion patch-diff frames that select much of the token grid are promoted to
 a dense ordered mask. The feature memory then uses dense assignment rather than
 high-density sparse gather/scatter, and the encoder avoids exploring many
-near-dense sparse widths. The viewer default cutoff is `0.60`, based on the
+near-dense sparse widths. The viewer default cutoff is `0.75`, based on the
 latest 256/512px WGPU viewer stability sweep: exact sparse widths are steady
 once shapes are warm, but live high-density jitter can still trigger first-use
 shape/autotune stalls, and dense full-grid inference is already competitive in
@@ -198,7 +198,8 @@ The feature-cache-only sweep still favors dense ordered assignment for
 near-full writes, especially at 512px, while the full Bevy viewer path adds
 patch-diff, rolling PCA, display upload, and WGPU shape-specialization effects.
 That is why the raw bench still includes near-dense rows, but the production
-Bevy fallback is lower (`0.60`) for smoother live camera behavior.
+Bevy fallback is `0.75` for smoother live camera behavior while keeping more
+high-motion frames on the sparse path than the older `0.60` cutoff.
 
 The headless Bevy FPS-stability sweep exercises camera-like RGBA frames through
 the real patch-diff path and writes CSV/Markdown artifacts:

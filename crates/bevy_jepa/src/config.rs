@@ -43,7 +43,7 @@ pub const DEFAULT_RECONSTRUCTION_MODEL_MANIFEST_PATH: &str =
     "target/burn_jepa_reconstruction/low_res_v1/manifest.json";
 pub const DEFAULT_RECONSTRUCTION_EVERY: u64 = 0;
 pub const DEFAULT_TTT_MODEL_PATH: &str =
-    "target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk";
+    "target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk";
 pub const DEFAULT_VJEPA21_CHECKPOINT_DIR: &str = "~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384";
 pub const DEFAULT_VJEPA21_CONFIG_PATH: &str =
     "~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json";

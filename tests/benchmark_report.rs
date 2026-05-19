@@ -605,7 +605,7 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(viewer_docs.contains("16-frame sample window"));
     assert!(viewer_docs.contains("quality `0.97`, threshold `0.03`"));
     assert!(viewer_docs.contains("quality value only changes the threshold"));
-    assert!(viewer_docs.contains("patch-diff-dense-fallback-density 0.60"));
+    assert!(viewer_docs.contains("patch-diff-dense-fallback-density 0.75"));
     assert!(viewer_docs.contains("shape-stable bucketed sparse encode"));
     assert!(viewer_docs.contains("bucketed-context"));
     assert!(viewer_docs.contains("FeatureFrameViewerConfig"));

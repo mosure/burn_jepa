@@ -118,14 +118,37 @@ Use a staged schedule for production candidates:
    sparse context rollout, and frozen sparse patchify.
 3. Evaluate free-run sparse quality, temporal diagnostics, utilization metrics,
    and cross-domain slices.
-4. Start a short low-LR unfrozen continuation only after the frozen adapter run
-   plateaus cleanly.
+4. Start staged trainable-capacity continuations only after the frozen adapter
+   run plateaus cleanly: norm-only first, last-block low-LR second, full
+   encoder low-LR only as an upper-bound ablation.
 
-The unfrozen continuation is an ablation, not the default first run. It may
-help reduce residual teacher-student mismatch after adapter saturation, but it
-uses dense autodiff patch embedding during training and can damage pretrained
-feature geometry if the learning rate or duration is too aggressive. Keep the
-stage-1 frozen adapter checkpoint as the deployable sparse baseline.
+Run no-TTT image-to-video controls alongside continuation probes. A fair
+control uses the same video-teacher feature loss and a non-frozen
+`ttt.pretrained_train_scope`, but leaves `ttt.layers = []` and
+`ttt.predictor_layers = []`. This measures whether static image-path
+finetuning alone can explain an apparent TTT gain. Do not compare a trained
+TTT student only against unfine-tuned base image features; V-JEPA 2.1 image and
+video token pathways are not assumed to be feature-identical.
+
+The continuation is an ablation, not the default first run. It may help reduce
+residual teacher-student mismatch after adapter saturation, but larger scopes
+can damage pretrained feature geometry if the learning rate or duration is too
+aggressive. Keep the stage-1 frozen adapter checkpoint as the deployable sparse
+baseline unless token-space free-run eval improves.
+
+`ttt.pretrained_train_scope` controls this stage:
+
+- `frozen`: historical adapter-only/default behavior.
+- `norms`: train only encoder LayerNorm weights in addition to TTT modules.
+  This preserves frozen sparse patchify and is the first low-risk alignment
+  test. With `ttt.layers = []`, it is also the smallest no-TTT image-to-video
+  baseline.
+- `last_n_blocks`: train the last `ttt.pretrained_train_last_n_blocks` encoder
+  blocks, with or without TTT modules. This keeps the patch embedding frozen
+  but is much more expensive.
+- `all`: train the full pretrained encoder/predictor wrapper. This requires
+  `ttt.freeze_pretrained = false` and should be treated as an upper-bound
+  diagnostic because it gives up the frozen sparse-patchify training bridge.
 
 ## Stream and TBPTT Training
 
@@ -439,7 +462,8 @@ with `sparse-patchify-cuda`. In training it runs frozen sparse patchify at the
 sparse token boundary so adapter-only TTT gradients still train the TTT/memory
 layers while the frozen patch embedding does not receive gradients. Evaluation
 can use the same frozen sparse patchify route without the autodiff wrapper.
-This requires `ttt.freeze_pretrained = true`. Training and eval reports include
+This requires `ttt.freeze_pretrained = true` and a sparse-compatible train
+scope (`frozen`, `norms`, or `last_n_blocks`). Training and eval reports include
 `rollout.frozen_sparse_patchify` so benchmark artifacts show which path was
 actually used.
 
@@ -546,9 +570,14 @@ cache hit/miss/eviction counts in train/eval stage metrics.
 ## TTT Layer Placement
 
 `ttt.insertion` controls the fast-weight architecture. Use `adapter` to keep
-the existing residual TTT adapters. Use `in_place_mlp` to convert selected
+the existing residual SC-TTT adapters. Use `in_place_mlp` to convert selected
 existing encoder MLPs into In-Place-style adaptive MLPs that reuse the
-pretrained down-projection as the base fast weight. `ttt.layer_placement`
+pretrained down-projection as the base fast weight. Use
+`in_place_mlp_strict` only for the paper-conformance lane: it uses the selected
+MLP `fc2` as the fast down-projection base, causal target generation, and
+apply-then-update full-chunk semantics. It intentionally disables
+Memory-ALiBi because multi-bank state is a project extension rather than the
+single fast-weight cache described by In-Place TTT. `ttt.layer_placement`
 controls which encoder layers are selected. Supported placements are `first`,
 `middle`, `last`,
 `first_last`, `thirds`, and `explicit`. `explicit` uses `ttt.layers` directly.
@@ -564,6 +593,14 @@ For the in-place MLP ablation, compare at least matched `thirds` layers
 `[1, 3, 5, 7, 9, 11]`. The latter is plausible because it reuses existing MLP
 projections rather than adding separate residual blocks, but it also increases
 fast-state memory by the MLP ratio and can increase backward cost.
+
+Training/eval targets remain rolling 3D-teacher windows. Production configs set
+`dataset.frames = 16` and `training.teacher_window_frames = 16`, so each
+teacher target is produced from the current 16-frame V-JEPA video window only.
+Longer history reaches the student through carried TTT state across packed
+stream windows, not by giving the 3D teacher future frames inside the same
+target sample. This keeps teacher supervision causal with respect to stream
+deployment while still letting reset steps train zero-state initialization.
 
 Bounded real-checkpoint CUDA smoke results from 2026-05-18 used the V-JEPA 2.1
 ViT-B checkpoint, 256px real manifest windows, manifest AutoGaze masks, and a

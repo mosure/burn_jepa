@@ -10,28 +10,141 @@ external parity/data requirements.
 - Base V-JEPA fixture:
   `/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/model.pt`
 - TTT adapter:
-  `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model.mpk`
-- Best sampled deploy-rollout checkpoint, retained for audit:
-  `target/burn-jepa-production-final-256/stage1-stream-tbptt-carry-forever-alibi/ttt-model-best.mpk`
+  `target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk`
+- Stage2 train-loss-best checkpoint, retained for audit:
+  `target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model-best.mpk`
 - Sparse policy: AutoGaze-style sparse context masks, 410 / 2048 context
   tokens, 103 / 2048 target tokens at 256px / 16 frames.
 - Eval split: 164 held-out open-set windows from
   `target/burn-jepa-production-final-256/data/eval-real-autogaze.jsonl`.
 
 In-Place TTT support is implemented as an ablation, but the active candidate is
-still the adapter/Memory-ALiBi model above. A bounded real-checkpoint CUDA
-smoke found `in_place_mlp` thirds had similar initial quality but about 4x fast
-state memory and slower backward/optimizer throughput than adapter thirds, so
-it is not promoted without a longer positive quality result or a lower-overhead
-backward path.
+still the SC-TTT adapter/Memory-ALiBi model above. A bounded real-checkpoint
+CUDA smoke found `in_place_mlp` thirds had similar initial quality but about 4x
+fast state memory and slower backward/optimizer throughput than adapter thirds,
+so it is not promoted without a longer positive quality result or a
+lower-overhead backward path. The stricter paper-conformance lane is
+`in_place_mlp_strict`; it uses causal target generation, single `fc2`
+fast-weight state, and apply-then-update full-chunk updates. Memory-ALiBi
+remains labeled as a local SC-TTT extension, not an In-Place TTT claim.
+
+## 2026-05-19 Image-Student to Video-Teacher Alignment
+
+The deployed sparse TTT student starts from image patch tokens and the teacher
+target is produced by V-JEPA 2.1 video/tubelet tokens. The alignment risk is
+real: adapter-only TTT has to learn both temporal recurrence and any static
+image-token to video-token distribution shift.
+
+Matched 8-window CUDA cactus evals against the video teacher:
+
+| Lane | Student tokens | Loss | Cosine | Late-early loss |
+|---|---:|---:|---:|---:|
+| Dense image V-JEPA 2.1 baseline | 2048 / 2048 | 0.3288 | 0.8636 | -0.0254 |
+| Sparse image V-JEPA 2.1 baseline | 410 / 2048 | 0.4631 | 0.8048 | +0.0010 |
+| Sparse Memory-ALiBi TTT | 410 / 2048 | 0.3410 | 0.8576 | -0.0828 |
+
+Interpretation: sparse Memory-ALiBi TTT closes most of the sparse image-token
+gap to the dense image baseline, but it still does not beat dense image tokens
+against the video teacher on this small matched slice. That is the right signal
+for staged trainable-capacity ablations; it is not evidence to fully unfreeze
+patch embedding by default.
+
+New train-scope controls:
+
+- `ttt.pretrained_train_scope = "frozen"`: adapter-only baseline.
+- `ttt.pretrained_train_scope = "norms"`: train encoder LayerNorms plus TTT.
+- `ttt.pretrained_train_scope = "last_n_blocks"`: train the last N encoder
+  blocks plus TTT.
+- `ttt.pretrained_train_scope = "all"`: full low-LR upper-bound ablation;
+  requires `ttt.freeze_pretrained = false`.
+
+Short CUDA continuation probes now include no-TTT image-to-video controls. The
+no-TTT controls start from the base V-JEPA 2.1 image pathway, train the same
+video-teacher feature loss, and leave `ttt.layers = []`; this prevents the
+comparison from assuming that image and video features already align.
+
+| Lane | Steps | Dense / sparse train steps | Trainable params | Pre eval loss/cos | Post eval loss/cos | Samples/s |
+|---|---:|---:|---:|---:|---:|---:|
+| No-TTT image-to-video, norms | 96 | 65 / 31 | 43K | 0.3981 / 0.8293 | 0.3954 / 0.8304 | 2.82 |
+| No-TTT image-to-video, last 2 blocks | 96 | 65 / 31 | 14.18M | 0.3981 / 0.8293 | 0.3967 / 0.8299 | 1.87 |
+| TTT + norms, from Memory-ALiBi best | 96 | 65 / 31 | 3.59M | 0.3557 / 0.8477 | 0.3493 / 0.8504 | 0.76 |
+| TTT + norms, from Memory-ALiBi best | 192 | 66 / 126 | 3.59M | 0.3557 / 0.8477 | 0.3465 / 0.8516 | 0.81 |
+| TTT + last 2 blocks, short sparse probe | 32 | 9 / 23 | 17.73M | 0.3814 / 0.8384 | 0.3791 / 0.8394 | not comparable |
+| TTT + last 2 blocks, lower LR short sparse probe | 32 | 9 / 23 | 17.73M | 0.3814 / 0.8384 | 0.3809 / 0.8386 | not comparable |
+
+Interpretation: the short-budget no-TTT controls do not explain the TTT result.
+Training only the image pathway, even with 14.18M late-block parameters, barely
+moved the sparse image-to-video feature loss on this eval slice. The recurrent
+TTT checkpoint starts substantially closer to the video teacher and norm-only
+continuation improves it slightly. This does not prove a larger static
+finetune could never work, but it makes TTT recurrence the current best
+quality path and puts training throughput, not static capacity, at the top of
+the optimization list.
+
+The norm-only TTT continuation is promoted over the prior stage1
+Memory-ALiBi checkpoint. It adds only `43,008` pretrained trainable parameters,
+preserves frozen sparse patchify, and improves both matched short eval and
+long-rollout gates. The final checkpoint is promoted over the step-448
+train-loss-best checkpoint because it is slightly better on the same-stream
+long-rollout gate. The last-block probes are not promoted because they add
+`14,181,888` pretrained trainable parameters, cost more backward time, and did
+not produce a proportionate token-space gain in the short run.
+
+Full stage2-norms training result:
+
+- 512 steps, 1024 samples, 20.0% sparse context density.
+- Mixed training loss: initial `0.1931`, best deploy-rollout sample `0.1649`,
+  final `0.2549`.
+- Saved final model:
+  `target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk`.
+- Saved train-loss-best model:
+  `target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model-best.mpk`
+  at step `448`.
+- Runtime: `993.6 s`, `1.03 samples/s`.
+- Backward/optimizer remains the bottleneck:
+  `750.1 s` backward plus `3.3 s` optimizer.
+- Stream mix: `952` carried windows, `72` reset windows, no stream decay, no
+  periodic reset.
+
+Long-rollout promotion gates:
+
+| Lane | Windows | Runtime resets | Loss | Cosine | Late-early loss |
+|---|---:|---:|---:|---:|---:|
+| Stage1 Memory-ALiBi final, same-stream cactus repeat | 1088 | 1 | 0.3273 | 0.8646 | -0.0009 |
+| Stage2-norms train-loss-best, same-stream cactus repeat | 1088 | 1 | 0.2803 | 0.8847 | -0.0009 |
+| Stage2-norms final, same-stream cactus repeat | 1088 | 1 | 0.2794 | 0.8851 | -0.0009 |
+| Stage1 Memory-ALiBi final, adversarial stitched stream | 512 | 1 | 0.2850 | 0.8807 | -0.0229 |
+| Stage2-norms final, adversarial stitched stream | 512 | 1 | 0.2573 | 0.8924 | -0.0193 |
+
+Feature-stability diagnostics still do not show token collapse:
+
+| Gate | Relative spread | Mean pairwise token cosine | Collapse score |
+|---|---:|---:|---:|
+| Same-stream cactus repeat, stage2 final | 0.4163 | 0.8255 | 0.4819 |
+| Adversarial stitched stream, stage2 final | 0.4301 | 0.8135 | 0.4639 |
+
+Artifacts:
+
+- `target/burn-jepa-production-final-256/long-rollout-dense-eval/ttt-eval-report.json`
+- `target/burn-jepa-production-final-256/long-rollout-base-sparse/ttt-eval-report.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report.json`
+- `target/burn-jepa-production-final-256/image2video-stage2-norms-low-lr/ttt-report.json`
+- `target/burn-jepa-production-final-256/image2video-stage2-last2-low-lr/ttt-report.json`
+- `target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-report.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-stage2-norms-best.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-cactus-64x/ttt-eval-report-stage2-norms-final.json`
+- `target/burn-jepa-production-final-256/long-rollout-carry-forever-alibi-adversarial-8x/ttt-eval-report-stage2-norms-final.json`
+- `target/burn-jepa-production-final-256/stage2-last2-low-lr-short-sparse/ttt-report.json`
+- `target/burn-jepa-production-final-256/stage2-last2-low-lr-short-sparse-lr1e-7/ttt-report.json`
 
 ## 2026-05-18 Memory-ALiBi Candidate Gate
 
-The carry-forever Memory-ALiBi run is now the active candidate.  It was trained
-as a continuation from the reset16 `longstable` checkpoint, but disables hard
-runtime resets: no clip-change reset, no scene-change reset, no non-monotonic
-reset, no periodic reset, and no stream-level state decay.  The added TTT fast
-memory uses three ALiBi-style banks with half-lives `[8, 64, 512]` windows.
+This is the previous active candidate, retained as the stage2 starting point
+and audit baseline. It was trained as a continuation from the reset16
+`longstable` checkpoint, but disables hard runtime resets: no clip-change
+reset, no scene-change reset, no non-monotonic reset, no periodic reset, and no
+stream-level state decay. The added TTT fast memory uses three ALiBi-style
+banks with half-lives `[8, 64, 512]` windows.
 
 Training command:
 

@@ -7,11 +7,11 @@ use burn_jepa::{
     BurnJepaTrainConfig, JepaDatasetConfig, JepaSample, JepaSampleMetadata, SparseMaskBatch,
     SparseTokenMask, TttBackpropMode, TttBestCheckpointSelection, TttEncoderConfig,
     TttEvalModelKind, TttInsertionMode, TttLayerPlacement, TttLayerState, TttMemoryDynamics,
-    TttMemoryUpdateSource, TttRolloutReportMode, TttSparsePatchifyTrainingMode,
-    TttSparseRolloutMode, TttState, TttStreamStepKind, TttSupervisionMode, TttTargetMode,
-    VJepa2_1Model, VJepaTttLayer, VJepaTttModel, apply_token_mask, evaluate_ttt_base_sparse,
-    evaluate_ttt_model_file, load_jepa_tensor_batch, synthetic_video, train_dense_jepa,
-    train_ttt_distillation,
+    TttMemoryUpdateSource, TttPretrainedTrainScope, TttRolloutReportMode,
+    TttSparsePatchifyTrainingMode, TttSparseRolloutMode, TttState, TttStreamStepKind,
+    TttSupervisionMode, TttTargetMode, VJepa2_1Model, VJepaTttLayer, VJepaTttModel,
+    apply_token_mask, evaluate_ttt_base_sparse, evaluate_ttt_model_file, load_jepa_tensor_batch,
+    synthetic_video, train_dense_jepa, train_ttt_distillation,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -106,6 +106,60 @@ fn ttt_training_config_round_trips_through_public_training_namespace() {
     assert_eq!(parsed.loss.latent_regularization.weight, 1.0e-4);
     assert_eq!(parsed.loss.latent_regularization.covariance_weight, 0.25);
     assert_eq!(parsed.loss.latent_regularization.covariance_sketch_dim, 8);
+}
+
+#[test]
+fn ttt_strict_in_place_config_is_explicit_and_rejects_memory_alibi() {
+    let mut config = BurnJepaTrainConfig::default();
+    config.ttt.insertion = TttInsertionMode::InPlaceMlpStrict;
+    config.ttt.memory_dynamics = TttMemoryDynamics::Ema;
+    config.ttt.layer_placement = TttLayerPlacement::Explicit;
+    config.ttt.layers = vec![0];
+    config.training.teacher_window_frames = config.dataset.frames;
+
+    let toml = config.to_toml_string().expect("serialize strict config");
+    assert!(toml.contains("insertion = \"in_place_mlp_strict\""));
+    assert!(toml.contains("teacher_window_frames"));
+    let parsed: BurnJepaTrainConfig = toml::from_str(&toml).expect("parse strict config");
+    parsed
+        .validate_for_ttt()
+        .expect("strict in-place EMA config should validate");
+
+    let mut invalid = parsed.clone();
+    invalid.ttt.memory_dynamics = TttMemoryDynamics::MemoryAlibi;
+    let error = invalid
+        .validate_for_ttt()
+        .expect_err("strict in-place should reject Memory-ALiBi");
+    assert!(
+        error
+            .to_string()
+            .contains("in_place_mlp_strict implements the paper-style"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn rolling_teacher_window_requires_current_sample_window() {
+    let mut config = BurnJepaTrainConfig::default();
+    config.ttt.layer_placement = TttLayerPlacement::Explicit;
+    config.ttt.layers = vec![0];
+    config.dataset.frames = 16;
+    config.training.teacher_window_frames = 8;
+
+    let error = config
+        .validate_for_ttt()
+        .expect_err("teacher window should match dataset frame window");
+    assert!(
+        error
+            .to_string()
+            .contains("teacher_window_frames currently formalizes rolling teacher windows"),
+        "{error:?}"
+    );
+
+    config.training.teacher_window_frames = 16;
+    config
+        .validate_for_ttt()
+        .expect("matching rolling teacher window should validate");
 }
 
 #[test]
@@ -239,6 +293,26 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
         "../configs/production/vjepa21-ttt-stage2-unfrozen-low-lr-cuda.toml"
     ))
     .expect("parse stage2 production config");
+    let stage2_norms: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage2-norms-low-lr-cuda.toml"
+    ))
+    .expect("parse stage2 norm-only production config");
+    let stage2_last2: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage2-last2-low-lr-cuda.toml"
+    ))
+    .expect("parse stage2 last-2-block production config");
+    let image2video_norms: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-image2video-stage2-norms-low-lr-cuda.toml"
+    ))
+    .expect("parse image-to-video norm-only baseline production config");
+    let image2video_last2: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-image2video-stage2-last2-low-lr-cuda.toml"
+    ))
+    .expect("parse image-to-video last-2-block baseline production config");
+    let strict_inplace: BurnJepaTrainConfig = toml::from_str(include_str!(
+        "../configs/production/vjepa21-ttt-stage1-stream-tbptt-inplace-mlp-strict-thirds-cuda.toml"
+    ))
+    .expect("parse strict in-place production ablation config");
 
     assert_eq!(stage1.ttt.layers, vec![3, 7, 11]);
     assert!(stage1.dataset.image_size >= 256);
@@ -502,6 +576,58 @@ fn production_ttt_configs_are_encoder_only_and_scheduled() {
         stage2.training.lr_schedule,
         burn_jepa::LearningRateScheduleConfig::LinearWarmupCosine { .. }
     ));
+    assert_eq!(
+        stage2.ttt.pretrained_train_scope,
+        TttPretrainedTrainScope::All
+    );
+    assert_eq!(
+        stage2_norms.ttt.pretrained_train_scope,
+        TttPretrainedTrainScope::Norms
+    );
+    assert_eq!(
+        stage2_norms.training.sparse_patchify_training,
+        TttSparsePatchifyTrainingMode::FrozenSparsePatchify
+    );
+    assert_eq!(
+        stage2_last2.ttt.pretrained_train_scope,
+        TttPretrainedTrainScope::LastNBlocks
+    );
+    assert_eq!(stage2_last2.ttt.pretrained_train_last_n_blocks, 2);
+    assert_eq!(
+        stage2_last2.training.sparse_patchify_training,
+        TttSparsePatchifyTrainingMode::FrozenSparsePatchify
+    );
+    assert!(image2video_norms.ttt.layers.is_empty());
+    assert!(image2video_norms.ttt.predictor_layers.is_empty());
+    assert!(image2video_norms.model.ttt_checkpoint_path.is_none());
+    assert_eq!(
+        image2video_norms.ttt.pretrained_train_scope,
+        TttPretrainedTrainScope::Norms
+    );
+    assert_eq!(
+        image2video_norms.training.sparse_patchify_training,
+        TttSparsePatchifyTrainingMode::FrozenSparsePatchify
+    );
+    assert!(image2video_last2.ttt.layers.is_empty());
+    assert!(image2video_last2.ttt.predictor_layers.is_empty());
+    assert!(image2video_last2.model.ttt_checkpoint_path.is_none());
+    assert_eq!(
+        image2video_last2.ttt.pretrained_train_scope,
+        TttPretrainedTrainScope::LastNBlocks
+    );
+    assert_eq!(image2video_last2.ttt.pretrained_train_last_n_blocks, 2);
+    assert_eq!(
+        strict_inplace.ttt.insertion,
+        TttInsertionMode::InPlaceMlpStrict
+    );
+    assert_eq!(strict_inplace.ttt.memory_dynamics, TttMemoryDynamics::Ema);
+    assert_eq!(strict_inplace.training.teacher_window_frames, 16);
+    assert_eq!(strict_inplace.dataset.frames, 16);
+    assert!(strict_inplace.training.stream.enabled);
+    assert_eq!(
+        strict_inplace.training.sparse_patchify_training,
+        TttSparsePatchifyTrainingMode::FrozenSparsePatchify
+    );
 }
 
 #[test]
@@ -656,6 +782,33 @@ fn ttt_predictor_layers_require_predictor_loss() {
 }
 
 #[test]
+fn no_ttt_image_to_video_distillation_requires_trainable_feature_path() {
+    let mut frozen = BurnJepaTrainConfig::default();
+    frozen.ttt.layer_placement = TttLayerPlacement::Explicit;
+    frozen.ttt.layers.clear();
+    frozen.ttt.predictor_layers.clear();
+    assert!(
+        frozen.validate_for_ttt().is_err(),
+        "no-adapter TTT config should not silently train nothing"
+    );
+
+    let mut no_feature_loss = frozen.clone();
+    no_feature_loss.ttt.pretrained_train_scope = TttPretrainedTrainScope::Norms;
+    no_feature_loss.loss.feature_loss_weight = 0.0;
+    no_feature_loss.loss.predictor_loss_weight = 0.25;
+    assert!(
+        no_feature_loss.validate_for_ttt().is_err(),
+        "no-adapter image-to-video baseline should use the video-teacher feature loss"
+    );
+
+    let mut norms = frozen;
+    norms.ttt.pretrained_train_scope = TttPretrainedTrainScope::Norms;
+    norms
+        .validate_for_ttt()
+        .expect("trainable norm-only image-to-video baseline should validate");
+}
+
+#[test]
 fn ttt_context_sparse_rollout_config_round_trips() {
     let mut config = BurnJepaTrainConfig::default();
     config.training.mask = Some(burn_jepa::TrainingMaskConfig::PrecomputedMasks {
@@ -712,6 +865,38 @@ fn ttt_sparse_rollout_config_rejects_incompatible_modes() {
         unfrozen.validate_for_ttt().is_err(),
         "frozen sparse patchify should require frozen pretrained weights"
     );
+}
+
+#[test]
+fn ttt_pretrained_train_scope_validation_is_explicit() {
+    let mut all_with_freeze = BurnJepaTrainConfig::default();
+    all_with_freeze.ttt.freeze_pretrained = true;
+    all_with_freeze.ttt.pretrained_train_scope = TttPretrainedTrainScope::All;
+    assert!(
+        all_with_freeze.validate_for_ttt().is_err(),
+        "full pretrained finetuning should opt out of freeze_pretrained"
+    );
+
+    let mut last_n_missing_count = BurnJepaTrainConfig::default();
+    last_n_missing_count.ttt.pretrained_train_scope = TttPretrainedTrainScope::LastNBlocks;
+    last_n_missing_count.ttt.pretrained_train_last_n_blocks = 0;
+    assert!(
+        last_n_missing_count.validate_for_ttt().is_err(),
+        "last_n_blocks should require an explicit block count"
+    );
+
+    let mut sparse_compatible_norms = BurnJepaTrainConfig::default();
+    sparse_compatible_norms.training.mask = Some(burn_jepa::TrainingMaskConfig::PrecomputedMasks {
+        context_indices: vec![0, 2, 5, 7],
+        target_indices: vec![1, 3],
+    });
+    sparse_compatible_norms.training.sparse_rollout = TttSparseRolloutMode::TargetMask;
+    sparse_compatible_norms.training.sparse_patchify_training =
+        TttSparsePatchifyTrainingMode::FrozenSparsePatchify;
+    sparse_compatible_norms.ttt.pretrained_train_scope = TttPretrainedTrainScope::Norms;
+    sparse_compatible_norms
+        .validate_for_ttt()
+        .expect("norm-only tuning keeps the patchify boundary frozen");
 }
 
 #[test]
@@ -1044,7 +1229,7 @@ fn ttt_model_zero_init_matches_pretrained_video_encoder_and_stays_stable() {
     let student = VJepaTttModel::from_model(
         base,
         TttEncoderConfig {
-            chunk_tokens: 4,
+            chunk_tokens: 8,
             ..TttEncoderConfig::default()
         },
         &device,
@@ -1109,7 +1294,7 @@ fn ttt_in_place_mlp_zero_init_reuses_pretrained_mlp_and_matches_base_encoder() {
             insertion: TttInsertionMode::InPlaceMlp,
             layer_placement: TttLayerPlacement::Explicit,
             layers: vec![0, 1],
-            chunk_tokens: 4,
+            chunk_tokens: 8,
             ..TttEncoderConfig::default()
         },
         &device,
@@ -1179,6 +1364,55 @@ fn ttt_in_place_mlp_zero_init_reuses_pretrained_mlp_and_matches_base_encoder() {
         expected,
         second,
         1.0e-5,
+    );
+}
+
+#[test]
+fn ttt_strict_in_place_mlp_first_pass_reuses_pretrained_mlp() {
+    let device = Default::default();
+    let model_config = burn_jepa::VJepaConfig::tiny_for_tests();
+    let base = VJepa2_1Model::<B>::new(&model_config, &device);
+    let student = VJepaTttModel::from_model(
+        base,
+        TttEncoderConfig {
+            insertion: TttInsertionMode::InPlaceMlpStrict,
+            layer_placement: TttLayerPlacement::Explicit,
+            layers: vec![0, 1],
+            chunk_tokens: 8,
+            ttt_lr: 0.001,
+            memory_dynamics: TttMemoryDynamics::Ema,
+            ..TttEncoderConfig::default()
+        },
+        &device,
+    )
+    .expect("strict in-place TTT wrapped model");
+    assert_eq!(
+        student.encoder.insertion_mode(),
+        TttInsertionMode::InPlaceMlpStrict
+    );
+
+    let video = synthetic_video::<B>(1, model_config.in_channels, 4, 32, 32, &device);
+    let expected = student
+        .encoder
+        .base
+        .forward_video(video.clone(), None)
+        .tokens;
+    let mut state = student.fresh_state();
+    let actual = student
+        .encoder
+        .forward_video_with_state(video, None, Some(expected.clone()), &mut state)
+        .expect("stateful strict in-place TTT encode")
+        .tokens;
+
+    assert_tensor_close(
+        "strict in-place MLP TTT first pass should preserve pretrained/base encoder",
+        expected,
+        actual,
+        1.0e-5,
+    );
+    assert!(
+        state.layers.iter().all(|layer| layer.fast_weight.is_some()),
+        "strict in-place MLP TTT should store per-layer down-proj delta fast weights"
     );
 }
 
@@ -1546,6 +1780,33 @@ fn ttt_in_place_mlp_distillation_training_smoke_runs() {
         loaded.encoder.insertion_mode(),
         TttInsertionMode::InPlaceMlp
     );
+}
+
+#[test]
+fn ttt_strict_in_place_mlp_distillation_training_smoke_runs() {
+    let device = Default::default();
+    let mut config = BurnJepaTrainConfig::default();
+    config.ttt.insertion = TttInsertionMode::InPlaceMlpStrict;
+    config.ttt.memory_dynamics = TttMemoryDynamics::Ema;
+    config.ttt.layer_placement = TttLayerPlacement::Explicit;
+    config.ttt.layers = vec![0, 1];
+    config.ttt.chunk_tokens = 2;
+    config.ttt.ttt_lr = 1.0e-3;
+    config.model.save_model = false;
+    let temp = tempfile::tempdir().expect("tempdir");
+    config.model.output_dir = temp.path().join("ttt-strict-in-place-train");
+    config.training.max_steps = 1;
+    config.training.batch_size = 1;
+    config.training.eval_steps = 1;
+    config.training.learning_rate = 1.0e-3;
+    config.dataset.synthetic_len = 1;
+
+    let report = train_ttt_distillation::<AB>(&config, &device)
+        .expect("strict in-place MLP TTT training smoke");
+    assert_eq!(report.steps, 1);
+    assert_eq!(report.memory.insertion, TttInsertionMode::InPlaceMlpStrict);
+    assert!(report.final_loss.is_finite());
+    assert!(report.eval_loss.is_some_and(f64::is_finite));
 }
 
 #[test]

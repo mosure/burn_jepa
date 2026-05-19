@@ -55,6 +55,8 @@ pub struct VJepaInPlaceTttMlp<B: Backend> {
     memory_alibi_update_weights: Vec<f32>,
     #[module(skip)]
     memory_clip_rms: f32,
+    #[module(skip)]
+    strict_in_place: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -79,12 +81,22 @@ impl<B: Backend> VJepaInPlaceTttMlp<B> {
         let target_proj = config
             .use_projection
             .then(|| identity_linear(embed_dim, device));
-        let temporal_conv = Conv1dConfig::new(embed_dim, embed_dim, kernel)
+        let strict_in_place = config.insertion.is_strict_in_place();
+        let conv_padding = if strict_in_place {
+            PaddingConfig1d::Explicit(kernel.saturating_sub(1), 0)
+        } else {
+            PaddingConfig1d::Same
+        };
+        let mut temporal_conv = Conv1dConfig::new(embed_dim, embed_dim, kernel)
             .with_groups(embed_dim)
-            .with_padding(PaddingConfig1d::Same)
+            .with_padding(conv_padding)
             .with_bias(false)
             .with_initializer(Initializer::Zeros)
             .init(device);
+        if strict_in_place {
+            temporal_conv.weight =
+                Param::from_tensor(depthwise_current_token_kernel(embed_dim, kernel, device));
+        }
         Self {
             target_proj,
             temporal_conv,
@@ -97,6 +109,7 @@ impl<B: Backend> VJepaInPlaceTttMlp<B> {
             memory_alibi_read_weights: config.resolved_memory_alibi_read_weights(),
             memory_alibi_update_weights: config.resolved_memory_alibi_update_weights(),
             memory_clip_rms: config.memory_clip_rms,
+            strict_in_place,
         }
     }
 
@@ -140,16 +153,7 @@ impl<B: Backend> VJepaInPlaceTttMlp<B> {
         let [batch, _, dim] = x.shape().dims::<3>();
         debug_assert_eq!(dim, self.embed_dim);
         let h = activation::gelu(mlp.fc1.forward(x.clone()));
-        let target = target.unwrap_or_else(|| x.clone()).detach();
-        let target = self
-            .temporal_conv
-            .forward(target.swap_dims(1, 2))
-            .swap_dims(1, 2);
-        let target = if let Some(proj) = &self.target_proj {
-            proj.forward(target)
-        } else {
-            target
-        };
+        let target = self.target_update_signal(target.unwrap_or_else(|| x.clone()).detach());
         let base = self.base_down_weight(mlp, batch);
         match self.memory_dynamics {
             TttMemoryDynamics::Ema => self.forward_ema(
@@ -213,11 +217,15 @@ impl<B: Backend> VJepaInPlaceTttMlp<B> {
             }
             chunks.push(output);
 
-            if update_fast_weight {
+            if update_fast_weight && self.should_update_chunk(end - start) {
                 let target_chunk = target.clone().slice_dim(1, start..end);
                 let update = h_chunk.swap_dims(1, 2).matmul(target_chunk);
-                delta = delta.mul_scalar(1.0 - self.ttt_lr as f64)
-                    + update.mul_scalar(self.ttt_lr as f64 / len);
+                delta = if self.strict_in_place {
+                    delta + update.mul_scalar(self.ttt_lr as f64)
+                } else {
+                    delta.mul_scalar(1.0 - self.ttt_lr as f64)
+                        + update.mul_scalar(self.ttt_lr as f64 / len)
+                };
                 delta = self.maybe_clip_fast_delta(delta);
             }
         }
@@ -338,6 +346,22 @@ impl<B: Backend> VJepaInPlaceTttMlp<B> {
             .val()
             .reshape([1, self.hidden_dim, self.embed_dim])
             .repeat_dim(0, batch)
+    }
+
+    fn target_update_signal(&self, target: Tensor<B, 3>) -> Tensor<B, 3> {
+        let target = self
+            .temporal_conv
+            .forward(target.swap_dims(1, 2))
+            .swap_dims(1, 2);
+        if let Some(proj) = &self.target_proj {
+            proj.forward(target)
+        } else {
+            target
+        }
+    }
+
+    fn should_update_chunk(&self, chunk_len: usize) -> bool {
+        !self.strict_in_place || chunk_len == self.chunk_tokens
     }
 
     fn linear_with_down_bias(&self, mlp: &VJepaMlp<B>, output: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -694,4 +718,169 @@ fn depthwise_identity_kernel<B: Backend>(
         values[channel * kernel + center] = 1.0;
     }
     Tensor::<B, 3>::from_data(TensorData::new(values, [dim, 1, kernel]), device)
+}
+
+fn depthwise_current_token_kernel<B: Backend>(
+    dim: usize,
+    kernel: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    let mut values = vec![0.0f32; dim * kernel];
+    let current = kernel.saturating_sub(1);
+    for channel in 0..dim {
+        values[channel * kernel + current] = 1.0;
+    }
+    Tensor::<B, 3>::from_data(TensorData::new(values, [dim, 1, kernel]), device)
+}
+
+#[cfg(all(test, feature = "ndarray"))]
+mod tests {
+    use super::*;
+    use crate::ttt::config::{TttEncoderConfig, TttInsertionMode};
+    use burn::backend::NdArray;
+
+    type TestBackend = NdArray<f32>;
+
+    fn values<const D: usize>(tensor: Tensor<TestBackend, D>) -> Vec<f32> {
+        tensor.to_data().to_vec::<f32>().expect("tensor values")
+    }
+
+    fn assert_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len(), "{label} len");
+        let max_diff = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff <= tolerance,
+            "{label} max diff {max_diff} > {tolerance}; actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
+    fn strict_in_place_target_conv_is_causal() {
+        let device = Default::default();
+        let config = TttEncoderConfig {
+            insertion: TttInsertionMode::InPlaceMlpStrict,
+            conv_kernel: 3,
+            use_projection: false,
+            ..TttEncoderConfig::default()
+        };
+        let mut layer = VJepaInPlaceTttMlp::<TestBackend>::new(1, 1, &config, &device);
+        layer.temporal_conv.weight = Param::from_tensor(Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 1.0, 1.0], [1, 1, 3]),
+            &device,
+        ));
+
+        let early = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 0.0, 0.0], [1, 4, 1]),
+            &device,
+        );
+        let future_changed = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 100.0, -100.0], [1, 4, 1]),
+            &device,
+        );
+
+        let early_values = values(layer.target_update_signal(early));
+        let future_changed_values = values(layer.target_update_signal(future_changed));
+
+        assert_close(
+            "causal target conv prefix",
+            &future_changed_values[..2],
+            &early_values[..2],
+            1.0e-6,
+        );
+        assert!(
+            (future_changed_values[2] - early_values[2]).abs() > 1.0,
+            "later outputs should still be allowed to depend on changed current/past tokens"
+        );
+    }
+
+    #[test]
+    fn strict_in_place_mlp_applies_then_updates_only_full_chunks() {
+        let device = Default::default();
+        let config = TttEncoderConfig {
+            insertion: TttInsertionMode::InPlaceMlpStrict,
+            chunk_tokens: 2,
+            conv_kernel: 1,
+            use_projection: false,
+            ttt_lr: 0.5,
+            ..TttEncoderConfig::default()
+        };
+        let layer = VJepaInPlaceTttMlp::<TestBackend>::new(2, 2, &config, &device);
+        let mut mlp = VJepaMlp::<TestBackend>::new(2, 1.0, &device);
+        mlp.fc1.weight = Param::from_tensor(Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0, 1.0], [2, 2]),
+            &device,
+        ));
+        mlp.fc1.bias = Some(Param::from_tensor(Tensor::<TestBackend, 1>::zeros(
+            [2],
+            &device,
+        )));
+        mlp.fc2.weight = Param::from_tensor(Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 0.0, 0.0, 1.0], [2, 2]),
+            &device,
+        ));
+        mlp.fc2.bias = Some(Param::from_tensor(Tensor::<TestBackend, 1>::zeros(
+            [2],
+            &device,
+        )));
+
+        let x = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.5, -0.25, 0.2, 0.3], [1, 2, 2]),
+            &device,
+        );
+        let target = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0], [1, 2, 2]),
+            &device,
+        );
+        let base = mlp.forward(x.clone());
+        let expected_delta = activation::gelu(mlp.fc1.forward(x.clone()))
+            .swap_dims(1, 2)
+            .matmul(target.clone())
+            .mul_scalar(0.5);
+
+        let mut state = TttLayerState::empty();
+        let output = layer.forward_mlp_with_options(&mlp, x, Some(target), &mut state, true);
+        assert_close(
+            "strict in-place first full chunk output",
+            &values(output),
+            &values(base),
+            1.0e-6,
+        );
+        assert_close(
+            "strict in-place full chunk update",
+            &values(state.fast_weight.expect("fast delta after full chunk")),
+            &values(expected_delta),
+            1.0e-6,
+        );
+
+        let short_x = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![0.5, -0.25], [1, 1, 2]),
+            &device,
+        );
+        let short_target = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 2.0], [1, 1, 2]),
+            &device,
+        );
+        let mut short_state = TttLayerState::empty();
+        let _ = layer.forward_mlp_with_options(
+            &mlp,
+            short_x,
+            Some(short_target),
+            &mut short_state,
+            true,
+        );
+        assert_close(
+            "strict in-place partial chunk should not update",
+            &values(
+                short_state
+                    .fast_weight
+                    .expect("fast delta after partial chunk"),
+            ),
+            &[0.0, 0.0, 0.0, 0.0],
+            1.0e-6,
+        );
+    }
 }

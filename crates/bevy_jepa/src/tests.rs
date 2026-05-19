@@ -1866,6 +1866,54 @@ fn patch_diff_below_dense_fallback_cutoff_remains_sparse() {
 }
 
 #[test]
+fn patch_diff_dense_fallback_cutoff_runs_before_dilation() {
+    let device = JepaBevyDevice::default();
+    let config = BevyJepaConfig {
+        source: BevyJepaFrameSource::Camera,
+        mask_source: BevyJepaMaskSource::PatchDiff,
+        pipeline: FeatureFrameViewerConfig {
+            context_density: 1.0,
+            patch_diff_threshold: 0.01,
+            patch_diff_dense_fallback_density: 0.25,
+            patch_diff_dilation_tiles: 1,
+            ..FeatureFrameViewerConfig::default()
+        },
+        ..BevyJepaConfig::default()
+    };
+    let mut model_config = VJepaConfig::tiny_for_tests();
+    model_config.image_size = 80;
+    model_config.num_frames = 2;
+    model_config.tubelet_size = 2;
+    model_config.patch_size = 16;
+    let grid = TokenGridShape::new(1, 5, 5);
+    let changed = [(2, 2)];
+    let previous_rgba = RgbaImage::new(80, 80);
+    let current_rgba = rgba_with_patches(80, 80, &changed, 16, image::Rgba([255, 255, 255, 255]));
+    let previous = rgba_image_to_tensor(previous_rgba.clone(), 80, &device).expect("prev");
+    let current = rgba_image_to_tensor(current_rgba.clone(), 80, &device).expect("current");
+
+    let output = run_sparse_mask_node(
+        &config,
+        Some(&previous),
+        Some(&previous_rgba),
+        Some(&current_rgba),
+        &current,
+        &model_config,
+        grid,
+    )
+    .expect("patch-diff mask");
+
+    assert_eq!(output.write_mask.len(), 9);
+    assert!(!output.write_mask.is_dense_ordered());
+    assert!(
+        output
+            .write_mask
+            .indices()
+            .contains(&coords_to_token_index(0, 2, 2, grid))
+    );
+}
+
+#[test]
 fn sparse_mask_bucket_preserves_changed_tokens_and_limits_shape_churn() {
     let grid = TokenGridShape::new(1, 32, 32);
     let changed = SparseTokenMask::new((0..103).collect(), grid.len()).expect("mask");

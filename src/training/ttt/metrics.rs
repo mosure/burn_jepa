@@ -2,7 +2,8 @@ use super::step::{TttPatchifyKind, TttRolloutKind};
 use crate::training::config::BurnJepaTrainConfig;
 use crate::{
     SparseMaskBatch, TttInsertionMode, TttMemoryDynamics, TttMemoryUpdateSource,
-    TttSupervisionMode, VJepaConfig, VJepaTttLayerProbeRecord, VJepaTttModel,
+    TttPretrainedTrainScope, TttSupervisionMode, VJepaConfig, VJepaTttLayerProbeRecord,
+    VJepaTttModel,
 };
 use anyhow::Result;
 use burn::optim::GradientsParams;
@@ -81,7 +82,9 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
     let memory_banks = config.ttt.memory_bank_count();
     let encoder_fast_weight_elements = match config.ttt.insertion {
         TttInsertionMode::Adapter => layer_count * batch_size * embed_dim * embed_dim,
-        TttInsertionMode::InPlaceMlp => layer_count * batch_size * hidden_dim * embed_dim,
+        TttInsertionMode::InPlaceMlp | TttInsertionMode::InPlaceMlpStrict => {
+            layer_count * batch_size * hidden_dim * embed_dim
+        }
     };
     let fast_weight_elements = memory_banks
         * (encoder_fast_weight_elements
@@ -92,7 +95,7 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
                 + embed_dim * config.ttt.conv_kernel.max(1)
                 + usize::from(config.ttt.use_projection) * embed_dim * embed_dim
         }
-        TttInsertionMode::InPlaceMlp => {
+        TttInsertionMode::InPlaceMlp | TttInsertionMode::InPlaceMlpStrict => {
             embed_dim * config.ttt.conv_kernel.max(1)
                 + usize::from(config.ttt.use_projection) * embed_dim * embed_dim
         }
@@ -100,8 +103,12 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
     let per_predictor_layer_params = predictor_embed_dim * predictor_embed_dim
         + predictor_embed_dim * config.ttt.conv_kernel.max(1)
         + usize::from(config.ttt.use_projection) * predictor_embed_dim * predictor_embed_dim;
-    let trainable_param_elements =
+    let ttt_trainable_param_elements =
         per_encoder_layer_params * layer_count + per_predictor_layer_params * predictor_layer_count;
+    let pretrained_trainable_param_elements =
+        pretrained_encoder_trainable_param_elements(config, model);
+    let trainable_param_elements =
+        ttt_trainable_param_elements + pretrained_trainable_param_elements;
     TttMemoryMetrics {
         layers,
         predictor_layers,
@@ -113,6 +120,8 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
         ttt_lr: config.ttt.ttt_lr,
         insertion: config.ttt.insertion,
         memory_dynamics: config.ttt.memory_dynamics,
+        pretrained_train_scope: config.ttt.resolved_pretrained_train_scope(),
+        pretrained_train_last_n_blocks: config.ttt.pretrained_train_last_n_blocks,
         memory_banks,
         memory_alibi_half_lives: match config.ttt.memory_dynamics {
             TttMemoryDynamics::Ema => Vec::new(),
@@ -121,10 +130,93 @@ pub(super) fn ttt_memory_metrics_for_batch_size(
         memory_clip_rms: config.ttt.memory_clip_rms,
         fast_weight_elements,
         fast_weight_bytes_f32: fast_weight_elements * std::mem::size_of::<f32>(),
+        ttt_trainable_param_elements,
+        pretrained_trainable_param_elements,
         trainable_param_elements,
         trainable_param_bytes_f32: trainable_param_elements * std::mem::size_of::<f32>(),
         adam_state_bytes_f32: trainable_param_elements * std::mem::size_of::<f32>() * 2,
     }
+}
+
+fn pretrained_encoder_trainable_param_elements(
+    config: &BurnJepaTrainConfig,
+    model: &VJepaConfig,
+) -> usize {
+    let embed_dim = model.encoder.embed_dim.max(1);
+    let hidden_dim = ((embed_dim as f32) * model.encoder.mlp_ratio.max(1.0)).round() as usize;
+    let depth = model.encoder.depth.max(1);
+    let norm_layers = model.encoder.hierarchical_layers().len();
+    let norms_only = depth * transformer_block_norm_param_elements(embed_dim)
+        + norm_layers * layer_norm_param_elements(embed_dim);
+    let block = transformer_block_param_elements(embed_dim, hidden_dim);
+    match config.ttt.resolved_pretrained_train_scope() {
+        TttPretrainedTrainScope::Frozen => 0,
+        TttPretrainedTrainScope::Norms => norms_only,
+        TttPretrainedTrainScope::LastNBlocks => {
+            let count = config.ttt.pretrained_train_last_n_blocks.min(depth);
+            count * block + norm_layers * layer_norm_param_elements(embed_dim)
+        }
+        TttPretrainedTrainScope::All => {
+            let patch = patch_embed3d_param_elements(
+                model.in_channels.max(1),
+                embed_dim,
+                model.patch_size.max(1),
+                model.tubelet_size.max(1),
+            ) + patch_embed3d_param_elements(
+                model.in_channels.max(1),
+                embed_dim,
+                model.patch_size.max(1),
+                1,
+            );
+            let mod_embeds = 2 * embed_dim;
+            patch
+                + depth * block
+                + norms_only
+                + mod_embeds
+                + predictor_trainable_param_elements(model)
+        }
+    }
+}
+
+fn predictor_trainable_param_elements(model: &VJepaConfig) -> usize {
+    let encoder_dim = model.encoder.embed_dim.max(1);
+    let pred_dim = model.predictor.embed_dim.max(1);
+    let output_dim = model.predictor.output_dim.unwrap_or(encoder_dim).max(1);
+    let hidden_dim = ((pred_dim as f32) * model.predictor.mlp_ratio.max(1.0)).round() as usize;
+    let predictor_embed = encoder_dim * pred_dim + pred_dim;
+    let mask_tokens = model.predictor.num_mask_tokens.max(1) * pred_dim;
+    let blocks =
+        model.predictor.depth.max(1) * transformer_block_param_elements(pred_dim, hidden_dim);
+    let norm = layer_norm_param_elements(pred_dim);
+    let target_proj = pred_dim * output_dim + output_dim;
+    let context_proj =
+        usize::from(model.predictor.return_all_tokens) * (pred_dim * output_dim + output_dim);
+    let mod_embeds = 2 * pred_dim;
+    predictor_embed + mask_tokens + blocks + norm + target_proj + context_proj + mod_embeds
+}
+
+fn patch_embed3d_param_elements(
+    in_channels: usize,
+    embed_dim: usize,
+    patch_size: usize,
+    tubelet_size: usize,
+) -> usize {
+    embed_dim * in_channels * tubelet_size * patch_size * patch_size + embed_dim
+}
+
+fn transformer_block_param_elements(embed_dim: usize, hidden_dim: usize) -> usize {
+    let qkv = embed_dim * embed_dim * 3 + embed_dim * 3;
+    let proj = embed_dim * embed_dim + embed_dim;
+    let mlp = embed_dim * hidden_dim + hidden_dim + hidden_dim * embed_dim + embed_dim;
+    qkv + proj + mlp + transformer_block_norm_param_elements(embed_dim)
+}
+
+fn transformer_block_norm_param_elements(embed_dim: usize) -> usize {
+    2 * layer_norm_param_elements(embed_dim)
+}
+
+fn layer_norm_param_elements(embed_dim: usize) -> usize {
+    2 * embed_dim
 }
 
 pub(super) fn rollout_metrics(
@@ -178,6 +270,10 @@ pub(super) fn target_supervision_metrics(
         memory_update: config.ttt.memory_update,
         supervision: config.ttt.supervision,
         hybrid_final_steps: config.ttt.hybrid_final_steps,
+        rolling_teacher_window_frames: config
+            .training
+            .teacher_window_frames
+            .max(config.dataset.frames),
         train_adapter_target,
         deploy_adapter_target: "self_hidden_detached",
         layer_alignment,

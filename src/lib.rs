@@ -206,9 +206,9 @@ pub use training::{
 };
 pub use ttt::{
     TttBackpropMode, TttEncoderConfig, TttInsertionMode, TttLayerPlacement, TttLayerState,
-    TttMemoryDynamics, TttMemoryUpdateSource, TttState, TttStateResetMode, TttSupervisionMode,
-    TttTargetMode, VJepaInPlaceTttMlp, VJepaTttEncoder, VJepaTttLayer, VJepaTttLayerProbe,
-    VJepaTttLayerProbeRecord, VJepaTttModel,
+    TttMemoryDynamics, TttMemoryUpdateSource, TttPretrainedTrainScope, TttState, TttStateResetMode,
+    TttSupervisionMode, TttTargetMode, VJepaInPlaceTttMlp, VJepaTttEncoder, VJepaTttLayer,
+    VJepaTttLayerProbe, VJepaTttLayerProbeRecord, VJepaTttModel,
 };
 pub use viewer::{
     DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CONTEXT_DENSITY,
@@ -227,9 +227,9 @@ pub use viewer::{
     PatchDiffRefreshConfig, PatchDiffRefreshState, RgbaPatchDiffFrameStats, bucket_sparse_mask,
     bucket_sparse_mask_with_config, center_prior_mask, finalize_patch_diff_mask,
     finalize_patch_diff_masks, patch_diff_can_use_dense_fast_path, patch_diff_dense_fallback,
-    patch_diff_sampled_dense_fast_path_from_rgba, patch_diff_scores_from_rgba,
-    patch_diff_sparsity_config, patch_diff_threshold_from_quality, rgba_patch_diff_frame_stats,
-    shape_prewarm_masks, sparse_mask_bucket_widths,
+    patch_diff_masks_from_scores, patch_diff_sampled_dense_fast_path_from_rgba,
+    patch_diff_scores_from_rgba, patch_diff_sparsity_config, patch_diff_threshold_from_quality,
+    rgba_patch_diff_frame_stats, shape_prewarm_masks, sparse_mask_bucket_widths,
 };
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;

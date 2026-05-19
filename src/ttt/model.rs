@@ -1,4 +1,4 @@
-use super::config::{TttBackpropMode, TttEncoderConfig};
+use super::config::{TttBackpropMode, TttEncoderConfig, TttPretrainedTrainScope};
 use super::encoder::VJepaTttEncoder;
 use super::layer::VJepaTttLayer;
 use super::state::TttState;
@@ -29,11 +29,7 @@ impl<B: Backend> VJepaTttModel<B> {
         device: &B::Device,
     ) -> Result<Self> {
         let model_config = model.config().clone();
-        let model = if ttt_config.freeze_pretrained {
-            model.no_grad()
-        } else {
-            model
-        };
+        let model = apply_pretrained_train_scope(model, &ttt_config);
         let predictor_layer_indices = ttt_config.resolved_predictor_layers(&model_config);
         let predictor_ttt_layers = predictor_layer_indices
             .iter()
@@ -331,6 +327,28 @@ impl<B: Backend> VJepaTttModel<B> {
             sequence_tokens: sequence,
             sequence_indices: plan.sequence_indices.clone(),
         })
+    }
+}
+
+fn apply_pretrained_train_scope<B: Backend>(
+    model: VJepa2_1Model<B>,
+    ttt_config: &TttEncoderConfig,
+) -> VJepa2_1Model<B> {
+    match ttt_config.resolved_pretrained_train_scope() {
+        TttPretrainedTrainScope::All => model,
+        TttPretrainedTrainScope::Frozen => model.no_grad(),
+        TttPretrainedTrainScope::Norms => {
+            let mut model = model.no_grad();
+            model.encoder = model.encoder.with_norms_require_grad(true);
+            model
+        }
+        TttPretrainedTrainScope::LastNBlocks => {
+            let mut model = model.no_grad();
+            model.encoder = model
+                .encoder
+                .with_last_blocks_require_grad(ttt_config.pretrained_train_last_n_blocks, true);
+            model
+        }
     }
 }
 

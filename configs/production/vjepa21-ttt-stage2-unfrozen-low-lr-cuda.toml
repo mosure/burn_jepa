@@ -1,7 +1,7 @@
 [model]
 checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
-ttt_checkpoint_path = "target/burn-jepa-production-final-256/stage1-stream-tbptt/ttt-model.mpk"
+ttt_checkpoint_path = "target/burn-jepa-production-final-256/stage2-norms-low-lr/ttt-model.mpk"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
 output_dir = "target/burn-jepa-production-final-256/stage2-unfrozen-low-lr"
@@ -32,6 +32,7 @@ rollout_blocks = 2
 backprop_mode = "final_feature"
 backprop_truncate_blocks = 1
 freeze_pretrained = false
+pretrained_train_scope = "all"
 
 [training]
 backend = "cuda"

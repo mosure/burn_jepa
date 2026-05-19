@@ -1732,17 +1732,12 @@ fn setup_controls_ui(mut commands: Commands) {
                         spawn_control_section_title(
                             tab,
                             "Patch-Diff Mask",
-                            "Dilation expands changed patches. Refresh modes are legacy and off by default.",
+                            "Threshold hits are cutoff before expansion. Refresh modes are legacy and off by default.",
                         );
                         spawn_slider_row(
                             tab,
                             "Diff threshold",
                             JepaControlSliderKind::PatchDiffThreshold,
-                        );
-                        spawn_slider_row(
-                            tab,
-                            "Expansion",
-                            JepaControlSliderKind::PatchDiffDilationTiles,
                         );
                         spawn_slider_row(tab, "Max density", JepaControlSliderKind::ContextDensity);
                         spawn_slider_row(
@@ -1754,6 +1749,11 @@ fn setup_controls_ui(mut commands: Commands) {
                             tab,
                             "Dense cutoff",
                             JepaControlSliderKind::DenseFallbackDensity,
+                        );
+                        spawn_slider_row(
+                            tab,
+                            "Expansion",
+                            JepaControlSliderKind::PatchDiffDilationTiles,
                         );
                         spawn_control_row(
                             tab,
@@ -5054,7 +5054,7 @@ fn control_help_text(action: JepaControlAction) -> &'static str {
             "Show model package, sparse/dense pipeline, and input resolution settings."
         }
         JepaControlAction::TabMask => {
-            "Show patch-diff threshold, dilation, density, and legacy refresh settings."
+            "Show patch-diff threshold, direct-density cutoff, dilation, and legacy refresh settings."
         }
         JepaControlAction::TabPca => "Show PCA basis fitting and projection stability settings.",
         JepaControlAction::TabReconstruction => {
@@ -5133,16 +5133,16 @@ fn slider_help_text(kind: JepaControlSliderKind) -> &'static str {
             "Patch difference threshold. Lower values admit more changed patches."
         }
         JepaControlSliderKind::PatchDiffDilationTiles => {
-            "Tile-radius expansion applied to direct patch-diff hits before refresh tokens."
+            "Tile-radius expansion applied after direct dense cutoff and before refresh tokens."
         }
         JepaControlSliderKind::ContextDensity => {
-            "Maximum context density used to cap patch-diff masks before JEPA encoding."
+            "Maximum direct patch-diff density used by fixed-budget modes before dilation."
         }
         JepaControlSliderKind::MinContextDensity => {
             "Minimum context density. Keep this low unless you need a guaranteed refresh floor."
         }
         JepaControlSliderKind::DenseFallbackDensity => {
-            "Route very dense sparse masks to dense JEPA when sparse overhead would dominate."
+            "Route very dense direct patch-diff masks to dense JEPA before dilation."
         }
         JepaControlSliderKind::PcaUpdateEvery => {
             "Rolling PCA cadence in processed frames. Zero locks the current projection."

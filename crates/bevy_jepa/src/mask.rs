@@ -3,8 +3,9 @@ use burn::tensor::Tensor;
 use burn_jepa::{
     FeatureFrameSparseMasks, PatchDiffRefreshState, SparseTokenMask, TokenGridShape, VJepaConfig,
     center_prior_mask, finalize_patch_diff_masks, patch_diff_can_use_dense_fast_path,
-    patch_diff_context_mask_from_video, patch_diff_sampled_dense_fast_path_from_rgba,
-    patch_diff_scores_from_rgba, patch_diff_sparsity_config,
+    patch_diff_context_mask_from_video, patch_diff_masks_from_scores,
+    patch_diff_sampled_dense_fast_path_from_rgba, patch_diff_scores_from_rgba,
+    patch_diff_sparsity_config,
 };
 use image::RgbaImage;
 
@@ -170,8 +171,7 @@ fn patch_diff_mask_from_rgba(
     if let Some(refresh_state) = refresh_state {
         refresh_state.masks_from_scores(scores, grid, &sparsity, config)
     } else {
-        let mask = burn_jepa::patch_diff_context_mask_from_scores(scores, grid, &sparsity)?;
-        Ok(finalize_patch_diff_masks(mask, grid, config))
+        patch_diff_masks_from_scores(scores, grid, &sparsity, config)
     }
 }
 

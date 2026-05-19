@@ -170,6 +170,10 @@ name = "video_gallery_e2e"
 path = "examples/video_gallery_e2e.rs"
 required-features = ["ndarray"]
 
+[[example]]
+name = "reconstruction_e2e"
+path = "examples/reconstruction_e2e.rs"
+
 [profile.dev]
 opt-level = 3
 debug-assertions = false

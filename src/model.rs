@@ -91,6 +91,32 @@ impl<B: Backend> PatchEmbed3d<B> {
         x.reshape([batch, dim, depth * height * width])
             .swap_dims(1, 2)
     }
+
+    pub fn with_require_grad(mut self, require_grad: bool) -> Self {
+        self.proj = conv3d_require_grad(self.proj, require_grad);
+        self
+    }
+}
+
+fn linear_require_grad<B: Backend>(mut layer: Linear<B>, require_grad: bool) -> Linear<B> {
+    layer.weight = layer.weight.set_require_grad(require_grad);
+    layer.bias = layer.bias.map(|bias| bias.set_require_grad(require_grad));
+    layer
+}
+
+fn conv3d_require_grad<B: Backend>(mut layer: Conv3d<B>, require_grad: bool) -> Conv3d<B> {
+    layer.weight = layer.weight.set_require_grad(require_grad);
+    layer.bias = layer.bias.map(|bias| bias.set_require_grad(require_grad));
+    layer
+}
+
+fn layer_norm_require_grad<B: Backend>(
+    mut layer: LayerNorm<B>,
+    require_grad: bool,
+) -> LayerNorm<B> {
+    layer.gamma = layer.gamma.set_require_grad(require_grad);
+    layer.beta = layer.beta.map(|beta| beta.set_require_grad(require_grad));
+    layer
 }
 
 #[derive(Module, Debug)]
@@ -160,6 +186,12 @@ impl<B: Backend> VJepaSelfAttention<B> {
             .reshape([batch, tokens, dim]);
         self.proj.forward(out)
     }
+
+    pub fn with_require_grad(mut self, require_grad: bool) -> Self {
+        self.qkv = linear_require_grad(self.qkv, require_grad);
+        self.proj = linear_require_grad(self.proj, require_grad);
+        self
+    }
 }
 
 #[derive(Module, Debug)]
@@ -179,6 +211,12 @@ impl<B: Backend> VJepaMlp<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         self.fc2.forward(activation::gelu(self.fc1.forward(x)))
+    }
+
+    pub fn with_require_grad(mut self, require_grad: bool) -> Self {
+        self.fc1 = linear_require_grad(self.fc1, require_grad);
+        self.fc2 = linear_require_grad(self.fc2, require_grad);
+        self
     }
 }
 
@@ -219,6 +257,20 @@ impl<B: Backend> TransformerBlock<B> {
         let y = self.attn.forward(self.norm1.forward(x.clone()), positions);
         let x = x + y;
         x.clone() + self.mlp.forward(self.norm2.forward(x))
+    }
+
+    pub fn with_require_grad(mut self, require_grad: bool) -> Self {
+        self.norm1 = layer_norm_require_grad(self.norm1, require_grad);
+        self.attn = self.attn.with_require_grad(require_grad);
+        self.norm2 = layer_norm_require_grad(self.norm2, require_grad);
+        self.mlp = self.mlp.with_require_grad(require_grad);
+        self
+    }
+
+    pub fn with_norms_require_grad(mut self, require_grad: bool) -> Self {
+        self.norm1 = layer_norm_require_grad(self.norm1, require_grad);
+        self.norm2 = layer_norm_require_grad(self.norm2, require_grad);
+        self
     }
 }
 
@@ -402,6 +454,43 @@ impl<B: Backend> VJepaEncoder<B> {
             config: config.clone(),
             hierarchical_layers,
         }
+    }
+
+    pub fn with_norms_require_grad(mut self, require_grad: bool) -> Self {
+        self.blocks = self
+            .blocks
+            .into_iter()
+            .map(|block| block.with_norms_require_grad(require_grad))
+            .collect();
+        self.norms_block = self
+            .norms_block
+            .into_iter()
+            .map(|norm| layer_norm_require_grad(norm, require_grad))
+            .collect();
+        self
+    }
+
+    pub fn with_last_blocks_require_grad(mut self, count: usize, require_grad: bool) -> Self {
+        let depth = self.blocks.len();
+        let first_trainable = depth.saturating_sub(count);
+        self.blocks = self
+            .blocks
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| {
+                if index >= first_trainable {
+                    block.with_require_grad(require_grad)
+                } else {
+                    block
+                }
+            })
+            .collect();
+        self.norms_block = self
+            .norms_block
+            .into_iter()
+            .map(|norm| layer_norm_require_grad(norm, require_grad))
+            .collect();
+        self
     }
 
     pub fn forward_video(

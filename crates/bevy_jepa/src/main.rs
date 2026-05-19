@@ -134,13 +134,17 @@ struct Cli {
     patch_diff_threshold: f32,
     #[arg(long)]
     patch_diff_quality: Option<f32>,
-    #[arg(long, default_value_t = DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY)]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
+        help = "Promote near-dense direct patch-diff masks to dense JEPA before dilation."
+    )]
     patch_diff_dense_fallback_density: f32,
     #[arg(
         long,
         visible_alias = "patch-diff-dilation-tiles",
         default_value_t = DEFAULT_PATCH_DIFF_DILATION_TILES,
-        help = "Tile-radius dilation applied to direct patch-diff hits before refresh/noise/age additions. Use 0 to disable expansion."
+        help = "Tile-radius dilation applied after direct dense cutoff and before refresh/noise/age additions. Use 0 to disable expansion."
     )]
     patch_diff_dilation: usize,
     #[arg(

@@ -3,7 +3,7 @@ checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 teacher_checkpoint_dir = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384"
 config_path = "/home/mosure/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384/config.json"
 weights_name = "model.pt"
-output_dir = "target/burn-jepa-production-final-256/stage1-stream-tbptt-inplace-mlp-thirds"
+output_dir = "target/burn-jepa-production-final-256/stage1-stream-tbptt-inplace-mlp-strict-thirds"
 save_model = true
 
 [dataset]
@@ -19,19 +19,16 @@ repeat_count = 16
 repeat_mode = "continuous_streams"
 
 [ttt]
-insertion = "in_place_mlp"
+insertion = "in_place_mlp_strict"
 layer_placement = "explicit"
 layers = [3, 7, 11]
 predictor_layers = []
 chunk_tokens = 196
-ttt_lr = 0.003
+ttt_lr = 0.00003
 use_projection = true
 conv_kernel = 3
 memory_update = "self_hidden"
-memory_dynamics = "memory_alibi"
-memory_alibi_half_lives = [8, 64, 512]
-memory_alibi_read_weights = [0.45, 0.35, 0.20]
-memory_alibi_update_weights = [1.0, 1.0, 1.0]
+memory_dynamics = "ema"
 memory_clip_rms = 16.0
 supervision = "final_teacher"
 hybrid_final_steps = 1
@@ -47,6 +44,7 @@ batch_size = 2
 max_steps = 512
 learning_rate = 0.00000075
 weight_decay = 0.0
+gradient_clip_norm = 0.5
 context_keep_ratio = 0.75
 sparse_rollout = "context_mask"
 sparse_patchify_training = "frozen_sparse_patchify"

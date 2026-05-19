@@ -289,6 +289,8 @@ pub enum BurnJepaCommand {
         image_size: usize,
         #[arg(long, default_value_t = 2)]
         frames: usize,
+        #[arg(long, default_value = "image")]
+        feature_source: String,
         #[arg(long, default_value_t = 512)]
         max_samples: usize,
         #[arg(long, default_value_t = 0.10)]
@@ -660,6 +662,7 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             image_dirs,
             image_size,
             frames,
+            feature_source,
             max_samples,
             val_split,
             steps,
@@ -691,6 +694,7 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             let reconstruction_architecture =
                 parse_reconstruction_architecture(&reconstruction_architecture)?;
             let output_activation = parse_reconstruction_output_activation(&output_activation)?;
+            let feature_source = parse_reconstruction_feature_source(&feature_source)?;
             let report = crate::reconstruction_training::train_reconstruction_bpk(
                 crate::reconstruction_training::ReconstructionTrainingOptions {
                     backend,
@@ -703,6 +707,7 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
                     image_dirs,
                     image_size,
                     frames,
+                    feature_source,
                     max_samples,
                     val_split,
                     steps,
@@ -854,6 +859,22 @@ fn parse_reconstruction_architecture(value: &str) -> Result<crate::JepaReconstru
         other => bail!(
             "unsupported reconstruction architecture `{other}`; expected residual-uniform, pyramid-convnext, patch-linear, or patch-conv"
         ),
+    }
+}
+
+fn parse_reconstruction_feature_source(
+    value: &str,
+) -> Result<crate::reconstruction_training::ReconstructionFeatureSource> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "image" | "single-frame" | "single" | "runtime" | "feature-frame" => {
+            Ok(crate::reconstruction_training::ReconstructionFeatureSource::Image)
+        }
+        "video" | "temporal" | "tubelet" | "legacy" => {
+            Ok(crate::reconstruction_training::ReconstructionFeatureSource::Video)
+        }
+        other => {
+            bail!("unsupported reconstruction feature source `{other}`; expected image or video")
+        }
     }
 }
 

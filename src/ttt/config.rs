@@ -32,6 +32,7 @@ pub enum TttInsertionMode {
     #[default]
     Adapter,
     InPlaceMlp,
+    InPlaceMlpStrict,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -64,6 +65,16 @@ pub enum TttLayerPlacement {
     Thirds,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TttPretrainedTrainScope {
+    #[default]
+    Frozen,
+    Norms,
+    LastNBlocks,
+    All,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TttEncoderConfig {
@@ -90,6 +101,8 @@ pub struct TttEncoderConfig {
     pub backprop_mode: TttBackpropMode,
     pub backprop_truncate_blocks: usize,
     pub freeze_pretrained: bool,
+    pub pretrained_train_scope: TttPretrainedTrainScope,
+    pub pretrained_train_last_n_blocks: usize,
 }
 
 fn is_default_target_mode(mode: &TttTargetMode) -> bool {
@@ -121,6 +134,8 @@ impl Default for TttEncoderConfig {
             backprop_mode: TttBackpropMode::FinalFeature,
             backprop_truncate_blocks: 1,
             freeze_pretrained: true,
+            pretrained_train_scope: TttPretrainedTrainScope::Frozen,
+            pretrained_train_last_n_blocks: 0,
         }
     }
 }
@@ -134,6 +149,12 @@ impl TttEncoderConfig {
             self.memory_clip_rms.is_finite() && self.memory_clip_rms >= 0.0,
             "ttt.memory_clip_rms must be finite and non-negative"
         );
+        if self.insertion == TttInsertionMode::InPlaceMlpStrict {
+            ensure!(
+                self.memory_dynamics == TttMemoryDynamics::Ema,
+                "ttt.insertion=in_place_mlp_strict implements the paper-style single fast down-projection cache and requires ttt.memory_dynamics=ema"
+            );
+        }
         if self.memory_dynamics == TttMemoryDynamics::MemoryAlibi {
             let half_lives = self.resolved_memory_alibi_half_lives();
             ensure!(
@@ -173,6 +194,18 @@ impl TttEncoderConfig {
             self.hybrid_final_steps > 0 || self.supervision != TttSupervisionMode::Hybrid,
             "ttt.hybrid_final_steps must be nonzero when ttt.supervision=hybrid"
         );
+        if self.freeze_pretrained {
+            ensure!(
+                self.pretrained_train_scope != TttPretrainedTrainScope::All,
+                "ttt.pretrained_train_scope=all requires ttt.freeze_pretrained=false"
+            );
+        }
+        if self.pretrained_train_scope == TttPretrainedTrainScope::LastNBlocks {
+            ensure!(
+                self.pretrained_train_last_n_blocks > 0,
+                "ttt.pretrained_train_last_n_blocks must be nonzero when ttt.pretrained_train_scope=last_n_blocks"
+            );
+        }
         for layer in self.resolved_layers(config) {
             ensure!(
                 layer < config.encoder.depth.max(1),
@@ -188,6 +221,13 @@ impl TttEncoderConfig {
             );
         }
         Ok(())
+    }
+
+    pub fn resolved_pretrained_train_scope(&self) -> TttPretrainedTrainScope {
+        if !self.freeze_pretrained {
+            return TttPretrainedTrainScope::All;
+        }
+        self.pretrained_train_scope
     }
 
     pub fn resolved_layers(&self, config: &VJepaConfig) -> Vec<usize> {
@@ -267,6 +307,16 @@ impl TttEncoderConfig {
             &default_memory_alibi_update_weights(),
             self.resolved_memory_alibi_half_lives().len(),
         )
+    }
+}
+
+impl TttInsertionMode {
+    pub fn is_in_place(self) -> bool {
+        matches!(self, Self::InPlaceMlp | Self::InPlaceMlpStrict)
+    }
+
+    pub fn is_strict_in_place(self) -> bool {
+        matches!(self, Self::InPlaceMlpStrict)
     }
 }
 

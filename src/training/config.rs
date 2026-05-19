@@ -1,7 +1,8 @@
 use super::mask::TrainingMaskConfig;
 use crate::{
     JepaDatasetConfig, JepaSampleMetadata, SparseTokenMask, TokenGridShape, TttEncoderConfig,
-    VJepaConfig, VJepaLoadOptions, load_config_from_hf_dir, video_token_grid,
+    TttPretrainedTrainScope, VJepaConfig, VJepaLoadOptions, load_config_from_hf_dir,
+    video_token_grid,
 };
 use anyhow::{Context, Result, ensure};
 use burn::tensor::Tensor;
@@ -80,9 +81,14 @@ impl BurnJepaTrainConfig {
         let model_config = self.model_config_for_validation()?;
         let encoder_layers = self.ttt.resolved_layers(&model_config);
         let predictor_layers = self.ttt.resolved_predictor_layers(&model_config);
+        let trainable_image_to_video_baseline = self.ttt.resolved_pretrained_train_scope()
+            != TttPretrainedTrainScope::Frozen
+            && self.loss.feature_loss_weight > 0.0;
         ensure!(
-            !encoder_layers.is_empty() || !predictor_layers.is_empty(),
-            "train-ttt requires at least one TTT layer"
+            !encoder_layers.is_empty()
+                || !predictor_layers.is_empty()
+                || trainable_image_to_video_baseline,
+            "train-ttt requires at least one TTT layer, or a non-frozen pretrained train scope with feature loss for no-TTT image-to-video distillation"
         );
         ensure!(
             predictor_layers.is_empty() || self.loss.predictor_loss_weight > 0.0,
@@ -138,6 +144,21 @@ impl BurnJepaTrainConfig {
             !self.training.dense_samples.enabled || self.loss.predictor_loss_weight <= 0.0,
             "training.dense_samples currently requires loss.predictor_loss_weight=0"
         );
+        if self.training.teacher_window_frames > 0 {
+            let tubelet = model_config.tubelet_size.max(1);
+            ensure!(
+                self.training.teacher_window_frames >= tubelet,
+                "training.teacher_window_frames must be at least the V-JEPA tubelet size"
+            );
+            ensure!(
+                self.training.teacher_window_frames.is_multiple_of(tubelet),
+                "training.teacher_window_frames must be divisible by the V-JEPA tubelet size"
+            );
+            ensure!(
+                self.training.teacher_window_frames == self.dataset.frames,
+                "training.teacher_window_frames currently formalizes rolling teacher windows by requiring dataset.frames to equal the teacher window; use carried stream state for earlier context instead of adding future frames to the teacher sample"
+            );
+        }
         self.ttt.validate(&model_config)?;
         Ok(())
     }
@@ -218,6 +239,7 @@ pub struct TrainingLoopConfig {
     pub eval_utilization_diagnostics: bool,
     pub eval_temporal_diagnostics: bool,
     pub eval_feature_stability_diagnostics: bool,
+    pub teacher_window_frames: usize,
     pub cache_teacher_tokens: bool,
     pub teacher_cache_max_entries: usize,
     pub prefetch_batches: bool,
@@ -249,6 +271,7 @@ impl Default for TrainingLoopConfig {
             eval_utilization_diagnostics: false,
             eval_temporal_diagnostics: false,
             eval_feature_stability_diagnostics: false,
+            teacher_window_frames: 0,
             cache_teacher_tokens: false,
             teacher_cache_max_entries: 32,
             prefetch_batches: false,
