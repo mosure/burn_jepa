@@ -473,11 +473,16 @@ fn control_actions_switch_dense_and_sparse_pipeline_presets() {
 
 #[test]
 fn control_actions_preserve_pca_settings_across_pipeline_changes() {
-    let mut config = BevyJepaConfig::default();
-    config.pca_update_every = 23;
-    config.pca_sample_window_frames = 41;
-    config.pca_min_sample_frames = 7;
-    config.pca_update_iterations = 5;
+    let mut config = BevyJepaConfig {
+        pipeline: FeatureFrameViewerConfig {
+            pca_update_every: 23,
+            pca_sample_window_frames: 41,
+            pca_min_sample_frames: 7,
+            pca_update_iterations: 5,
+            ..FeatureFrameViewerConfig::default()
+        },
+        ..BevyJepaConfig::default()
+    };
     let pca = PcaControlSettings::capture(&config);
 
     for action in [
@@ -513,11 +518,16 @@ fn control_actions_preserve_pca_settings_across_pipeline_changes() {
 
 #[test]
 fn control_sliders_preserve_pca_settings_for_non_pca_fields() {
-    let mut config = BevyJepaConfig::default();
-    config.pca_update_every = 17;
-    config.pca_sample_window_frames = 37;
-    config.pca_min_sample_frames = 11;
-    config.pca_update_iterations = 6;
+    let mut config = BevyJepaConfig {
+        pipeline: FeatureFrameViewerConfig {
+            pca_update_every: 17,
+            pca_sample_window_frames: 37,
+            pca_min_sample_frames: 11,
+            pca_update_iterations: 6,
+            ..FeatureFrameViewerConfig::default()
+        },
+        ..BevyJepaConfig::default()
+    };
     let pca = PcaControlSettings::capture(&config);
 
     for kind in [

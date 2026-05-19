@@ -46,6 +46,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(target_arch = "wasm32"))]
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(target_arch = "wasm32"))]
+const DOWNLOAD_PROGRESS_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -822,23 +824,16 @@ where
         .manifest_url
         .clone()
         .unwrap_or_else(|| join_url(&config.model_base_url, "manifest.json"));
-    progress(format!(
-        "downloading burn_jepa package manifest {manifest_url}"
-    ));
-    ensure_file_cached(&manifest_path, &manifest_url, true)?;
-
-    let manifest_json = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("read package manifest {}", manifest_path.display()))?;
-    let manifest = BurnJepaPipelinePackageManifest::from_json_str(&manifest_json)
-        .with_context(|| format!("parse package manifest {}", manifest_path.display()))?;
+    let manifest = read_or_download_burn_jepa_manifest(&manifest_path, &manifest_url, &progress)?;
     let parts_manifest_url = resolve_manifest_entry_url(&manifest_url, &manifest.parts_manifest);
     let parts_manifest_path = safe_cache_entry_path(&cache_root, &manifest.parts_manifest)?;
 
-    progress(format!(
-        "downloading burn_jepa parts manifest {parts_manifest_url}"
-    ));
-    ensure_file_cached(&parts_manifest_path, &parts_manifest_url, true)?;
-    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
+    let parts_manifest = read_or_download_parts_manifest(
+        &parts_manifest_path,
+        &parts_manifest_url,
+        "burn_jepa",
+        &progress,
+    )?;
     if parts_manifest.parts.is_empty() {
         bail!(
             "burn_jepa parts manifest {} contains no parts",
@@ -847,23 +842,42 @@ where
     }
 
     let total_parts = parts_manifest.parts.len();
+    let mut cached_parts = 0usize;
+    let mut cached_bytes = 0u64;
+    let mut missing_parts = Vec::new();
     for (index, part) in parts_manifest.parts.iter().enumerate() {
         let part_path = safe_cache_entry_path(&cache_root, &part.path)?;
         if part_matches_cache(&part_path, part)? {
-            progress(format!(
-                "cached burn_jepa shard {}/{}",
-                index + 1,
-                total_parts
-            ));
-            continue;
+            cached_parts += 1;
+            cached_bytes = cached_bytes.saturating_add(part.bytes);
+        } else {
+            missing_parts.push((index, part, part_path));
         }
-        let part_url = resolve_manifest_entry_url(&parts_manifest_url, &part.path);
+    }
+    if cached_parts > 0 {
         progress(format!(
-            "downloading burn_jepa shard {}/{}",
-            index + 1,
-            total_parts
+            "using cached burn_jepa shards {cached_parts}/{total_parts} ({})",
+            format_bytes(cached_bytes)
         ));
-        ensure_file_cached(&part_path, &part_url, false)?;
+    }
+    for (index, part, part_path) in missing_parts {
+        let part_url = part_download_url(
+            &resolve_manifest_entry_url(&parts_manifest_url, &part.path),
+            part,
+        );
+        progress(format!(
+            "downloading burn_jepa shard {}/{} ({})",
+            index + 1,
+            total_parts,
+            format_bytes(part.bytes)
+        ));
+        ensure_file_cached_with_progress(
+            &part_path,
+            &part_url,
+            true,
+            &format!("burn_jepa shard {}/{}", index + 1, total_parts),
+            &progress,
+        )?;
         if !part_matches_cache(&part_path, part)? {
             bail!(
                 "downloaded burn_jepa shard `{}` does not match manifest entry",
@@ -924,23 +938,16 @@ where
         .manifest_url
         .clone()
         .unwrap_or_else(|| join_url(&config.model_base_url, "manifest.json"));
-    progress(format!(
-        "downloading burn_anyup package manifest {manifest_url}"
-    ));
-    ensure_file_cached(&manifest_path, &manifest_url, true)?;
-
-    let manifest_json = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("read AnyUp package manifest {}", manifest_path.display()))?;
-    let manifest = BurnAnyUpPackageManifest::from_json_str(&manifest_json)
-        .with_context(|| format!("parse AnyUp package manifest {}", manifest_path.display()))?;
+    let manifest = read_or_download_burn_anyup_manifest(&manifest_path, &manifest_url, &progress)?;
     let parts_manifest_url = resolve_manifest_entry_url(&manifest_url, &manifest.parts_manifest);
     let parts_manifest_path = safe_cache_entry_path(&cache_root, &manifest.parts_manifest)?;
 
-    progress(format!(
-        "downloading burn_anyup parts manifest {parts_manifest_url}"
-    ));
-    ensure_file_cached(&parts_manifest_path, &parts_manifest_url, true)?;
-    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
+    let parts_manifest = read_or_download_parts_manifest(
+        &parts_manifest_path,
+        &parts_manifest_url,
+        "burn_anyup",
+        &progress,
+    )?;
     if parts_manifest.parts.is_empty() {
         bail!(
             "burn_anyup parts manifest {} contains no parts",
@@ -949,23 +956,42 @@ where
     }
 
     let total_parts = parts_manifest.parts.len();
+    let mut cached_parts = 0usize;
+    let mut cached_bytes = 0u64;
+    let mut missing_parts = Vec::new();
     for (index, part) in parts_manifest.parts.iter().enumerate() {
         let part_path = safe_cache_entry_path(&cache_root, &part.path)?;
         if part_matches_cache(&part_path, part)? {
-            progress(format!(
-                "cached burn_anyup shard {}/{}",
-                index + 1,
-                total_parts
-            ));
-            continue;
+            cached_parts += 1;
+            cached_bytes = cached_bytes.saturating_add(part.bytes);
+        } else {
+            missing_parts.push((index, part, part_path));
         }
-        let part_url = resolve_manifest_entry_url(&parts_manifest_url, &part.path);
+    }
+    if cached_parts > 0 {
         progress(format!(
-            "downloading burn_anyup shard {}/{}",
-            index + 1,
-            total_parts
+            "using cached burn_anyup shards {cached_parts}/{total_parts} ({})",
+            format_bytes(cached_bytes)
         ));
-        ensure_file_cached(&part_path, &part_url, false)?;
+    }
+    for (index, part, part_path) in missing_parts {
+        let part_url = part_download_url(
+            &resolve_manifest_entry_url(&parts_manifest_url, &part.path),
+            part,
+        );
+        progress(format!(
+            "downloading burn_anyup shard {}/{} ({})",
+            index + 1,
+            total_parts,
+            format_bytes(part.bytes)
+        ));
+        ensure_file_cached_with_progress(
+            &part_path,
+            &part_url,
+            true,
+            &format!("burn_anyup shard {}/{}", index + 1, total_parts),
+            &progress,
+        )?;
         if !part_matches_cache(&part_path, part)? {
             bail!(
                 "downloaded burn_anyup shard `{}` does not match manifest entry",
@@ -1800,7 +1826,138 @@ fn cached_anyup_package_files(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn ensure_file_cached(path: &Path, url: &str, overwrite: bool) -> Result<()> {
+fn read_or_download_burn_jepa_manifest<F>(
+    manifest_path: &Path,
+    manifest_url: &str,
+    progress: &F,
+) -> Result<BurnJepaPipelinePackageManifest>
+where
+    F: Fn(String),
+{
+    if manifest_path.exists() {
+        match read_burn_jepa_package_manifest(manifest_path) {
+            Ok(manifest) => {
+                progress("using cached burn_jepa package manifest".to_string());
+                return Ok(manifest);
+            }
+            Err(err) => {
+                progress(format!(
+                    "refreshing invalid cached burn_jepa package manifest: {err:#}"
+                ));
+            }
+        }
+    }
+    progress(format!(
+        "downloading burn_jepa package manifest {manifest_url}"
+    ));
+    ensure_file_cached_with_progress(
+        manifest_path,
+        manifest_url,
+        true,
+        "burn_jepa package manifest",
+        progress,
+    )?;
+    read_burn_jepa_package_manifest(manifest_path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_burn_jepa_package_manifest(path: &Path) -> Result<BurnJepaPipelinePackageManifest> {
+    let manifest_json = fs::read_to_string(path)
+        .with_context(|| format!("read package manifest {}", path.display()))?;
+    BurnJepaPipelinePackageManifest::from_json_str(&manifest_json)
+        .with_context(|| format!("parse package manifest {}", path.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_or_download_burn_anyup_manifest<F>(
+    manifest_path: &Path,
+    manifest_url: &str,
+    progress: &F,
+) -> Result<BurnAnyUpPackageManifest>
+where
+    F: Fn(String),
+{
+    if manifest_path.exists() {
+        match read_burn_anyup_package_manifest(manifest_path) {
+            Ok(manifest) => {
+                progress("using cached burn_anyup package manifest".to_string());
+                return Ok(manifest);
+            }
+            Err(err) => {
+                progress(format!(
+                    "refreshing invalid cached burn_anyup package manifest: {err:#}"
+                ));
+            }
+        }
+    }
+    progress(format!(
+        "downloading burn_anyup package manifest {manifest_url}"
+    ));
+    ensure_file_cached_with_progress(
+        manifest_path,
+        manifest_url,
+        true,
+        "burn_anyup package manifest",
+        progress,
+    )?;
+    read_burn_anyup_package_manifest(manifest_path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_burn_anyup_package_manifest(path: &Path) -> Result<BurnAnyUpPackageManifest> {
+    let manifest_json = fs::read_to_string(path)
+        .with_context(|| format!("read AnyUp package manifest {}", path.display()))?;
+    BurnAnyUpPackageManifest::from_json_str(&manifest_json)
+        .with_context(|| format!("parse AnyUp package manifest {}", path.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_or_download_parts_manifest<F>(
+    parts_manifest_path: &Path,
+    parts_manifest_url: &str,
+    package: &str,
+    progress: &F,
+) -> Result<BurnpackPartsManifest>
+where
+    F: Fn(String),
+{
+    if parts_manifest_path.exists() {
+        match read_parts_manifest(parts_manifest_path) {
+            Ok(manifest) => {
+                progress(format!("using cached {package} parts manifest"));
+                return Ok(manifest);
+            }
+            Err(err) => {
+                progress(format!(
+                    "refreshing invalid cached {package} parts manifest: {err:#}"
+                ));
+            }
+        }
+    }
+    progress(format!(
+        "downloading {package} parts manifest {parts_manifest_url}"
+    ));
+    ensure_file_cached_with_progress(
+        parts_manifest_path,
+        parts_manifest_url,
+        true,
+        &format!("{package} parts manifest"),
+        progress,
+    )?;
+    read_parts_manifest(parts_manifest_path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_file_cached_with_progress<F>(
+    path: &Path,
+    url: &str,
+    overwrite: bool,
+    label: &str,
+    progress: &F,
+) -> Result<()>
+where
+    F: Fn(String),
+{
     if path.exists() && !overwrite {
         return Ok(());
     }
@@ -1808,7 +1965,12 @@ fn ensure_file_cached(path: &Path, url: &str, overwrite: bool) -> Result<()> {
     let tmp = temp_download_path(path);
     let mut last_error = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match download_to_file(url, &tmp) {
+        match download_to_file(url, &tmp, |downloaded, expected| {
+            progress(format!(
+                "downloading {label}: {}",
+                format_download_progress(downloaded, expected)
+            ));
+        }) {
             Ok(()) => {
                 if path.exists() {
                     fs::remove_file(path)
@@ -1840,18 +2002,28 @@ fn ensure_file_cached(path: &Path, url: &str, overwrite: bool) -> Result<()> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn download_to_file(url: &str, destination: &Path) -> Result<(), String> {
+fn download_to_file<F>(url: &str, destination: &Path, progress: F) -> Result<(), String>
+where
+    F: Fn(u64, Option<u64>),
+{
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(READ_TIMEOUT)
         .timeout_write(WRITE_TIMEOUT)
         .build();
-    let response = agent.get(url).call().map_err(|err| match err {
-        ureq::Error::Status(code, response) => {
-            format!("HTTP {code} ({})", response.status_text())
-        }
-        ureq::Error::Transport(transport) => format!("transport error: {transport}"),
-    })?;
+    let response = agent
+        .get(url)
+        .set("Accept", "*/*")
+        .set("Accept-Encoding", "identity")
+        .set("Cache-Control", "no-cache")
+        .set("Pragma", "no-cache")
+        .call()
+        .map_err(|err| match err {
+            ureq::Error::Status(code, response) => {
+                format!("HTTP {code} ({})", response.status_text())
+            }
+            ureq::Error::Transport(transport) => format!("transport error: {transport}"),
+        })?;
     let expected_len = response
         .header("Content-Length")
         .and_then(|value| value.parse::<u64>().ok());
@@ -1859,6 +2031,7 @@ fn download_to_file(url: &str, destination: &Path) -> Result<(), String> {
     let mut writer = fs::File::create(destination)
         .map_err(|err| format!("failed to create {}: {err}", destination.display()))?;
     let mut total = 0u64;
+    let mut next_progress = DOWNLOAD_PROGRESS_BYTES;
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let read = reader
@@ -1871,6 +2044,10 @@ fn download_to_file(url: &str, destination: &Path) -> Result<(), String> {
             .write_all(&buffer[..read])
             .map_err(|err| format!("failed writing {}: {err}", destination.display()))?;
         total = total.saturating_add(read as u64);
+        if total >= next_progress {
+            progress(total, expected_len);
+            next_progress = total.saturating_add(DOWNLOAD_PROGRESS_BYTES);
+        }
     }
     writer
         .flush()
@@ -1885,6 +2062,7 @@ fn download_to_file(url: &str, destination: &Path) -> Result<(), String> {
             "content-length mismatch (expected {expected} bytes, wrote {total} bytes)"
         ));
     }
+    progress(total, expected_len);
     Ok(())
 }
 
@@ -1922,6 +2100,15 @@ fn resolve_manifest_entry_url(manifest_url: &str, entry_url: &str) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn part_download_url(url: &str, part: &BurnpackPartEntry) -> String {
+    if part.sha256.is_empty() {
+        return url.to_string();
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}sha256={}", part.sha256)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn join_url(base: &str, child: &str) -> String {
     let mut out = base.trim_end_matches('/').to_string();
     out.push('/');
@@ -1933,6 +2120,36 @@ fn join_url(base: &str, child: &str) -> String {
 fn retry_delay(attempt: u32) -> Duration {
     let capped = attempt.min(6);
     Duration::from_millis(600_u64.saturating_mul(1_u64 << capped))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_download_progress(downloaded: u64, expected: Option<u64>) -> String {
+    match expected {
+        Some(expected) if expected > 0 => format!(
+            "{} / {} ({:.1}%)",
+            format_bytes(downloaded),
+            format_bytes(expected),
+            (downloaded as f64 / expected as f64 * 100.0).clamp(0.0, 100.0)
+        ),
+        _ => format!("{} downloaded", format_bytes(downloaded)),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.1} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2020,7 +2237,7 @@ mod tests {
     use crate::VJepaConfig;
     use std::net::TcpListener;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::thread;
@@ -2354,6 +2571,80 @@ mod tests {
     }
 
     #[test]
+    fn native_bootstrap_replaces_invalid_shard_without_refetching_manifests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("remote");
+        fs::create_dir_all(&source).expect("remote dir");
+        let (_manifest_path, parts) = write_tiny_package(&source, 1024);
+        assert!(parts.part_paths.len() > 1);
+
+        let cache_root = temp.path().join("cache");
+        fs::create_dir_all(&cache_root).expect("cache dir");
+        fs::copy(
+            source.join("manifest.json"),
+            cache_root.join("manifest.json"),
+        )
+        .expect("copy package manifest");
+        let parts_manifest_name =
+            file_name_string(&parts.manifest_path).expect("parts manifest name");
+        fs::copy(&parts.manifest_path, cache_root.join(&parts_manifest_name))
+            .expect("copy parts manifest");
+        let parts_manifest = read_parts_manifest(&parts.manifest_path).expect("parts manifest");
+        let corrupt_part = parts_manifest
+            .parts
+            .first()
+            .expect("at least one part")
+            .path
+            .clone();
+        for part in &parts_manifest.parts {
+            let source_part = resolve_part_entry_path(&parts.manifest_path, &part.path)
+                .expect("source part path");
+            let cache_part = cache_root.join(&part.path);
+            ensure_parent_dir(&cache_part).expect("part parent");
+            fs::copy(&source_part, &cache_part).expect("copy cached shard");
+        }
+        fs::write(cache_root.join(&corrupt_part), b"corrupt shard").expect("corrupt shard");
+
+        let server = TestServer::serve(source);
+        let config = BurnJepaModelBootstrapConfig {
+            cache_root: Some(cache_root.clone()),
+            model_profile: BurnJepaModelProfile::Vjepa21Base,
+            model_base_url: server.base_url.clone(),
+            manifest_url: None,
+        };
+
+        let package = resolve_or_bootstrap_burn_jepa_model_package_with_config(&config)
+            .expect("repair corrupted package cache");
+        assert!(burn_jepa_model_package_cache_complete(&package.manifest_path).unwrap());
+        assert_eq!(package.part_paths.len(), parts.part_paths.len());
+
+        let paths = server.request_paths();
+        let path_entries = paths
+            .iter()
+            .map(|path| path.split('?').next().unwrap_or(path.as_str()))
+            .collect::<Vec<_>>();
+        let parts_manifest_request = format!("/{parts_manifest_name}");
+        let corrupt_part_request = format!("/{corrupt_part}");
+        assert!(
+            !path_entries.contains(&"/manifest.json"),
+            "cached package manifest should not be refetched: {paths:?}"
+        );
+        assert!(
+            !path_entries.contains(&parts_manifest_request.as_str()),
+            "cached parts manifest should not be refetched: {paths:?}"
+        );
+        assert!(
+            path_entries.contains(&corrupt_part_request.as_str()),
+            "corrupt shard should be redownloaded: {paths:?}"
+        );
+        assert_eq!(
+            paths.len(),
+            1,
+            "only the corrupt shard should be fetched: {paths:?}"
+        );
+    }
+
+    #[test]
     fn native_anyup_bootstrap_downloads_and_reuses_sharded_package_cache() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("remote-anyup");
@@ -2388,6 +2679,7 @@ mod tests {
     struct TestServer {
         base_url: String,
         requests: Arc<AtomicUsize>,
+        paths: Arc<Mutex<Vec<String>>>,
         stop: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<()>>,
     }
@@ -2398,8 +2690,10 @@ mod tests {
             listener.set_nonblocking(true).expect("nonblocking");
             let addr = listener.local_addr().expect("addr");
             let requests = Arc::new(AtomicUsize::new(0));
+            let paths = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let thread_requests = requests.clone();
+            let thread_paths = paths.clone();
             let thread_stop = stop.clone();
             let handle = thread::spawn(move || {
                 while !thread_stop.load(Ordering::SeqCst) {
@@ -2414,6 +2708,10 @@ mod tests {
                                 .next()
                                 .and_then(|line| line.split_whitespace().nth(1))
                                 .unwrap_or("/");
+                            thread_paths
+                                .lock()
+                                .expect("request path lock")
+                                .push(path.to_string());
                             let rel = path.trim_start_matches('/').split('?').next().unwrap_or("");
                             let file_path = root.join(rel);
                             let (status, body) = match fs::read(&file_path) {
@@ -2438,9 +2736,14 @@ mod tests {
             Self {
                 base_url: format!("http://{addr}"),
                 requests,
+                paths,
                 stop,
                 handle: Some(handle),
             }
+        }
+
+        fn request_paths(&self) -> Vec<String> {
+            self.paths.lock().expect("request paths").clone()
         }
     }
 

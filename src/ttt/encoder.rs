@@ -2289,9 +2289,8 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
                 update_fast_weight,
             )?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -2557,9 +2556,8 @@ impl VJepaTttEncoder<burn::backend::Wgpu<f32, i32>> {
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -2711,9 +2709,8 @@ impl VJepaTttEncoder<burn_flex_gmm::cuda::DefaultCudaBackend> {
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -2810,9 +2807,8 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -3011,9 +3007,8 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
                 state,
             )?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -3102,9 +3097,7 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::wgpu::DefaultWgpuBac
                     max_tokens,
                 ));
             }
-            for (layer_outputs, tokens) in hierarchical_outputs
-                .iter_mut()
-                .zip(encoded.hierarchical.into_iter())
+            for (layer_outputs, tokens) in hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
             {
                 for (group_offset, &sample_index) in group.iter().enumerate() {
                     layer_outputs[sample_index] = Some(pad_token_sequence(
@@ -3282,9 +3275,8 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn_flex_gmm::cuda::DefaultCudaBac
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &encoder_plan, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -3437,9 +3429,8 @@ impl VJepaTttEncoder<burn::backend::Cuda<f32, i32>> {
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &plan.encoder, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -3591,9 +3582,8 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
             let encoded =
                 self.forward_sparse_tokens_with_plan(tokens, &plan.encoder, target_frame, state)?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -3791,9 +3781,8 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
                 state,
             )?;
             if frame % tubelet == tubelet - 1 {
-                for (layer_outputs, tokens) in hierarchical_outputs
-                    .iter_mut()
-                    .zip(encoded.hierarchical.into_iter())
+                for (layer_outputs, tokens) in
+                    hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
                 {
                     layer_outputs.push(tokens);
                 }
@@ -3880,9 +3869,7 @@ impl VJepaTttEncoder<burn::backend::Autodiff<burn::backend::Cuda<f32, i32>>> {
                     max_tokens,
                 ));
             }
-            for (layer_outputs, tokens) in hierarchical_outputs
-                .iter_mut()
-                .zip(encoded.hierarchical.into_iter())
+            for (layer_outputs, tokens) in hierarchical_outputs.iter_mut().zip(encoded.hierarchical)
             {
                 for (group_offset, &sample_index) in group.iter().enumerate() {
                     layer_outputs[sample_index] = Some(pad_token_sequence(

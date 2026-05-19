@@ -872,6 +872,9 @@ impl JepaRuntime {
         config: &BevyJepaConfig,
         device: &JepaBevyDevice,
     ) -> Result<bool> {
+        if self.pipeline.is_none() && self.active_task.is_some() {
+            return Ok(true);
+        }
         let image_size = config.pipeline_image_size();
         let signature = RuntimePipelineSignature::new(config, image_size);
         let _ = self.ensure_pipeline(config, device)?;

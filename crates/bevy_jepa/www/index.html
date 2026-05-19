@@ -151,9 +151,10 @@
           const partsManifestUrl = resolvePartsManifestUrl(manifestUrl, manifest);
           const partsManifest = await fetchJson(partsManifestUrl);
           const parts = [];
-          for (const part of partsManifest.parts ?? []) {
+          const partEntries = partsManifest.parts ?? [];
+          for (const [index, part] of partEntries.entries()) {
             const partUrl = joinUrl(parentUrl(partsManifestUrl), part.path);
-            parts.push(await fetchBytes(partUrl));
+            parts.push(await fetchBytes(partDownloadUrl(partUrl, part), `model shard ${index + 1}/${partEntries.length}`));
           }
           window.__burnJepaModelPackage = {
             manifestJson: JSON.stringify(manifest),
@@ -218,9 +219,10 @@
           const partsManifestUrl = resolvePartsManifestUrl(manifestUrl, manifest, "anyup.bpk");
           const partsManifest = await fetchJson(partsManifestUrl);
           const parts = [];
-          for (const part of partsManifest.parts ?? []) {
+          const partEntries = partsManifest.parts ?? [];
+          for (const [index, part] of partEntries.entries()) {
             const partUrl = joinUrl(parentUrl(partsManifestUrl), part.path);
-            parts.push(await fetchBytes(partUrl));
+            parts.push(await fetchBytes(partDownloadUrl(partUrl, part), `AnyUp shard ${index + 1}/${partEntries.length}`));
           }
           window.__burnAnyupModelPackage = {
             manifestJson: JSON.stringify(manifest),
@@ -329,19 +331,83 @@
       }
 
       async function fetchJson(url) {
-        const response = await fetch(url, { cache: "force-cache" });
+        const response = await fetch(url, { cache: "no-cache" });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status} while fetching ${url}`);
         }
         return response.json();
       }
 
-      async function fetchBytes(url) {
-        const response = await fetch(url, { cache: "force-cache" });
+      function partDownloadUrl(url, part) {
+        if (!part?.sha256) {
+          return url;
+        }
+        const separator = url.includes("?") ? "&" : "?";
+        return `${url}${separator}sha256=${encodeURIComponent(part.sha256)}`;
+      }
+
+      async function fetchBytes(url, label = "model shard") {
+        logStatus(`downloading ${label} ${url}`);
+        setStatus(`bevy_jepa downloading ${label}...`);
+        const response = await fetch(url, { cache: "no-cache" });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status} while fetching ${url}`);
         }
-        return new Uint8Array(await response.arrayBuffer());
+        const expected = Number(response.headers.get("content-length") || 0);
+        if (!response.body) {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          logStatus(`downloaded ${label} (${formatBytes(bytes.byteLength)})`);
+          return bytes;
+        }
+        const reader = response.body.getReader();
+        const chunks = [];
+        let received = 0;
+        let nextLog = 8 * 1024 * 1024;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          chunks.push(value);
+          received += value.byteLength;
+          if (received >= nextLog) {
+            const progress = formatDownloadProgress(received, expected);
+            logStatus(`downloading ${label}: ${progress}`);
+            setStatus(`bevy_jepa downloading ${label}: ${progress}`);
+            nextLog = received + 8 * 1024 * 1024;
+          }
+        }
+        const bytes = new Uint8Array(received);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        const progress = formatDownloadProgress(received, expected);
+        logStatus(`downloaded ${label}: ${progress}`);
+        setStatus(`bevy_jepa downloaded ${label}: ${progress}`);
+        return bytes;
+      }
+
+      function formatDownloadProgress(received, expected) {
+        if (expected > 0) {
+          const percent = Math.min(100, Math.max(0, (received / expected) * 100));
+          return `${formatBytes(received)} / ${formatBytes(expected)} (${percent.toFixed(1)}%)`;
+        }
+        return `${formatBytes(received)} downloaded`;
+      }
+
+      function formatBytes(bytes) {
+        if (bytes >= 1024 * 1024 * 1024) {
+          return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+        }
+        if (bytes >= 1024 * 1024) {
+          return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+        }
+        if (bytes >= 1024) {
+          return `${(bytes / 1024).toFixed(1)} KiB`;
+        }
+        return `${bytes} B`;
       }
 
       function parentUrl(url) {
