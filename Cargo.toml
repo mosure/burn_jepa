@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/bevy_burn", "crates/bevy_jepa", "crates/burn_anyup"]
+members = [".", "crates/bevy_burn", "crates/bevy_jepa", "crates/burn_anyup", "crates/burn_jepa_reconstruction"]
 default-members = ["."]
 resolver = "3"
 
@@ -24,13 +24,13 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["ndarray", "webgpu"]
-ndarray = ["burn/ndarray", "burn_anyup/ndarray"]
-flex = ["burn/flex", "burn_anyup/flex"]
-dispatch = ["burn/dispatch", "burn_anyup/dispatch"]
-webgpu = ["burn/webgpu", "burn_anyup/webgpu"]
-wgpu = ["burn/wgpu", "burn-store/wgpu", "burn_anyup/wgpu"]
-cuda = ["burn/cuda", "burn-store/cuda", "burn_anyup/cuda"]
-wasm-fusion = ["burn/fusion", "burn-wgpu/fusion", "burn_anyup/fusion"]
+ndarray = ["burn/ndarray", "burn_anyup/ndarray", "burn_jepa_reconstruction/ndarray"]
+flex = ["burn/flex", "burn_anyup/flex", "burn_jepa_reconstruction/flex"]
+dispatch = ["burn/dispatch", "burn_anyup/dispatch", "burn_jepa_reconstruction/dispatch"]
+webgpu = ["burn/webgpu", "burn_anyup/webgpu", "burn_jepa_reconstruction/webgpu"]
+wgpu = ["burn/wgpu", "burn-store/wgpu", "burn_anyup/wgpu", "burn_jepa_reconstruction/wgpu"]
+cuda = ["burn/cuda", "burn-store/cuda", "burn_anyup/cuda", "burn_jepa_reconstruction/cuda"]
+wasm-fusion = ["burn/fusion", "burn-wgpu/fusion", "burn_anyup/fusion", "burn_jepa_reconstruction/fusion"]
 autogaze = ["dep:burn_autogaze"]
 autogaze-ndarray = ["autogaze", "burn_autogaze/ndarray"]
 autogaze-webgpu = ["autogaze", "burn_autogaze/webgpu"]
@@ -88,6 +88,7 @@ burn-fusion = { version = "0.21.0", default-features = false, optional = true }
 burn-ir = { version = "0.21.0", default-features = false, optional = true }
 burn-store = { version = "0.21.0", default-features = false, features = ["burnpack", "pytorch", "safetensors", "std"] }
 burn_anyup = { path = "crates/burn_anyup", version = "0.21.0", default-features = false }
+burn_jepa_reconstruction = { path = "crates/burn_jepa_reconstruction", version = "0.21.0", default-features = false }
 burn_autogaze = { version = "0.21.6", default-features = false, optional = true }
 burn_flex_gmm = { version = "0.21.1", default-features = false, optional = true }
 ciborium = "0.2"

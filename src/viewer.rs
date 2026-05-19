@@ -1254,6 +1254,16 @@ mod tests {
     }
 
     #[test]
+    fn prewarm_masks_cover_1024_resolution_bucket_widths_once() {
+        let grid = TokenGridShape::new(1, 64, 64);
+        let masks = shape_prewarm_masks(grid, &FeatureFrameViewerConfig::default());
+        let widths: Vec<_> = masks.iter().map(SparseTokenMask::len).collect();
+
+        assert_eq!(widths, vec![410, 1024, 2048, 4096]);
+        assert!(masks.last().expect("dense mask").is_dense_ordered());
+    }
+
+    #[test]
     fn empty_bucket_density_list_uses_legacy_fixed_width_steps() {
         let grid = TokenGridShape::new(1, 32, 32);
         let config = FeatureFrameViewerConfig {

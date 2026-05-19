@@ -238,6 +238,141 @@ pub enum BurnJepaCommand {
         #[arg(long, default_value_t = false)]
         overwrite: bool,
     },
+    ExportReconstructionBpk {
+        #[arg(
+            short,
+            long,
+            default_value = "target/burn_jepa_reconstruction-build/low_res_v1/jepa_reconstruction.bpk"
+        )]
+        output: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        shard_mib: u64,
+        #[arg(long, default_value_t = false)]
+        overwrite_shards: bool,
+        #[arg(long, visible_alias = "reconstruction-model-name", default_value_t = crate::BurnJepaReconstructionModelProfile::default())]
+        model_profile: crate::BurnJepaReconstructionModelProfile,
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL)]
+        model_base_url: String,
+        #[arg(
+            long,
+            default_value = "target/burn_jepa_reconstruction/low_res_v1",
+            help = "Clean CDN/upload directory containing manifest.json, parts manifest, and shard files only."
+        )]
+        deploy_dir: PathBuf,
+        #[arg(long, default_value_t = false)]
+        overwrite_deploy: bool,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().input_dim)]
+        input_dim: usize,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().hidden_dim)]
+        hidden_dim: usize,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().patch_size)]
+        patch_size: usize,
+    },
+    TrainReconstructionBpk {
+        #[arg(long, default_value = "cuda")]
+        backend: String,
+        #[arg(long, help = "Local burn_jepa V-JEPA base package manifest.json.")]
+        jepa_manifest: Option<PathBuf>,
+        #[arg(long, visible_alias = "model-name", default_value_t = crate::BurnJepaModelProfile::Vjepa21Base)]
+        jepa_model_profile: crate::BurnJepaModelProfile,
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_MODEL_BASE_URL)]
+        jepa_model_base_url: String,
+        #[arg(long)]
+        jepa_manifest_url: Option<String>,
+        #[arg(long)]
+        jepa_cache_dir: Option<PathBuf>,
+        #[arg(long = "image")]
+        images: Vec<PathBuf>,
+        #[arg(long = "image-dir")]
+        image_dirs: Vec<PathBuf>,
+        #[arg(long, default_value_t = 512)]
+        image_size: usize,
+        #[arg(long, default_value_t = 2)]
+        frames: usize,
+        #[arg(long, default_value_t = 512)]
+        max_samples: usize,
+        #[arg(long, default_value_t = 0.10)]
+        val_split: f32,
+        #[arg(long, default_value_t = 2000)]
+        steps: usize,
+        #[arg(long, default_value_t = 4)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 1.0e-3)]
+        lr: f64,
+        #[arg(long, default_value_t = 1.0e-4)]
+        weight_decay: f64,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().hidden_dim)]
+        hidden_dim: usize,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().residual_blocks_per_scale)]
+        residual_blocks_per_scale: usize,
+        #[arg(long, default_value_t = 50)]
+        log_interval: usize,
+        #[arg(long, default_value_t = 0x5EED)]
+        seed: u64,
+        #[arg(
+            short,
+            long,
+            default_value = "target/burn_jepa_reconstruction-build/low_res_v1/jepa_reconstruction.bpk"
+        )]
+        output: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        shard_mib: u64,
+        #[arg(long, default_value_t = false)]
+        overwrite_shards: bool,
+        #[arg(long, visible_alias = "reconstruction-model-name", default_value_t = crate::BurnJepaReconstructionModelProfile::default())]
+        reconstruction_model_profile: crate::BurnJepaReconstructionModelProfile,
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL)]
+        reconstruction_model_base_url: String,
+        #[arg(
+            long,
+            default_value = "target/burn_jepa_reconstruction/low_res_v1",
+            help = "Clean CDN/upload directory containing manifest.json, parts manifest, and shard files only."
+        )]
+        deploy_dir: PathBuf,
+        #[arg(long, default_value_t = false)]
+        overwrite_deploy: bool,
+    },
+    CacheReconstruction {
+        #[arg(long, visible_alias = "reconstruction-model-name", default_value_t = crate::BurnJepaReconstructionModelProfile::default())]
+        model_profile: crate::BurnJepaReconstructionModelProfile,
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL)]
+        model_base_url: String,
+        #[arg(long)]
+        manifest_url: Option<String>,
+        #[arg(
+            long,
+            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa_reconstruction/{model_profile}."
+        )]
+        cache_dir: Option<PathBuf>,
+    },
+    VerifyReconstructionBpk {
+        #[arg(
+            long,
+            help = "Local burn_jepa_reconstruction package manifest. If omitted, cache/download from --model-base-url."
+        )]
+        manifest: Option<PathBuf>,
+        #[arg(long, visible_alias = "reconstruction-model-name", default_value_t = crate::BurnJepaReconstructionModelProfile::default())]
+        model_profile: crate::BurnJepaReconstructionModelProfile,
+        #[arg(long, default_value = crate::DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL)]
+        model_base_url: String,
+        #[arg(long)]
+        manifest_url: Option<String>,
+        #[arg(
+            long,
+            help = "Exact local cache directory. Defaults to ~/.burn_jepa/models/burn_jepa_reconstruction/{model_profile}."
+        )]
+        cache_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 64)]
+        image_size: usize,
+    },
+    BundleReconstructionBpkDeploy {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = false)]
+        overwrite: bool,
+    },
     PrintConfig,
     PrintExperimentConfig,
 }
@@ -473,6 +608,138 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             let report = crate::write_burn_anyup_model_deploy_bundle(manifest, output, overwrite)?;
             print_json(&report)
         }
+        BurnJepaCommand::ExportReconstructionBpk {
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_profile,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            input_dim,
+            hidden_dim,
+            patch_size,
+        } => dispatch_export_reconstruction_bpk(
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_profile,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            input_dim,
+            hidden_dim,
+            patch_size,
+        ),
+        BurnJepaCommand::TrainReconstructionBpk {
+            backend,
+            jepa_manifest,
+            jepa_model_profile,
+            jepa_model_base_url,
+            jepa_manifest_url,
+            jepa_cache_dir,
+            images,
+            image_dirs,
+            image_size,
+            frames,
+            max_samples,
+            val_split,
+            steps,
+            batch_size,
+            lr,
+            weight_decay,
+            hidden_dim,
+            residual_blocks_per_scale,
+            log_interval,
+            seed,
+            output,
+            shard_mib,
+            overwrite_shards,
+            reconstruction_model_profile,
+            reconstruction_model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+        } => {
+            let backend = parse_reconstruction_backend(&backend)?;
+            let report = crate::reconstruction_training::train_reconstruction_bpk(
+                crate::reconstruction_training::ReconstructionTrainingOptions {
+                    backend,
+                    jepa_manifest,
+                    jepa_model_profile,
+                    jepa_model_base_url,
+                    jepa_manifest_url,
+                    jepa_cache_dir,
+                    image_paths: images,
+                    image_dirs,
+                    image_size,
+                    frames,
+                    max_samples,
+                    val_split,
+                    steps,
+                    batch_size,
+                    learning_rate: lr,
+                    weight_decay,
+                    hidden_dim,
+                    residual_blocks_per_scale,
+                    log_interval,
+                    seed,
+                    output,
+                    shard_mib,
+                    overwrite_shards,
+                    reconstruction_model_profile,
+                    reconstruction_model_base_url,
+                    deploy_dir,
+                    overwrite_deploy,
+                },
+            )?;
+            print_json(&report)
+        }
+        BurnJepaCommand::CacheReconstruction {
+            model_profile,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+        } => {
+            let model_base_url =
+                resolve_reconstruction_model_profile_base_url(model_profile, model_base_url);
+            let config = crate::BurnJepaReconstructionModelBootstrapConfig {
+                cache_root: cache_dir,
+                model_profile,
+                model_base_url,
+                manifest_url,
+            };
+            let report =
+                crate::resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config_and_progress(
+                    &config,
+                    |message| eprintln!("{message}"),
+                )?;
+            print_json(&report)
+        }
+        BurnJepaCommand::VerifyReconstructionBpk {
+            manifest,
+            model_profile,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            image_size,
+        } => dispatch_verify_reconstruction_bpk(
+            manifest,
+            model_profile,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            image_size,
+        ),
+        BurnJepaCommand::BundleReconstructionBpkDeploy {
+            manifest,
+            output,
+            overwrite,
+        } => {
+            let report = crate::write_burn_jepa_reconstruction_model_deploy_bundle(
+                manifest, output, overwrite,
+            )?;
+            print_json(&report)
+        }
         BurnJepaCommand::PrintConfig => {
             let config = BurnJepaTrainConfig::default();
             println!("{}", config.to_toml_string()?);
@@ -505,6 +772,29 @@ fn resolve_anyup_model_profile_base_url(
         crate::burn_anyup_model_profile_base_url(model_profile)
     } else {
         model_base_url
+    }
+}
+
+fn resolve_reconstruction_model_profile_base_url(
+    model_profile: crate::BurnJepaReconstructionModelProfile,
+    model_base_url: String,
+) -> String {
+    if model_base_url == crate::DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL {
+        crate::burn_jepa_reconstruction_model_profile_base_url(model_profile)
+    } else {
+        model_base_url
+    }
+}
+
+fn parse_reconstruction_backend(value: &str) -> Result<JepaTrainBackend> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cuda" => Ok(JepaTrainBackend::Cuda),
+        "wgpu" => Ok(JepaTrainBackend::Wgpu),
+        "webgpu" => Ok(JepaTrainBackend::WebGpu),
+        "ndarray" | "cpu" => Ok(JepaTrainBackend::NdArray),
+        other => bail!(
+            "unsupported reconstruction backend `{other}`; expected cuda, wgpu, webgpu, or ndarray"
+        ),
     }
 }
 
@@ -1457,6 +1747,307 @@ fn anyup_load_report_json(report: Option<&crate::AnyUpLoadReport>) -> serde_json
         }),
         None => serde_json::Value::Null,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_export_reconstruction_bpk(
+    output: PathBuf,
+    shard_mib: u64,
+    overwrite_shards: bool,
+    model_profile: crate::BurnJepaReconstructionModelProfile,
+    model_base_url: String,
+    deploy_dir: PathBuf,
+    overwrite_deploy: bool,
+    input_dim: usize,
+    hidden_dim: usize,
+    patch_size: usize,
+) -> Result<()> {
+    #[cfg(feature = "ndarray")]
+    {
+        export_reconstruction_bpk_ndarray(
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_profile,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            input_dim,
+            hidden_dim,
+            patch_size,
+        )
+    }
+    #[cfg(not(feature = "ndarray"))]
+    {
+        let _ = (
+            output,
+            shard_mib,
+            overwrite_shards,
+            model_profile,
+            model_base_url,
+            deploy_dir,
+            overwrite_deploy,
+            input_dim,
+            hidden_dim,
+            patch_size,
+        );
+        bail!("export-reconstruction-bpk requires the ndarray feature")
+    }
+}
+
+#[cfg(feature = "ndarray")]
+#[allow(clippy::too_many_arguments)]
+fn export_reconstruction_bpk_ndarray(
+    output: PathBuf,
+    shard_mib: u64,
+    overwrite_shards: bool,
+    model_profile: crate::BurnJepaReconstructionModelProfile,
+    model_base_url: String,
+    deploy_dir: PathBuf,
+    overwrite_deploy: bool,
+    input_dim: usize,
+    hidden_dim: usize,
+    patch_size: usize,
+) -> Result<()> {
+    use burn::module::Module;
+
+    type B = burn::backend::NdArray<f32>;
+
+    let device = Default::default();
+    let reconstruction_config = crate::JepaReconstructionConfig {
+        input_dim,
+        hidden_dim,
+        patch_size,
+        ..crate::JepaReconstructionConfig::default()
+    };
+    let decoder =
+        crate::JepaReconstructionDecoder::<B>::new(reconstruction_config.clone(), &device)?;
+    let output = output.with_extension("bpk");
+    crate::save_jepa_reconstruction_burnpack(&decoder.no_grad(), &output)?;
+    let burnpack_dtype_counts = crate::burnpack_dtype_counts(&output)?;
+    ensure_export_burnpack_is_f16(&burnpack_dtype_counts)?;
+    let max_part_bytes = shard_mib
+        .max(1)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--shard-mib overflow"))?;
+    let parts = crate::write_burnpack_parts_for_browser(&output, max_part_bytes, overwrite_shards)?;
+    let model_base_url =
+        resolve_reconstruction_model_profile_base_url(model_profile, model_base_url);
+    let manifest = crate::BurnJepaReconstructionPackageManifest {
+        record_dtype: Some("f16".to_string()),
+        reconstruction_config,
+        model_base_url,
+        ..crate::BurnJepaReconstructionPackageManifest::default()
+    }
+    .with_burnpack_paths(&output);
+    let manifest_path = output
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("manifest.json");
+    crate::write_jepa_reconstruction_package_manifest(&manifest_path, &manifest)?;
+    let deploy_bundle = crate::write_burn_jepa_reconstruction_model_deploy_bundle(
+        &manifest_path,
+        deploy_dir,
+        overwrite_deploy,
+    )?;
+
+    print_json(&serde_json::json!({
+        "burnpack": output,
+        "package_manifest": manifest_path,
+        "parts_manifest": parts.manifest_path,
+        "parts": parts.part_paths,
+        "total_bytes": parts.total_bytes,
+        "record_dtype": manifest.record_dtype.clone(),
+        "burnpack_dtype_counts": burnpack_dtype_counts,
+        "model_base_url": manifest.model_base_url.clone(),
+        "model_profile": model_profile.as_str(),
+        "deploy_bundle": deploy_bundle,
+    }))
+}
+
+fn dispatch_verify_reconstruction_bpk(
+    manifest: Option<PathBuf>,
+    model_profile: crate::BurnJepaReconstructionModelProfile,
+    model_base_url: String,
+    manifest_url: Option<String>,
+    cache_dir: Option<PathBuf>,
+    image_size: usize,
+) -> Result<()> {
+    #[cfg(feature = "ndarray")]
+    {
+        verify_reconstruction_bpk_ndarray(
+            manifest,
+            model_profile,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            image_size,
+        )
+    }
+    #[cfg(not(feature = "ndarray"))]
+    {
+        let _ = (
+            manifest,
+            model_profile,
+            model_base_url,
+            manifest_url,
+            cache_dir,
+            image_size,
+        );
+        bail!("verify-reconstruction-bpk requires the ndarray feature")
+    }
+}
+
+#[cfg(feature = "ndarray")]
+#[derive(Debug, Serialize)]
+struct ReconstructionBpkVerifyReport {
+    manifest_path: PathBuf,
+    parts_manifest_path: PathBuf,
+    part_count: usize,
+    total_bytes: u64,
+    record_dtype: Option<String>,
+    burnpack_dtype_counts: std::collections::BTreeMap<String, usize>,
+    runtime_dtype_counts: std::collections::BTreeMap<String, usize>,
+    apply_applied: usize,
+    apply_missing: usize,
+    apply_skipped: usize,
+    apply_unused: usize,
+    apply_errors: usize,
+    output_shape: Vec<usize>,
+    psnr_db: Option<f64>,
+    sample_count: usize,
+    sample_mean: f32,
+    sample_min: f32,
+    sample_max: f32,
+    load_path: &'static str,
+}
+
+#[cfg(feature = "ndarray")]
+fn verify_reconstruction_bpk_ndarray(
+    manifest_path: Option<PathBuf>,
+    model_profile: crate::BurnJepaReconstructionModelProfile,
+    model_base_url: String,
+    manifest_url: Option<String>,
+    cache_dir: Option<PathBuf>,
+    image_size: usize,
+) -> Result<()> {
+    ensure!(image_size >= 16, "--image-size must be at least 16");
+    type B = burn::backend::NdArray<f32>;
+
+    let package = if let Some(manifest_path) = manifest_path {
+        let manifest_json = std::fs::read_to_string(&manifest_path)?;
+        let manifest = crate::BurnJepaReconstructionPackageManifest::from_json_str(&manifest_json)?;
+        let parts_manifest_path =
+            crate::resolve_package_manifest_entry_path(&manifest_path, &manifest.parts_manifest)?;
+        let parts_manifest = crate::read_parts_manifest(&parts_manifest_path)?;
+        let part_paths = parts_manifest
+            .parts
+            .iter()
+            .map(|part| crate::resolve_part_entry_path(&parts_manifest_path, &part.path))
+            .collect::<Result<Vec<_>>>()?;
+        crate::BurnJepaReconstructionModelPackageFiles {
+            cache_root: manifest_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
+            manifest_path,
+            parts_manifest_path,
+            part_paths,
+            total_bytes: parts_manifest.total_bytes,
+            model_base_url: manifest.model_base_url,
+        }
+    } else {
+        let model_base_url =
+            resolve_reconstruction_model_profile_base_url(model_profile, model_base_url);
+        let config = crate::BurnJepaReconstructionModelBootstrapConfig {
+            cache_root: cache_dir,
+            model_profile,
+            model_base_url,
+            manifest_url,
+        };
+        crate::resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config_and_progress(
+            &config,
+            |message| eprintln!("{message}"),
+        )?
+    };
+
+    let manifest_json = std::fs::read_to_string(&package.manifest_path)?;
+    let manifest = crate::BurnJepaReconstructionPackageManifest::from_json_str(&manifest_json)?;
+    let parts = package
+        .part_paths
+        .iter()
+        .map(std::fs::read)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let device = Default::default();
+    let (decoder, apply_result) = crate::load_jepa_reconstruction_burnpack_parts::<B>(
+        &manifest.reconstruction_config,
+        &parts,
+        &device,
+    )?;
+    ensure!(
+        apply_result.errors.is_empty(),
+        "burn_jepa_reconstruction apply reported errors: {:?}",
+        apply_result.errors
+    );
+    ensure!(
+        !apply_result.applied.is_empty(),
+        "burn_jepa_reconstruction package did not apply any tensors"
+    );
+    let runtime_dtype_counts = crate::module_dtype_counts::<B, _>(&decoder);
+    ensure!(
+        runtime_dtype_counts.get("F16").copied().unwrap_or(0) == 0,
+        "runtime reconstruction model still contains F16 tensors after load: {:?}",
+        runtime_dtype_counts
+    );
+
+    let grid = (image_size / manifest.reconstruction_config.patch_size.max(1)).max(1);
+    let features = burn::tensor::Tensor::<B, 4>::ones(
+        [1, manifest.reconstruction_config.input_dim, grid, grid],
+        &device,
+    );
+    let target =
+        burn::tensor::Tensor::<B, 4>::ones([1, 3, image_size, image_size], &device).mul_scalar(0.5);
+    let output = decoder.forward_to_size(features, [image_size, image_size]);
+    let psnr_db = crate::reconstruction_psnr_scalar(output.clone(), target, 1.0);
+    let [batch, channels, height, width] = output.shape().dims::<4>();
+    let values = output
+        .into_data()
+        .to_vec::<f32>()
+        .map_err(|err| anyhow::anyhow!("read reconstruction BPK output values: {err:?}"))?;
+    ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "reconstruction BPK output contains non-finite values"
+    );
+    let (sample_min, sample_max, sample_mean) = summarize_f32(&values);
+    let burnpack_dtype_counts = crate::burnpack_parts_dtype_counts(&package.parts_manifest_path)?;
+    ensure!(
+        burnpack_dtype_counts.get("F16").copied().unwrap_or(0) > 0
+            && burnpack_dtype_counts.get("F32").copied().unwrap_or(0) == 0,
+        "deployment reconstruction burnpack parts are not f16-only: {:?}",
+        burnpack_dtype_counts
+    );
+
+    print_json(&ReconstructionBpkVerifyReport {
+        manifest_path: package.manifest_path,
+        parts_manifest_path: package.parts_manifest_path,
+        part_count: package.part_paths.len(),
+        total_bytes: package.total_bytes,
+        record_dtype: manifest.record_dtype,
+        burnpack_dtype_counts,
+        runtime_dtype_counts,
+        apply_applied: apply_result.applied.len(),
+        apply_missing: apply_result.missing.len(),
+        apply_skipped: apply_result.skipped.len(),
+        apply_unused: apply_result.unused.len(),
+        apply_errors: apply_result.errors.len(),
+        output_shape: vec![batch, channels, height, width],
+        psnr_db,
+        sample_count: values.len(),
+        sample_mean,
+        sample_min,
+        sample_max,
+        load_path: "burn_store::BurnpackStore + ModuleSnapshot::load_from clean init",
+    })
 }
 
 fn run_experiment_command(command: ExperimentCommand) -> Result<()> {

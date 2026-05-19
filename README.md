@@ -89,6 +89,7 @@ assert_eq!(output.predictions.shape().dims::<3>(), [1, target.len(), 32]);
 ```sh
 cargo run -p bevy_jepa
 cargo run -p bevy_jepa -- --source camera --image-size 256
+cargo run -p bevy_jepa -- --source camera --image-size 1024
 cargo run -p bevy_jepa -- --encoder-source base-checkpoint --sparse-encode-mode dense
 cargo run -p bevy_jepa -- --encoder-source trained-ttt --mask-source patch-diff
 ```
@@ -104,7 +105,7 @@ the no-arg native default starts the live sparse feature pipeline with camera
 input, patch-diff sparse masks, low-res token-cache PCA every processed frame,
 and high-res AnyUp/PCA decoupled from the low-res worker. Controls live in the
 in-app menu, including base vs. TTT, dense vs. sparse, patch-diff threshold,
-refresh policy, resolution, and AnyUp mode.
+refresh policy, 256/512/1024 resolution, and AnyUp mode.
 
 See [crates/bevy_jepa/README.md](./crates/bevy_jepa/README.md) for native,
 wasm, camera, CDN model-package, and Pages notes.

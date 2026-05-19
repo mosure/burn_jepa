@@ -295,11 +295,12 @@ BURN_JEPA_HIGHRES_BENCH_LARGE=1 cargo bench --bench highres_anyup_pca_pipeline -
 ```
 
 The raw E2E matrix includes `viewer256_sparse100` and `viewer512_sparse100`
-rows for the V-JEPA 2.1 trained-resolution viewer paths. The Bevy app defaults
-to the 512x512 sparse-encoding path with a 32x32 token grid; 256x256 remains
-available as the smaller 16x16-grid path. Compare these rows with the headless
-Bevy wrapper bench to separate shared pipeline cost from display tensor
-preparation:
+rows for the V-JEPA 2.1 trained-resolution viewer paths. Set
+`BURN_JEPA_BENCH_1024=1` to add the expensive `viewer1024_sparse100` lane. The
+Bevy app defaults to the 512x512 sparse-encoding path with a 32x32 token grid;
+256x256 remains available as the smaller 16x16-grid path, while 1024x1024 is a
+64x64-grid diagnostic path. Compare these rows with the headless Bevy wrapper
+bench to separate shared pipeline cost from display tensor preparation:
 
 ```sh
 cargo bench -p bevy_jepa --bench viewer_pipeline -- --sample-size 10

@@ -2528,6 +2528,7 @@ dependencies = [
  "burn_anyup",
  "burn_autogaze",
  "burn_flex_gmm",
+ "burn_jepa_reconstruction",
  "ciborium",
  "clap",
  "console_error_panic_hook",
@@ -2545,6 +2546,16 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "burn_jepa_reconstruction"
+version = "0.21.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "criterion",
+ "serde",
 ]
 
 [[package]]

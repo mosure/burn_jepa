@@ -5,7 +5,7 @@
   "scripts": {
     "check:native": "cargo check",
     "check:web": "cargo check --target wasm32-unknown-unknown",
-    "build:wasm": "cargo build --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir www/out --out-name bevy_jepa ../../target/wasm32-unknown-unknown/release/bevy_jepa.wasm",
+    "build:wasm": "cargo build --no-default-features --target wasm32-unknown-unknown --release --bin bevy_jepa && wasm-bindgen --target web --out-dir www/out --out-name bevy_jepa ../../target/wasm32-unknown-unknown/release/bevy_jepa.wasm",
     "serve": "python3 -m http.server 8080 -d www",
     "test:static": "node tests/static-source.spec.mjs",
     "test:browser": "playwright test --config playwright.config.mjs",

@@ -14,6 +14,7 @@ crates/bevy_jepa/www/out/
 .env.*
 !.env.example
 .DS_Store
+autotune-stdout
 
 # Generated model/checkpoint artifacts are too large and machine-specific.
 *.ckpt

@@ -1,10 +1,14 @@
 use super::*;
 use burn_jepa::{
-    AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, FeatureFrameEncodePath,
-    FeatureFrameJepaEncoder, FeatureFrameJepaEncoderKind, PatchDiffRefreshState, TttEncoderConfig,
-    VJepa2_1Model, VJepaTttModel, coords_to_token_index, write_burnpack_parts_for_browser,
-    write_pipeline_package_manifest,
+    AnyUpConfig, BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest,
+    BurnJepaReconstructionPackageManifest, FeatureFrameEncodePath, FeatureFrameJepaEncoder,
+    FeatureFrameJepaEncoderKind, JepaReconstructionConfig, JepaReconstructionDecoder,
+    PatchDiffRefreshState, TttEncoderConfig, VJepa2_1Model, VJepaTttModel, coords_to_token_index,
+    save_jepa_reconstruction_burnpack, write_burnpack_parts_for_browser,
+    write_jepa_reconstruction_package_manifest, write_pipeline_package_manifest,
 };
+use std::path::PathBuf;
+use tempfile::TempDir;
 
 fn tiny_viewer_config() -> BevyJepaConfig {
     BevyJepaConfig {
@@ -18,6 +22,33 @@ fn tiny_viewer_config() -> BevyJepaConfig {
 
 fn values4(tensor: Tensor<JepaBevyBackend, 4>) -> Vec<f32> {
     tensor.to_data().to_vec::<f32>().expect("tensor values")
+}
+
+fn write_tiny_viewer_reconstruction_package() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("temp reconstruction package dir");
+    let device = JepaBevyDevice::default();
+    let config = JepaReconstructionConfig {
+        input_dim: VJepaConfig::tiny_for_tests().encoder.embed_dim,
+        patch_size: VJepaConfig::tiny_for_tests().patch_size,
+        ..JepaReconstructionConfig::tiny_for_tests()
+    };
+    let decoder = JepaReconstructionDecoder::<JepaBevyBackend>::new(config.clone(), &device)
+        .expect("tiny reconstruction decoder");
+    let burnpack = dir.path().join("jepa_reconstruction.bpk");
+    save_jepa_reconstruction_burnpack(&decoder, &burnpack).expect("save tiny reconstruction bpk");
+    write_burnpack_parts_for_browser(&burnpack, 1024 * 1024, true)
+        .expect("write tiny reconstruction bpk parts");
+    let manifest = BurnJepaReconstructionPackageManifest {
+        record_dtype: Some("f16".to_string()),
+        reconstruction_config: config,
+        model_base_url: "http://127.0.0.1/reconstruction".to_string(),
+        ..BurnJepaReconstructionPackageManifest::default()
+    }
+    .with_burnpack_paths(&burnpack);
+    let manifest_path = dir.path().join("manifest.json");
+    write_jepa_reconstruction_package_manifest(&manifest_path, &manifest)
+        .expect("write tiny reconstruction manifest");
+    (dir, manifest_path)
 }
 
 #[test]
@@ -237,6 +268,11 @@ fn control_actions_switch_model_profiles_and_resolution() {
         JepaControlReset::Rebuild
     );
     assert_eq!(config.pipeline_image_size(), 512);
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::Resolution1024),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.pipeline_image_size(), 1024);
 }
 
 #[test]
@@ -310,6 +346,25 @@ fn control_actions_toggle_anyup_panel_cadence() {
         JepaControlReset::Rebuild
     );
     assert_eq!(config.high_res_pca_every, 0);
+    assert_eq!(visible_panel_count(&config), 3);
+}
+
+#[test]
+fn control_actions_toggle_reconstruction_panel_cadence() {
+    let mut config = BevyJepaConfig::default();
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::ReconstructionEvery8),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.reconstruction_every, 8);
+    assert_eq!(visible_panel_count(&config), 4);
+
+    assert_eq!(
+        apply_control_action(&mut config, JepaControlAction::ReconstructionOff),
+        JepaControlReset::Rebuild
+    );
+    assert_eq!(config.reconstruction_every, 0);
     assert_eq!(visible_panel_count(&config), 3);
 }
 
@@ -523,6 +578,7 @@ fn control_actions_preserve_pca_settings_across_pipeline_changes() {
         JepaControlAction::PipelineSparse,
         JepaControlAction::Resolution256,
         JepaControlAction::Resolution512,
+        JepaControlAction::Resolution1024,
         JepaControlAction::AnyUpOff,
         JepaControlAction::AnyUpEvery8,
         JepaControlAction::AnyUpEvery1,
@@ -687,7 +743,7 @@ fn assert_visible_controls_tab(app: &mut App, active: JepaControlsTab) {
         };
         assert_eq!(node.display, expected, "tab {:?}", panel.tab);
     }
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
 }
 
 #[test]
@@ -2285,6 +2341,72 @@ fn headless_stage_request_can_measure_low_res_only_path() {
     assert_eq!(output.metrics.anyup_decode_us, 0);
     assert_eq!(output.metrics.high_res_pca_us, 0);
     assert!(output.metrics.low_res_pca_us > 0 || !output.metrics.stage_metrics.measured);
+}
+
+#[test]
+fn headless_reconstruction_runs_without_psnr_host_read_by_default() {
+    let (_package_dir, reconstruction_model_manifest_path) =
+        write_tiny_viewer_reconstruction_package();
+    let device = JepaBevyDevice::default();
+    let mut pipeline = BevyJepaHeadlessPipeline::new(
+        BevyJepaConfig {
+            source: BevyJepaFrameSource::SyntheticLocalMotion,
+            reconstruction_every: 1,
+            reconstruction_model_manifest_path: Some(reconstruction_model_manifest_path),
+            reconstruction_model_auto_download: false,
+            pipeline: FeatureFrameViewerConfig {
+                high_res_pca_every: 0,
+                measure_stages: true,
+                sync_measurements: false,
+                ..FeatureFrameViewerConfig::default()
+            },
+            ..tiny_viewer_config()
+        },
+        device,
+    );
+
+    let output = pipeline
+        .step_with_reconstruction_request(FeatureFrameRequest::low_res())
+        .expect("reconstruction viewer step");
+
+    assert!(output.metrics.aligns_with_stage_metrics());
+    assert_eq!(output.metrics.reconstruction_frames, 1);
+    assert!(output.metrics.reconstruction_decode_us > 0);
+    assert_eq!(output.metrics.anyup_decode_us, 0);
+    assert_eq!(output.metrics.high_res_pca_us, 0);
+    assert!(
+        output.metrics.reconstruction_psnr_db.is_none(),
+        "PSNR should remain an opt-in diagnostic because it forces a scalar host read"
+    );
+}
+
+#[test]
+fn headless_reconstruction_psnr_is_sync_measurement_diagnostic() {
+    let (_package_dir, reconstruction_model_manifest_path) =
+        write_tiny_viewer_reconstruction_package();
+    let device = JepaBevyDevice::default();
+    let mut pipeline = BevyJepaHeadlessPipeline::new(
+        BevyJepaConfig {
+            source: BevyJepaFrameSource::SyntheticLocalMotion,
+            reconstruction_every: 1,
+            reconstruction_model_manifest_path: Some(reconstruction_model_manifest_path),
+            reconstruction_model_auto_download: false,
+            pipeline: FeatureFrameViewerConfig {
+                high_res_pca_every: 0,
+                measure_stages: true,
+                sync_measurements: true,
+                ..FeatureFrameViewerConfig::default()
+            },
+            ..tiny_viewer_config()
+        },
+        device,
+    );
+
+    let output = pipeline
+        .step_with_reconstruction_request(FeatureFrameRequest::low_res())
+        .expect("reconstruction viewer step");
+
+    assert!(output.metrics.reconstruction_psnr_db.is_some());
 }
 
 #[test]

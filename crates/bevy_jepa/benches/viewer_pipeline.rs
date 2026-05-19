@@ -6,10 +6,15 @@ use bevy_jepa::{
     JepaBevyBackend, JepaBevyDevice,
 };
 use burn::tensor::backend::Backend;
-use burn_jepa::FeatureFrameRequest;
+use burn_jepa::{
+    BurnJepaReconstructionPackageManifest, FeatureFrameRequest, JepaReconstructionConfig,
+    JepaReconstructionDecoder, VJepaConfig, save_jepa_reconstruction_burnpack,
+    write_burnpack_parts_for_browser, write_jepa_reconstruction_package_manifest,
+};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use std::path::PathBuf;
+use tempfile::TempDir;
 
-const VIEWER_IMAGE_SIZES: [usize; 2] = [256, DEFAULT_IMAGE_SIZE];
 const VIEWER_CONTEXT_DENSITY: f32 = 1.0;
 
 #[derive(Clone, Copy)]
@@ -38,6 +43,10 @@ enum ViewerBenchLane {
         name: &'static str,
         request: FeatureFrameRequest,
     },
+    Reconstruction {
+        name: &'static str,
+        request: FeatureFrameRequest,
+    },
     Display {
         name: &'static str,
         request: FeatureFrameRequest,
@@ -45,7 +54,7 @@ enum ViewerBenchLane {
     },
 }
 
-const VIEWER_BENCH_LANES: [ViewerBenchLane; 5] = [
+const VIEWER_BENCH_LANES: [ViewerBenchLane; 6] = [
     ViewerBenchLane::Stage {
         name: "low_res_cache_update",
         request: FeatureFrameRequest::none(),
@@ -57,6 +66,10 @@ const VIEWER_BENCH_LANES: [ViewerBenchLane; 5] = [
     ViewerBenchLane::Stage {
         name: "full_anyup_decode",
         request: FeatureFrameRequest::high_res_features(),
+    },
+    ViewerBenchLane::Reconstruction {
+        name: "reconstruction_decode",
+        request: FeatureFrameRequest::low_res(),
     },
     ViewerBenchLane::Display {
         name: "display_upload_gpu",
@@ -122,10 +135,66 @@ fn prepare_pipeline(
     (device, pipeline)
 }
 
+fn prepare_reconstruction_pipeline(
+    image_size: usize,
+    mask_source: BevyJepaMaskSource,
+    patch_diff_threshold: f32,
+    reconstruction_model_manifest_path: PathBuf,
+) -> (JepaBevyDevice, BevyJepaHeadlessPipeline) {
+    let device = JepaBevyDevice::default();
+    let mut config = viewer_config(
+        image_size,
+        mask_source,
+        patch_diff_threshold,
+        BevyJepaDisplayTransfer::Gpu,
+    );
+    config.reconstruction_every = 1;
+    config.high_res_pca_every = 0;
+    config.sync_measurements = false;
+    config.reconstruction_model_manifest_path = Some(reconstruction_model_manifest_path);
+    config.reconstruction_model_auto_download = false;
+    let mut pipeline = BevyJepaHeadlessPipeline::new(config, device.clone());
+    if mask_source == BevyJepaMaskSource::PatchDiff {
+        pipeline
+            .step_stage_only()
+            .expect("seed patch-diff previous frame");
+    }
+    (device, pipeline)
+}
+
+fn write_tiny_reconstruction_package(device: &JepaBevyDevice) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("temp reconstruction package dir");
+    let config = JepaReconstructionConfig {
+        input_dim: VJepaConfig::tiny_for_tests().encoder.embed_dim,
+        patch_size: VJepaConfig::tiny_for_tests().patch_size,
+        ..JepaReconstructionConfig::tiny_for_tests()
+    };
+    let decoder = JepaReconstructionDecoder::<JepaBevyBackend>::new(config.clone(), device)
+        .expect("tiny reconstruction decoder");
+    let burnpack = dir.path().join("jepa_reconstruction.bpk");
+    save_jepa_reconstruction_burnpack(&decoder, &burnpack).expect("save tiny reconstruction bpk");
+    write_burnpack_parts_for_browser(&burnpack, 1024 * 1024, true)
+        .expect("write tiny reconstruction bpk parts");
+    let manifest = BurnJepaReconstructionPackageManifest {
+        record_dtype: Some("f16".to_string()),
+        reconstruction_config: config,
+        model_base_url: "http://127.0.0.1/reconstruction".to_string(),
+        ..BurnJepaReconstructionPackageManifest::default()
+    }
+    .with_burnpack_paths(&burnpack);
+    let manifest_path = dir.path().join("manifest.json");
+    write_jepa_reconstruction_package_manifest(&manifest_path, &manifest)
+        .expect("write tiny reconstruction manifest");
+    (dir, manifest_path)
+}
+
 fn bench_viewer_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("bevy_jepa_viewer_pipeline_wgpu");
+    let package_device = JepaBevyDevice::default();
+    let (_reconstruction_package_dir, reconstruction_model_manifest_path) =
+        write_tiny_reconstruction_package(&package_device);
 
-    for image_size in VIEWER_IMAGE_SIZES {
+    for image_size in viewer_image_sizes() {
         group.throughput(Throughput::Elements((image_size * image_size) as u64));
         for mask_case in VIEWER_MASK_CASES {
             for lane in VIEWER_BENCH_LANES {
@@ -214,6 +283,37 @@ fn bench_viewer_pipeline(c: &mut Criterion) {
                             },
                         );
                     }
+                    ViewerBenchLane::Reconstruction { name, request } => {
+                        group.bench_function(
+                            format!("{}_{}_{}", mask_case.label, image_size, name),
+                            |bench| {
+                                bench.iter_batched(
+                                    || {
+                                        prepare_reconstruction_pipeline(
+                                            image_size,
+                                            mask_case.source,
+                                            mask_case.patch_diff_threshold,
+                                            reconstruction_model_manifest_path.clone(),
+                                        )
+                                    },
+                                    |(device, mut pipeline)| {
+                                        let output = pipeline
+                                            .step_with_reconstruction_request(request)
+                                            .expect("reconstruction viewer step");
+                                        JepaBevyBackend::sync(&device)
+                                            .expect("sync viewer backend");
+                                        assert!(output.metrics.aligns_with_stage_metrics());
+                                        assert!(output.metrics.reconstruction_decode_us > 0);
+                                        assert_eq!(output.metrics.reconstruction_frames, 1);
+                                        assert_eq!(output.metrics.anyup_decode_us, 0);
+                                        assert!(output.metrics.reconstruction_psnr_db.is_none());
+                                        black_box(output.metrics);
+                                    },
+                                    BatchSize::SmallInput,
+                                );
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -234,3 +334,13 @@ impl ViewerStageMetricsExt for burn_jepa::FeatureFrameMetrics {
 
 criterion_group!(benches, bench_viewer_pipeline);
 criterion_main!(benches);
+
+fn viewer_image_sizes() -> Vec<usize> {
+    let mut sizes = vec![256, DEFAULT_IMAGE_SIZE];
+    if std::env::var("BURN_JEPA_BENCH_1024").ok().as_deref() == Some("1") {
+        sizes.push(1024);
+    }
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}

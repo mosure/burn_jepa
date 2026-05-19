@@ -1,0 +1,36 @@
+[package]
+name = "burn_jepa_reconstruction"
+description = "Low-resolution V-JEPA token feature to image reconstruction decoder for Burn"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/mosure/burn_jepa"
+repository = "https://github.com/mosure/burn_jepa"
+documentation = "https://docs.rs/burn_jepa_reconstruction"
+readme = "README.md"
+categories = ["computer-vision", "science"]
+keywords = ["burn", "jepa", "reconstruction", "decoder", "vision"]
+
+[features]
+default = ["ndarray"]
+ndarray = ["burn/ndarray"]
+flex = ["burn/flex"]
+dispatch = ["burn/dispatch"]
+webgpu = ["burn/webgpu"]
+wgpu = ["burn/wgpu"]
+cuda = ["burn/cuda"]
+fusion = ["burn/fusion"]
+
+[dependencies]
+anyhow = "1"
+burn = { version = "0.21.0", default-features = false, features = ["autodiff", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "reconstruction_forward"
+harness = false

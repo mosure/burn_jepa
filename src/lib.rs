@@ -16,6 +16,8 @@ mod pca;
 mod pipeline;
 mod positional;
 mod quantization;
+#[cfg(not(target_arch = "wasm32"))]
+mod reconstruction_training;
 pub mod runtime;
 mod safetensors_io;
 #[cfg(any(
@@ -45,6 +47,12 @@ pub use autogaze::{
 pub use burn_anyup::{
     AnyUp, AnyUpAttentionMode, AnyUpConfig, AnyUpImageContext, AnyUpImageGrid, AnyUpLoadOptions,
     AnyUpLoadReport,
+};
+pub use burn_jepa_reconstruction::{
+    JepaReconstructionConfig, JepaReconstructionDecoder, JepaReconstructionFitReport,
+    JepaReconstructionOutputActivation, JepaReconstructionTrainConfig, JepaReconstructionUpBlock,
+    fit_reconstruction_decoder, reconstruction_mse, reconstruction_psnr,
+    reconstruction_psnr_scalar,
 };
 pub use burn_store::ApplyResult as BurnStoreApplyResult;
 pub use config::{
@@ -94,32 +102,46 @@ pub use model_package::{
     BurnAnyUpModelBootstrapConfig, BurnAnyUpModelDeployBundleReport, BurnAnyUpModelPackageFiles,
     BurnAnyUpModelProfile, BurnAnyUpPackageManifest, BurnJepaModelBootstrapConfig,
     BurnJepaModelDeployBundleReport, BurnJepaModelPackageFiles, BurnJepaModelProfile,
-    BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, BurnpackPartEntry,
-    BurnpackPartsManifest, BurnpackPartsReport, DEFAULT_BURN_ANYUP_CHECKPOINT_PATH,
-    DEFAULT_BURN_ANYUP_MODEL_BASE_URL, DEFAULT_BURN_ANYUP_MODEL_CACHE_SUBDIR,
-    DEFAULT_BURN_ANYUP_MODEL_ROOT_URL, DEFAULT_BURN_JEPA_MODEL_BASE_URL,
-    DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR, DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR,
-    DEFAULT_BURN_JEPA_MODEL_ROOT_URL, DEFAULT_BURNPACK_SHARD_MAX_BYTES, apply_burnpack_parts,
-    burn_anyup_model_profile_base_url, burn_jepa_model_profile_base_url, burnpack_dtype_counts,
+    BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest,
+    BurnJepaReconstructionModelBootstrapConfig, BurnJepaReconstructionModelDeployBundleReport,
+    BurnJepaReconstructionModelPackageFiles, BurnJepaReconstructionModelProfile,
+    BurnJepaReconstructionPackageManifest, BurnpackPartEntry, BurnpackPartsManifest,
+    BurnpackPartsReport, DEFAULT_BURN_ANYUP_CHECKPOINT_PATH, DEFAULT_BURN_ANYUP_MODEL_BASE_URL,
+    DEFAULT_BURN_ANYUP_MODEL_CACHE_SUBDIR, DEFAULT_BURN_ANYUP_MODEL_ROOT_URL,
+    DEFAULT_BURN_JEPA_MODEL_BASE_URL, DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR,
+    DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR, DEFAULT_BURN_JEPA_MODEL_ROOT_URL,
+    DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL,
+    DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_CACHE_SUBDIR,
+    DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_ROOT_URL, DEFAULT_BURNPACK_SHARD_MAX_BYTES,
+    apply_burnpack_parts, burn_anyup_model_profile_base_url, burn_jepa_model_profile_base_url,
+    burn_jepa_reconstruction_model_profile_base_url, burnpack_dtype_counts,
     burnpack_parts_dtype_counts, burnpack_parts_manifest_path, load_anyup_burnpack_parts,
-    load_ttt_burnpack, load_ttt_burnpack_parts, load_vjepa_burnpack, load_vjepa_burnpack_parts,
-    manifest_has_all_parts, module_dtype_counts, read_parts_manifest,
-    resolve_package_manifest_entry_path, resolve_part_entry_path, save_anyup_burnpack,
-    save_module_burnpack, save_ttt_burnpack, save_vjepa_burnpack, write_anyup_package_manifest,
+    load_jepa_reconstruction_burnpack_parts, load_ttt_burnpack, load_ttt_burnpack_parts,
+    load_vjepa_burnpack, load_vjepa_burnpack_parts, manifest_has_all_parts, module_dtype_counts,
+    read_parts_manifest, resolve_package_manifest_entry_path, resolve_part_entry_path,
+    save_anyup_burnpack, save_jepa_reconstruction_burnpack, save_module_burnpack,
+    save_ttt_burnpack, save_vjepa_burnpack, write_anyup_package_manifest,
     write_burn_anyup_model_deploy_bundle, write_burn_jepa_model_deploy_bundle,
-    write_burnpack_parts_for_browser, write_pipeline_package_manifest,
+    write_burn_jepa_reconstruction_model_deploy_bundle, write_burnpack_parts_for_browser,
+    write_jepa_reconstruction_package_manifest, write_pipeline_package_manifest,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use model_package::{
     burn_anyup_model_package_cache_complete, burn_jepa_model_package_cache_complete,
-    default_burn_anyup_model_cache_root, default_burn_anyup_model_cache_root_with_config,
-    default_burn_jepa_model_cache_root, default_burn_jepa_model_cache_root_with_config,
+    burn_jepa_reconstruction_model_package_cache_complete, default_burn_anyup_model_cache_root,
+    default_burn_anyup_model_cache_root_with_config, default_burn_jepa_model_cache_root,
+    default_burn_jepa_model_cache_root_with_config,
+    default_burn_jepa_reconstruction_model_cache_root,
+    default_burn_jepa_reconstruction_model_cache_root_with_config,
     resolve_or_bootstrap_burn_anyup_model_package,
     resolve_or_bootstrap_burn_anyup_model_package_with_config,
     resolve_or_bootstrap_burn_anyup_model_package_with_config_and_progress,
     resolve_or_bootstrap_burn_jepa_model_package,
     resolve_or_bootstrap_burn_jepa_model_package_with_config,
     resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress,
+    resolve_or_bootstrap_burn_jepa_reconstruction_model_package,
+    resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config,
+    resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config_and_progress,
 };
 pub use nodes::{
     FnOutputNode, RgbaVideoInput, SparseJepaAutogazeSparsityConfig, SparseJepaInputNode,

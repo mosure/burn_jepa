@@ -15,10 +15,12 @@ pub(crate) struct JepaPanelTextures {
     pub(crate) input_image: Handle<Image>,
     pub(crate) mask_image: Handle<Image>,
     pub(crate) low_res_image: Handle<Image>,
+    pub(crate) reconstruction_image: Handle<Image>,
     pub(crate) high_res_image: Handle<Image>,
     pub(crate) input_entity: Option<Entity>,
     pub(crate) mask_entity: Option<Entity>,
     pub(crate) low_res_entity: Option<Entity>,
+    pub(crate) reconstruction_entity: Option<Entity>,
     pub(crate) high_res_entity: Option<Entity>,
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -31,10 +33,12 @@ impl Default for JepaPanelTextures {
             input_image: Handle::default(),
             mask_image: Handle::default(),
             low_res_image: Handle::default(),
+            reconstruction_image: Handle::default(),
             high_res_image: Handle::default(),
             input_entity: None,
             mask_entity: None,
             low_res_entity: None,
+            reconstruction_entity: None,
             high_res_entity: None,
             width: 1,
             height: 1,
@@ -66,6 +70,7 @@ pub(crate) enum StagePanelData {
         mask_rgba: Tensor<JepaBevyBackend, 3>,
         low_res_rgba: Tensor<JepaBevyBackend, 3>,
         high_res_rgba: Option<Tensor<JepaBevyBackend, 3>>,
+        reconstruction_rgba: Option<Tensor<JepaBevyBackend, 3>>,
     },
     Host {
         width: u32,
@@ -73,6 +78,7 @@ pub(crate) enum StagePanelData {
         mask_rgba: Vec<u8>,
         low_res_rgba: Vec<u8>,
         high_res_rgba: Option<Vec<u8>>,
+        reconstruction_rgba: Option<Vec<u8>>,
     },
 }
 
@@ -87,6 +93,19 @@ pub(crate) enum HighResPanelData {
         width: u32,
         height: u32,
         high_res_rgba: Vec<u8>,
+    },
+}
+
+pub(crate) enum ReconstructionPanelData {
+    Tensor {
+        width: u32,
+        height: u32,
+        reconstruction_rgba: Tensor<JepaBevyBackend, 3>,
+    },
+    Host {
+        width: u32,
+        height: u32,
+        reconstruction_rgba: Vec<u8>,
     },
 }
 
@@ -164,6 +183,7 @@ pub(crate) fn apply_stage_panels_to_world(
                 mask_rgba,
                 low_res_rgba,
                 high_res_rgba,
+                reconstruction_rgba,
             },
             BevyJepaDisplayTransfer::Gpu,
         ) => {
@@ -171,6 +191,14 @@ pub(crate) fn apply_stage_panels_to_world(
             if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
                 for handle in [&texture.mask_image, &texture.low_res_image] {
                     set_gpu_visualization_image(handle, width, height, &mut images);
+                }
+                if reconstruction_rgba.is_some() {
+                    set_gpu_visualization_image(
+                        &texture.reconstruction_image,
+                        width,
+                        height,
+                        &mut images,
+                    );
                 }
                 if high_res_rgba.is_some() {
                     set_gpu_visualization_image(
@@ -201,6 +229,14 @@ pub(crate) fn apply_stage_panels_to_world(
                     high_res_rgba,
                 );
             }
+            if let Some(reconstruction_rgba) = reconstruction_rgba {
+                set_gpu_panel_upload_handle(
+                    world,
+                    texture.reconstruction_entity,
+                    texture.reconstruction_image.clone(),
+                    reconstruction_rgba,
+                );
+            }
         }
         (
             StagePanelData::Host {
@@ -209,6 +245,7 @@ pub(crate) fn apply_stage_panels_to_world(
                 mask_rgba,
                 low_res_rgba,
                 high_res_rgba,
+                reconstruction_rgba,
             },
             _,
         ) => {
@@ -235,6 +272,15 @@ pub(crate) fn apply_stage_panels_to_world(
                         width,
                         height,
                         high_res_rgba,
+                        &mut images,
+                    );
+                }
+                if let Some(reconstruction_rgba) = reconstruction_rgba {
+                    set_host_visualization_image(
+                        &texture.reconstruction_image,
+                        width,
+                        height,
+                        reconstruction_rgba,
                         &mut images,
                     );
                 }
@@ -305,6 +351,68 @@ pub(crate) fn apply_high_res_panel_to_world(
     }
 }
 
+pub(crate) fn apply_reconstruction_panel_to_world(
+    world: &mut World,
+    image_data: ReconstructionPanelData,
+    transfer: BevyJepaDisplayTransfer,
+) {
+    let Some(texture) = world.get_resource::<JepaPanelTextures>().cloned() else {
+        return;
+    };
+    let mut panel_size = (texture.width, texture.height);
+    match (image_data, transfer) {
+        (
+            ReconstructionPanelData::Tensor {
+                width,
+                height,
+                reconstruction_rgba,
+            },
+            BevyJepaDisplayTransfer::Gpu,
+        ) => {
+            panel_size = (width, height);
+            if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
+                set_gpu_visualization_image(
+                    &texture.reconstruction_image,
+                    width,
+                    height,
+                    &mut images,
+                );
+            }
+            set_gpu_panel_upload_handle(
+                world,
+                texture.reconstruction_entity,
+                texture.reconstruction_image.clone(),
+                reconstruction_rgba,
+            );
+        }
+        (
+            ReconstructionPanelData::Host {
+                width,
+                height,
+                reconstruction_rgba,
+            },
+            _,
+        ) => {
+            panel_size = (width, height);
+            remove_gpu_handle(world, texture.reconstruction_entity);
+            if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
+                set_host_visualization_image(
+                    &texture.reconstruction_image,
+                    width,
+                    height,
+                    reconstruction_rgba,
+                    &mut images,
+                );
+            }
+        }
+        (ReconstructionPanelData::Tensor { .. }, BevyJepaDisplayTransfer::Cpu) => {}
+    }
+    if let Some(mut texture) = world.get_resource_mut::<JepaPanelTextures>() {
+        texture.width = panel_size.0.max(1);
+        texture.height = panel_size.1.max(1);
+    }
+}
+
 pub(crate) fn clear_completed_gpu_uploads(
     mut commands: Commands,
     mut query: Query<(Entity, &mut BevyBurnHandle<JepaBevyBackend>), With<OneShotGpuUpload>>,
@@ -352,6 +460,7 @@ fn remove_panel_gpu_handles(world: &mut World, texture: &JepaPanelTextures) {
         texture.input_entity,
         texture.mask_entity,
         texture.low_res_entity,
+        texture.reconstruction_entity,
         texture.high_res_entity,
     ]
     .into_iter()

@@ -16,6 +16,7 @@ cargo run -p bevy_jepa -- --source static --image-path /path/to/frame.png
 cargo run -p bevy_jepa -- --source synthetic-local-motion --mask-source patch-diff
 cargo run -p bevy_jepa -- --source synthetic-local-motion --mask-source patch-diff --image-size 256
 cargo run -p bevy_jepa -- --source camera --anyup-weights /path/to/anyup_multi_backbone.pth --anyup-attention-mode upstream-masked
+cargo run -p bevy_jepa -- --reconstruction-every 8
 cargo run -p bevy_jepa -- --encoder-source tiny-test --source synthetic-local-motion
 ```
 
@@ -78,7 +79,8 @@ to startup; use `--no-prewarm-shape-buckets` to disable it.
 The pipeline image size is at least 256x256, defaults to 512x512 sparse
 encoding, and is rounded up to a multiple of the 16px V-JEPA patch size. The
 default token grid is 32x32; `--image-size 256` uses the smaller 16x16-grid
-path.
+path, while `--image-size 1024` enables a 64x64-grid diagnostic path that is
+substantially more expensive.
 
 The default view renders three stage panels:
 
@@ -88,9 +90,19 @@ The default view renders three stage panels:
 
 High-resolution AnyUp PCA is hidden when `--high-res-pca-every 0` (the
 default) and appears as a fourth panel when AnyUp is enabled. Open the compact
-`controls` submenu, or press `C`, to switch TTT/base model packages, 256/512
-input size, AnyUp cadence and attention mode, patch-diff threshold, and bounded
-refresh modes without crowding the default viewer.
+`controls` submenu, or press `C`, to switch TTT/base model packages,
+256/512/1024 input size, token reconstruction cadence, AnyUp cadence and
+attention mode, patch-diff threshold, and bounded refresh modes without
+crowding the default viewer.
+
+Low-resolution token reconstruction is also hidden by default and appears as a
+separate panel when `--reconstruction-every N` is positive. It decodes the
+current JEPA token-cache feature grid directly back to RGB, which gives a
+different artifact view from PCA: stale or incoherent sparse cache writes show
+up as image reconstruction errors. The stage metrics column reports decoder
+latency and PSNR against the denormalized input crop. Reconstruction is loaded
+and packaged separately from V-JEPA and AnyUp via the
+`burn_jepa_reconstruction` crate.
 
 The viewer preprocesses camera/static frames with the same ImageNet
 mean/std normalization expected by V-JEPA and upstream AnyUp. When high-res PCA
@@ -128,11 +140,10 @@ AnyUp -> PCA pipeline then runs on the square crop. The wasm page
 uses `navigator.mediaDevices.getUserMedia` and forwards frames through the
 exported `frame_input(...)` function; `?source=static` uses generated or
 `?image-url=...` frames without requesting a webcam.
-Patch-diff mask refresh is enabled by default for the live cache: slow
-subthreshold changes accumulate, old token positions are age-refreshed, and a
-small deterministic blue-noise refresh probes quiet regions. The extra writes
-are capped by unused context budget, so high-motion threshold hits still win.
-Use `--no-patch-diff-refresh` for legacy instantaneous masks.
+Patch-diff mask refresh is off by default for the live cache. Dilation is the
+preferred expansion mechanism; legacy subthreshold, age, and blue-noise refresh
+can still be enabled explicitly for experiments where the extra probes are
+worth the added mask policy complexity.
 Model loading prefers sharded `.bpk` package manifests. Exported packages store
 floating-point records as f16 for deployment size, and the native/wasm loaders
 upcast those records into the active backend dtype. Native JEPA runs check
@@ -163,6 +174,20 @@ Use `--anyup-model-base-url`, `--anyup-model-cache-dir`,
 `--no-anyup-model-download`, or wasm query params `?anyup-model-base=...` and
 `?anyup-model-manifest=...` to override it.
 
+When `--reconstruction-every` is positive, the RGB reconstruction panel uses a
+sharded `burn_jepa_reconstruction` package. Native runs check
+`--reconstruction-model-manifest`,
+`BURN_JEPA_RECONSTRUCTION_MODEL_MANIFEST`,
+`target/burn_jepa_reconstruction/{reconstruction_model_profile}/manifest.json`,
+then `~/.burn_jepa/models/burn_jepa_reconstruction/{profile}`. The default
+route is
+`https://aberration.technology/model/burn_jepa_reconstruction/low_res_v1/manifest.json`.
+Use `--reconstruction-model-base-url`,
+`--reconstruction-model-cache-dir`, `--no-reconstruction-model-download`, or
+wasm query params `?reconstruction-model-base=...`,
+`?reconstruction-model-manifest=...`, and `?reconstruction-every=8` to override
+it.
+
 ```bash
 cargo run --bin burn-jepa -- export-bpk \
   --config ../../configs/deploy/vjepa21-base-bpk-export.toml \
@@ -186,6 +211,16 @@ cargo run --no-default-features --features ndarray --bin burn-jepa -- export-any
   --shard-mib 20 \
   --model-profile anyup_multi_backbone \
   --deploy-dir ../../target/burn_anyup/anyup_multi_backbone \
+  --overwrite-shards \
+  --overwrite-deploy
+cargo run --no-default-features --features ndarray --bin burn-jepa -- export-reconstruction-bpk \
+  --output ../../target/burn_jepa_reconstruction-build/low_res_v1/jepa_reconstruction.bpk \
+  --input-dim 768 \
+  --hidden-dim 256 \
+  --patch-size 16 \
+  --shard-mib 20 \
+  --model-profile low_res_v1 \
+  --deploy-dir ../../target/burn_jepa_reconstruction/low_res_v1 \
   --overwrite-shards \
   --overwrite-deploy
 python3 -m http.server 8091 -d ../../target/burn-jepa-web/model
@@ -278,6 +313,7 @@ Bevy render schedule:
 ```bash
 cargo bench -p bevy_jepa --bench viewer_pipeline -- --sample-size 10
 cargo bench --bench highres_anyup_pca_pipeline --features webgpu -- highres_sparse_jepa_anyup_pca_e2e_wgpu/viewer512_sparse100
+BURN_JEPA_BENCH_1024=1 cargo bench -p bevy_jepa --bench viewer_pipeline -- --sample-size 10 1024
 ```
 
 `*_low_res_cache_update` measures sparse mask generation, sparse JEPA encode,

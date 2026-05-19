@@ -7,8 +7,8 @@ use std::{
 
 use bevy::prelude::Resource;
 use burn_jepa::{
-    AnyUpAttentionMode, BurnAnyUpModelProfile, BurnJepaModelProfile, FeatureFrameEncodeRoute,
-    FeatureFrameSparseEncodeMode,
+    AnyUpAttentionMode, BurnAnyUpModelProfile, BurnJepaModelProfile,
+    BurnJepaReconstructionModelProfile, FeatureFrameEncodeRoute, FeatureFrameSparseEncodeMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,10 @@ pub const DEFAULT_MODEL_MANIFEST_PATH: &str =
 pub const DEFAULT_ANYUP_PACKAGE_DIR: &str = "target/burn_anyup";
 pub const DEFAULT_ANYUP_MODEL_MANIFEST_PATH: &str =
     "target/burn_anyup/anyup_multi_backbone/manifest.json";
+pub const DEFAULT_RECONSTRUCTION_PACKAGE_DIR: &str = "target/burn_jepa_reconstruction";
+pub const DEFAULT_RECONSTRUCTION_MODEL_MANIFEST_PATH: &str =
+    "target/burn_jepa_reconstruction/low_res_v1/manifest.json";
+pub const DEFAULT_RECONSTRUCTION_EVERY: u64 = 0;
 pub const DEFAULT_TTT_MODEL_PATH: &str =
     "target/burn-jepa-production-final/stage1-stream-tbptt/ttt-model.mpk";
 pub const DEFAULT_VJEPA21_CHECKPOINT_DIR: &str = "~/.cache/burn_jepa/vjepa2_1_vitb_dist_vitG_384";
@@ -48,6 +52,7 @@ pub const DEFAULT_VJEPA21_WEIGHTS_NAME: &str = "model.pt";
 pub type BevyJepaEncodePath = FeatureFrameEncodeRoute;
 pub type BevyJepaAnyUpModelPackageProfile = BurnAnyUpModelProfile;
 pub type BevyJepaModelPackageProfile = BurnJepaModelProfile;
+pub type BevyJepaReconstructionModelPackageProfile = BurnJepaReconstructionModelProfile;
 pub type BevyJepaSparseEncodeMode = FeatureFrameSparseEncodeMode;
 
 pub fn default_model_manifest_path_for_profile(profile: BevyJepaModelPackageProfile) -> PathBuf {
@@ -60,6 +65,14 @@ pub fn default_anyup_model_manifest_path_for_profile(
     profile: BevyJepaAnyUpModelPackageProfile,
 ) -> PathBuf {
     PathBuf::from(DEFAULT_ANYUP_PACKAGE_DIR)
+        .join(profile.as_str())
+        .join("manifest.json")
+}
+
+pub fn default_reconstruction_model_manifest_path_for_profile(
+    profile: BevyJepaReconstructionModelPackageProfile,
+) -> PathBuf {
+    PathBuf::from(DEFAULT_RECONSTRUCTION_PACKAGE_DIR)
         .join(profile.as_str())
         .join("manifest.json")
 }
@@ -288,6 +301,12 @@ pub struct BevyJepaConfig {
     pub anyup_model_base_url: String,
     pub anyup_model_auto_download: bool,
     pub anyup_attention_mode: AnyUpAttentionMode,
+    pub reconstruction_model_manifest_path: Option<PathBuf>,
+    pub reconstruction_model_cache_dir: Option<PathBuf>,
+    pub reconstruction_model_profile: BevyJepaReconstructionModelPackageProfile,
+    pub reconstruction_model_base_url: String,
+    pub reconstruction_model_auto_download: bool,
+    pub reconstruction_every: u64,
     #[serde(flatten)]
     pub pipeline: FeatureFrameViewerConfig,
     pub show_metrics: bool,
@@ -324,6 +343,15 @@ impl Default for BevyJepaConfig {
             ),
             anyup_model_auto_download: true,
             anyup_attention_mode: AnyUpAttentionMode::EfficientLocal,
+            reconstruction_model_manifest_path: None,
+            reconstruction_model_cache_dir: None,
+            reconstruction_model_profile: BevyJepaReconstructionModelPackageProfile::default(),
+            reconstruction_model_base_url:
+                burn_jepa::burn_jepa_reconstruction_model_profile_base_url(
+                    BevyJepaReconstructionModelPackageProfile::default(),
+                ),
+            reconstruction_model_auto_download: true,
+            reconstruction_every: DEFAULT_RECONSTRUCTION_EVERY,
             pipeline: FeatureFrameViewerConfig::default(),
             show_metrics: true,
             camera_width: DEFAULT_CAMERA_WIDTH,

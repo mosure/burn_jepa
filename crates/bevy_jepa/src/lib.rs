@@ -23,12 +23,14 @@ use burn::tensor::{
     module::interpolate,
     ops::{InterpolateMode, InterpolateOptions},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use burn_jepa::reconstruction_psnr_scalar;
 use burn_jepa::{
     AnyUp, AnyUpImageGrid, FeatureFrameBatch, FeatureFrameMetrics, FeatureFramePipeline,
     FeatureFramePipelineConfig, FeatureFrameRequest, FeatureFrameSparseEncodeMode,
     FeaturePcaProjector, FeaturePcaUpdateConfig, FrameId, HighResFrameArtifacts,
-    LowResFrameArtifacts, SparseTokenMask, TokenGridShape, VJEPA_IMAGE_MEAN, VJEPA_IMAGE_STD,
-    VJepaConfig, shape_prewarm_masks,
+    JepaReconstructionDecoder, LowResFrameArtifacts, SparseTokenMask, TokenGridShape,
+    VJEPA_IMAGE_MEAN, VJEPA_IMAGE_STD, VJepaConfig, shape_prewarm_masks,
 };
 #[cfg(feature = "sparse-patchify-wgpu")]
 use burn_jepa::{SparseMaskBatch, SparsePatchifyBatchPlan};
@@ -49,11 +51,12 @@ use burn_jepa::{
 pub use config::{
     BevyJepaAnyUpModelPackageProfile, BevyJepaConfig, BevyJepaDisplayTransfer, BevyJepaEncodePath,
     BevyJepaEncoderSource, BevyJepaFrameSource, BevyJepaMaskSource, BevyJepaModelPackageProfile,
-    BevyJepaSparseEncodeMode, DEFAULT_ANYUP_CHECKPOINT_PATH, DEFAULT_ANYUP_CHUNK_SIZE,
-    DEFAULT_ANYUP_MODEL_MANIFEST_PATH, DEFAULT_ANYUP_PACKAGE_DIR,
-    DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CAMERA_FPS, DEFAULT_CAMERA_HEIGHT,
-    DEFAULT_CAMERA_WIDTH, DEFAULT_CONTEXT_DENSITY, DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE,
-    DEFAULT_MIN_CONTEXT_DENSITY, DEFAULT_MODEL_MANIFEST_PATH, DEFAULT_MODEL_PACKAGE_DIR,
+    BevyJepaReconstructionModelPackageProfile, BevyJepaSparseEncodeMode,
+    DEFAULT_ANYUP_CHECKPOINT_PATH, DEFAULT_ANYUP_CHUNK_SIZE, DEFAULT_ANYUP_MODEL_MANIFEST_PATH,
+    DEFAULT_ANYUP_PACKAGE_DIR, DEFAULT_BOOTSTRAP_CONTEXT_DENSITY, DEFAULT_CAMERA_FPS,
+    DEFAULT_CAMERA_HEIGHT, DEFAULT_CAMERA_WIDTH, DEFAULT_CONTEXT_DENSITY,
+    DEFAULT_HIGH_RES_PCA_EVERY, DEFAULT_IMAGE_SIZE, DEFAULT_MIN_CONTEXT_DENSITY,
+    DEFAULT_MODEL_MANIFEST_PATH, DEFAULT_MODEL_PACKAGE_DIR,
     DEFAULT_PATCH_DIFF_AGE_REFRESH_INTERVAL_FRAMES, DEFAULT_PATCH_DIFF_AGE_REFRESH_MAX_DENSITY,
     DEFAULT_PATCH_DIFF_BLUE_NOISE_REFRESH_DENSITY, DEFAULT_PATCH_DIFF_DENSE_FALLBACK_DENSITY,
     DEFAULT_PATCH_DIFF_DILATION_TILES, DEFAULT_PATCH_DIFF_QUALITY,
@@ -61,17 +64,19 @@ pub use config::{
     DEFAULT_PATCH_DIFF_SUBTHRESHOLD_DECAY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY,
     DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER, DEFAULT_PATCH_DIFF_THRESHOLD,
     DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES, DEFAULT_PCA_UPDATE_EVERY,
-    DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
+    DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS, DEFAULT_RECONSTRUCTION_EVERY,
+    DEFAULT_RECONSTRUCTION_MODEL_MANIFEST_PATH, DEFAULT_RECONSTRUCTION_PACKAGE_DIR,
     DEFAULT_SPARSE_MASK_BUCKET_DENSITIES, DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
     DEFAULT_TTT_MODEL_PATH, DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH,
     DEFAULT_VJEPA21_WEIGHTS_NAME, FeatureFrameViewerConfig, MIN_PIPELINE_IMAGE_SIZE,
     PIPELINE_IMAGE_SIZE_MULTIPLE, PatchDiffRefreshConfig,
     default_anyup_model_manifest_path_for_profile, default_model_manifest_path_for_profile,
+    default_reconstruction_model_manifest_path_for_profile,
 };
 use display::{
-    HighResPanelData, InputPanelData, JepaPanelTextures, StagePanelData,
-    apply_high_res_panel_to_world, apply_input_panel_to_world, apply_stage_panels_to_world,
-    clear_completed_gpu_uploads,
+    HighResPanelData, InputPanelData, JepaPanelTextures, ReconstructionPanelData, StagePanelData,
+    apply_high_res_panel_to_world, apply_input_panel_to_world, apply_reconstruction_panel_to_world,
+    apply_stage_panels_to_world, clear_completed_gpu_uploads,
 };
 #[cfg(test)]
 use mask::run_sparse_mask_node;
@@ -80,7 +85,9 @@ pub use metrics::{BevyJepaMetrics, BevyJepaStepOutput};
 use metrics::{MetricFrameContext, bevy_metrics_from_stage, metrics_source_status};
 #[cfg(test)]
 use metrics::{format_metrics_line, format_metrics_waiting_line};
-use model_loading::{effective_anyup_weights, load_viewer_anyup, load_viewer_encoder};
+use model_loading::{
+    effective_anyup_weights, load_viewer_anyup, load_viewer_encoder, load_viewer_reconstruction,
+};
 #[cfg(test)]
 use model_loading::{
     effective_ttt_model_path, resolve_repo_relative_path, tiny_viewer_model_config,
@@ -220,6 +227,8 @@ struct JepaRuntime {
     active_task: Option<Task<JepaAsyncTaskOutput>>,
     pending_stage: Option<PendingStageFrame>,
     pending_shape_prewarm: Option<PendingShapePrewarm>,
+    reconstruction: Option<JepaReconstructionDecoder<JepaBevyBackend>>,
+    reconstruction_signature: Option<RuntimePipelineSignature>,
     high_res_runtime: Option<AnyUpHighResRuntime>,
     high_res_signature: Option<RuntimePipelineSignature>,
     high_res_task: Option<Task<HighResAsyncTaskOutput>>,
@@ -233,6 +242,7 @@ struct JepaRuntime {
     input_frames_seen: u64,
     completed_frames: u64,
     high_res_frames: u64,
+    reconstruction_frames: u64,
     pca_update_events: u64,
     latest_input_sequence: u64,
     dropped_frames: usize,
@@ -241,15 +251,20 @@ struct JepaRuntime {
     last_input_at: Option<ViewerInstant>,
     last_completion_at: Option<ViewerInstant>,
     last_high_res_completion_at: Option<ViewerInstant>,
+    last_reconstruction_completion_at: Option<ViewerInstant>,
     last_pca_update_at: Option<ViewerInstant>,
     input_fps: f64,
     low_res_fps: f64,
     high_res_fps: f64,
+    reconstruction_fps: f64,
     pca_update_fps: f64,
     last_high_res_anyup_context_us: u64,
     last_high_res_anyup_decode_us: u64,
     last_high_res_pca_us: u64,
     last_high_res_display_tensor_us: u64,
+    last_reconstruction_decode_us: u64,
+    last_reconstruction_display_tensor_us: u64,
+    last_reconstruction_psnr_db: Option<f64>,
     status_message: Option<String>,
     last_error: Option<String>,
     last_logged_error: Option<String>,
@@ -283,6 +298,12 @@ struct RuntimePipelineSignature {
     anyup_model_base_url: String,
     anyup_model_auto_download: bool,
     anyup_attention_mode: burn_jepa::AnyUpAttentionMode,
+    reconstruction_model_manifest_path: Option<PathBuf>,
+    reconstruction_model_cache_dir: Option<PathBuf>,
+    reconstruction_model_profile: BevyJepaReconstructionModelPackageProfile,
+    reconstruction_model_base_url: String,
+    reconstruction_model_auto_download: bool,
+    reconstruction_every: u64,
     anyup_q_chunk_size: usize,
     sparse_encode_mode: BevyJepaSparseEncodeMode,
     patch_diff_threshold_bits: u32,
@@ -339,6 +360,12 @@ impl RuntimePipelineSignature {
             anyup_model_base_url: config.anyup_model_base_url.clone(),
             anyup_model_auto_download: config.anyup_model_auto_download,
             anyup_attention_mode: config.anyup_attention_mode,
+            reconstruction_model_manifest_path: config.reconstruction_model_manifest_path.clone(),
+            reconstruction_model_cache_dir: config.reconstruction_model_cache_dir.clone(),
+            reconstruction_model_profile: config.reconstruction_model_profile,
+            reconstruction_model_base_url: config.reconstruction_model_base_url.clone(),
+            reconstruction_model_auto_download: config.reconstruction_model_auto_download,
+            reconstruction_every: config.reconstruction_every,
             anyup_q_chunk_size: config.anyup_q_chunk_size,
             sparse_encode_mode: config.sparse_encode_mode,
             patch_diff_threshold_bits: config.patch_diff_threshold.to_bits(),
@@ -457,6 +484,7 @@ enum BevyJepaStepMode {
     StageOnly,
     DisplayPanels(FeatureFrameRequest),
     StageRequest(FeatureFrameRequest),
+    ReconstructionPanels(FeatureFrameRequest),
 }
 
 impl BevyJepaHeadlessPipeline {
@@ -488,6 +516,13 @@ impl BevyJepaHeadlessPipeline {
         request: FeatureFrameRequest,
     ) -> Result<BevyJepaStepOutput> {
         self.step_internal(BevyJepaStepMode::StageRequest(request))
+    }
+
+    pub fn step_with_reconstruction_request(
+        &mut self,
+        request: FeatureFrameRequest,
+    ) -> Result<BevyJepaStepOutput> {
+        self.step_internal(BevyJepaStepMode::ReconstructionPanels(request))
     }
 
     fn step_internal(&mut self, mode: BevyJepaStepMode) -> Result<BevyJepaStepOutput> {
@@ -531,6 +566,7 @@ enum MetricValueKind {
     Error,
     FpsInput,
     FpsLow,
+    FpsRecon,
     FpsHigh,
     FpsRolling,
     StageInputSource,
@@ -544,6 +580,8 @@ enum MetricValueKind {
     StageCacheLatency,
     StageTokenViewLatency,
     StageLowResPcaLatency,
+    StageReconstructionLatency,
+    StageReconstructionQuality,
     StagePcaBasis,
     StagePcaUpdates,
     StageAnyUpLatency,
@@ -568,6 +606,7 @@ enum JepaControlsTab {
     Pipeline,
     Mask,
     Pca,
+    Reconstruction,
     AnyUp,
 }
 
@@ -604,12 +643,16 @@ struct JepaControlHelp {
 #[derive(Component)]
 struct HighResPanelElement;
 
+#[derive(Component)]
+struct ReconstructionPanelElement;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JepaControlAction {
     TogglePanel,
     TabPipeline,
     TabMask,
     TabPca,
+    TabReconstruction,
     TabAnyUp,
     ModelTtt,
     ModelBase,
@@ -617,11 +660,15 @@ enum JepaControlAction {
     PipelineDense,
     Resolution256,
     Resolution512,
+    Resolution1024,
     AnyUpOff,
     AnyUpEvery8,
     AnyUpEvery1,
     AnyUpEfficientLocal,
     AnyUpUpstreamMasked,
+    ReconstructionOff,
+    ReconstructionEvery8,
+    ReconstructionEvery1,
     PcaTrain,
     PcaLock,
     PatchRefresh,
@@ -818,6 +865,11 @@ impl JepaRuntime {
         if needs_init {
             let (encoder, model_config) = load_viewer_encoder(config, image_size, device)?;
             let anyup = load_viewer_anyup(config, device)?;
+            let reconstruction = if config.reconstruction_every > 0 {
+                Some(load_viewer_reconstruction(config, &model_config, device)?)
+            } else {
+                None
+            };
             let pipeline_config = FeatureFramePipelineConfig {
                 anyup_q_chunk_size: Some(config.anyup_q_chunk_size.max(1)),
                 update_pca_online: false,
@@ -838,6 +890,8 @@ impl JepaRuntime {
             let pipeline = self.pipeline.as_ref().expect("pipeline initialized");
             self.pipeline_grid = Some(pipeline.grid());
             self.pipeline_patch_size = Some(model_config.patch_size);
+            self.reconstruction = reconstruction;
+            self.reconstruction_signature = Some(signature.clone());
             self.pending_shape_prewarm = pending_shape_prewarm(config, pipeline, signature.clone());
             self.status_message = self
                 .pending_shape_prewarm
@@ -848,6 +902,11 @@ impl JepaRuntime {
             self.pending_stage = None;
             self.high_res_runtime = None;
             self.high_res_signature = None;
+            self.reconstruction_frames = 0;
+            self.reconstruction_fps = 0.0;
+            self.last_reconstruction_completion_at = None;
+            self.last_reconstruction_decode_us = 0;
+            self.last_reconstruction_psnr_db = None;
             self.high_res_task = None;
             self.pending_high_res = None;
             self.prev_image = None;
@@ -1027,6 +1086,35 @@ impl JepaRuntime {
         run_high_res_anyup_step(runtime, input)
     }
 
+    fn run_reconstruction_frame_inline(
+        &mut self,
+        config: &BevyJepaConfig,
+        input: ReconstructionFrameInput,
+        device: &JepaBevyDevice,
+    ) -> Result<ReconstructionProcessedFrame> {
+        if config.reconstruction_every == 0 {
+            bail!("reconstruction decoder is disabled");
+        }
+        let signature = RuntimePipelineSignature::new(config, config.pipeline_image_size());
+        let needs_init = self
+            .reconstruction_signature
+            .as_ref()
+            .is_none_or(|current| current != &signature)
+            || self.reconstruction.is_none();
+        if needs_init {
+            let Some(model_config) = self.model_config.as_ref() else {
+                bail!("cannot initialize reconstruction decoder before JEPA model config");
+            };
+            self.reconstruction = Some(load_viewer_reconstruction(config, model_config, device)?);
+            self.reconstruction_signature = Some(signature);
+        }
+        let decoder = self
+            .reconstruction
+            .as_ref()
+            .expect("reconstruction decoder initialized");
+        run_reconstruction_step(decoder, input)
+    }
+
     fn record_input_frame(&mut self, sequence: u64) {
         let now = viewer_now();
         if let Some(previous) = self.last_input_at {
@@ -1081,6 +1169,18 @@ impl JepaRuntime {
         self.high_res_frames = self.high_res_frames.saturating_add(1);
     }
 
+    fn record_reconstruction_completion(&mut self) {
+        let now = viewer_now();
+        if let Some(previous) = self.last_reconstruction_completion_at {
+            let seconds = viewer_seconds_since(now, previous);
+            if seconds.is_finite() && seconds > 0.0 {
+                self.reconstruction_fps = 1.0 / seconds;
+            }
+        }
+        self.last_reconstruction_completion_at = Some(now);
+        self.reconstruction_frames = self.reconstruction_frames.saturating_add(1);
+    }
+
     fn apply_high_res_timings(&mut self, processed: &HighResProcessedFrame) {
         self.last_high_res_anyup_context_us = processed.anyup_context_us;
         self.last_high_res_anyup_decode_us = processed.anyup_decode_us;
@@ -1088,15 +1188,23 @@ impl JepaRuntime {
         self.last_high_res_display_tensor_us = processed.display_tensor_us;
     }
 
+    fn apply_reconstruction_timings(&mut self, processed: &ReconstructionProcessedFrame) {
+        self.last_reconstruction_decode_us = processed.decode_us;
+        self.last_reconstruction_display_tensor_us = processed.display_tensor_us;
+        self.last_reconstruction_psnr_db = processed.psnr_db;
+    }
+
     fn apply_runtime_counts(&self, metrics: &mut BevyJepaMetrics) {
         metrics.input_frames_seen = self.input_frames_seen;
         metrics.input_frame_index = self.latest_input_sequence;
         metrics.completed_frames = self.completed_frames;
         metrics.high_res_frames = self.high_res_frames;
+        metrics.reconstruction_frames = self.reconstruction_frames;
         metrics.pca_update_events = self.pca_update_events;
         metrics.input_fps = self.input_fps;
         metrics.low_res_fps = self.low_res_fps;
         metrics.high_res_fps = self.high_res_fps;
+        metrics.reconstruction_fps = self.reconstruction_fps;
         metrics.pca_update_fps = self.pca_update_fps;
         metrics.in_flight_frames = usize::from(self.active_task.is_some())
             + usize::from(self.pending_stage.is_some())
@@ -1112,6 +1220,13 @@ impl JepaRuntime {
             metrics.display_tensor_us = metrics
                 .display_tensor_us
                 .max(self.last_high_res_display_tensor_us);
+        }
+        if self.last_reconstruction_decode_us > 0 {
+            metrics.reconstruction_decode_us = self.last_reconstruction_decode_us;
+            metrics.reconstruction_psnr_db = self.last_reconstruction_psnr_db;
+            metrics.display_tensor_us = metrics
+                .display_tensor_us
+                .max(self.last_reconstruction_display_tensor_us);
         }
     }
 
@@ -1136,6 +1251,10 @@ impl JepaRuntime {
         }
         self.pending_stage = None;
         self.pending_high_res = None;
+        self.last_reconstruction_completion_at = None;
+        self.last_reconstruction_decode_us = 0;
+        self.last_reconstruction_display_tensor_us = 0;
+        self.last_reconstruction_psnr_db = None;
         self.prev_image = None;
         self.prev_rgba = None;
         self.prev_stage_image = None;
@@ -1154,6 +1273,8 @@ impl JepaRuntime {
         self.pipeline_patch_size = None;
         self.high_res_runtime = None;
         self.high_res_signature = None;
+        self.reconstruction = None;
+        self.reconstruction_signature = None;
         self.pending_stage = None;
         self.pending_high_res = None;
         self.pending_shape_prewarm = None;
@@ -1163,6 +1284,7 @@ impl JepaRuntime {
         self.prev_stage_rgba = None;
         self.frame_index = 0;
         self.last_high_res_completion_at = None;
+        self.last_reconstruction_completion_at = None;
         self.last_pca_update_at = None;
         self.pca_update_events = 0;
         self.pca_update_fps = 0.0;
@@ -1170,6 +1292,11 @@ impl JepaRuntime {
         self.last_high_res_anyup_decode_us = 0;
         self.last_high_res_pca_us = 0;
         self.last_high_res_display_tensor_us = 0;
+        self.reconstruction_frames = 0;
+        self.reconstruction_fps = 0.0;
+        self.last_reconstruction_decode_us = 0;
+        self.last_reconstruction_display_tensor_us = 0;
+        self.last_reconstruction_psnr_db = None;
         self.status_message = None;
         self.last_error = None;
     }
@@ -1197,8 +1324,13 @@ fn high_res_panel_enabled(config: &BevyJepaConfig) -> bool {
     config.high_res_pca_every > 0
 }
 
+fn reconstruction_panel_enabled(config: &BevyJepaConfig) -> bool {
+    config.reconstruction_every > 0
+}
+
 fn visible_panel_count(config: &BevyJepaConfig) -> usize {
-    if high_res_panel_enabled(config) { 4 } else { 3 }
+    3 + usize::from(reconstruction_panel_enabled(config))
+        + usize::from(high_res_panel_enabled(config))
 }
 
 fn visible_panel_count_u16(config: &BevyJepaConfig) -> u16 {
@@ -1226,6 +1358,7 @@ fn setup_ui(
     texture.input_image = images.add(empty_panel_image(1, 1));
     texture.mask_image = images.add(empty_panel_image(1, 1));
     texture.low_res_image = images.add(empty_panel_image(1, 1));
+    texture.reconstruction_image = images.add(empty_panel_image(1, 1));
     texture.high_res_image = images.add(empty_panel_image(1, 1));
 
     let mut root = commands.spawn(Node {
@@ -1243,11 +1376,17 @@ fn setup_ui(
     let mut input_entity = None;
     let mut mask_entity = None;
     let mut low_res_entity = None;
+    let mut reconstruction_entity = None;
     let mut high_res_entity = None;
     root.with_children(|builder| {
         input_entity = Some(spawn_panel_image(builder, texture.input_image.clone()));
         mask_entity = Some(spawn_panel_image(builder, texture.mask_image.clone()));
         low_res_entity = Some(spawn_panel_image(builder, texture.low_res_image.clone()));
+        reconstruction_entity = Some(spawn_optional_panel_image(
+            builder,
+            texture.reconstruction_image.clone(),
+            reconstruction_panel_enabled(&config),
+        ));
         high_res_entity = Some(spawn_high_res_panel_image(
             builder,
             texture.high_res_image.clone(),
@@ -1257,12 +1396,14 @@ fn setup_ui(
         spawn_panel_label(builder, "Input", false, true);
         spawn_panel_label(builder, "Sparse mask", false, true);
         spawn_panel_label(builder, "Token PCA", false, true);
+        spawn_reconstruction_panel_label(builder, reconstruction_panel_enabled(&config));
         spawn_panel_label(builder, "AnyUp PCA", true, high_res_panel_enabled(&config));
     });
 
     texture.input_entity = input_entity;
     texture.mask_entity = mask_entity;
     texture.low_res_entity = low_res_entity;
+    texture.reconstruction_entity = reconstruction_entity;
     texture.high_res_entity = high_res_entity;
     texture.root_entity = Some(root_entity);
     commands
@@ -1352,6 +1493,7 @@ fn setup_metrics_overlay(mut commands: Commands, config: Res<BevyJepaConfig>) {
                 spawn_metric_value_line(card, MetricValueKind::FpsRolling);
                 spawn_metric_value_line(card, MetricValueKind::FpsInput);
                 spawn_metric_value_line(card, MetricValueKind::FpsLow);
+                spawn_metric_value_line(card, MetricValueKind::FpsRecon);
                 spawn_metric_value_line(card, MetricValueKind::FpsHigh);
             });
         });
@@ -1416,6 +1558,16 @@ fn setup_metrics_overlay(mut commands: Commands, config: Res<BevyJepaConfig>) {
             );
             spawn_stage_metrics_card(
                 grid,
+                "Reconstruction",
+                &[
+                    MetricValueKind::StageReconstructionLatency,
+                    MetricValueKind::StageReconstructionQuality,
+                    MetricValueKind::StageDisplayLatency,
+                ],
+                true,
+            );
+            spawn_stage_metrics_card(
+                grid,
                 "AnyUp + Display",
                 &[
                     MetricValueKind::StageAnyUpLatency,
@@ -1445,7 +1597,9 @@ fn spawn_stage_metrics_card(
         BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.18)),
         BackgroundColor(Color::srgba(0.025, 0.028, 0.032, 0.74)),
     ));
-    if high_res {
+    if title == "Reconstruction" {
+        entity.insert(ReconstructionPanelElement);
+    } else if high_res {
         entity.insert(HighResPanelElement);
     }
     entity.with_children(|card| {
@@ -1577,6 +1731,7 @@ fn setup_controls_ui(mut commands: Commands) {
                             &[
                                 (JepaControlAction::Resolution256, "256"),
                                 (JepaControlAction::Resolution512, "512"),
+                                (JepaControlAction::Resolution1024, "1024"),
                             ],
                         );
                     });
@@ -1666,6 +1821,22 @@ fn setup_controls_ui(mut commands: Commands) {
                             tab,
                             "Iterations",
                             JepaControlSliderKind::PcaUpdateIterations,
+                        );
+                    });
+                    spawn_controls_tab_panel(panel, JepaControlsTab::Reconstruction, |tab| {
+                        spawn_control_section_title(
+                            tab,
+                            "Token Reconstruction",
+                            "Decode the low-res JEPA token cache back to RGB to inspect sparse-update artifacts.",
+                        );
+                        spawn_control_row(
+                            tab,
+                            "Decode cadence",
+                            &[
+                                (JepaControlAction::ReconstructionOff, "Off"),
+                                (JepaControlAction::ReconstructionEvery8, "1/8"),
+                                (JepaControlAction::ReconstructionEvery1, "1/1"),
+                            ],
                         );
                     });
                     spawn_controls_tab_panel(panel, JepaControlsTab::AnyUp, |tab| {
@@ -1991,6 +2162,7 @@ fn apply_jepa_completion_to_world(
     let mut high_res_completed = None;
     #[cfg(not(target_arch = "wasm32"))]
     let high_res_completed: Option<Result<HighResProcessedFrame, String>> = None;
+    let mut reconstruction_completed: Option<ReconstructionProcessedFrame> = None;
     match completed {
         Ok(processed) => {
             let mut metrics = processed.metrics.clone();
@@ -2017,8 +2189,20 @@ fn apply_jepa_completion_to_world(
                         enqueue_error = Some(err.to_string());
                     }
                 }
+                if let Some(input) = processed.reconstruction_input {
+                    match runtime.run_reconstruction_frame_inline(config, input, device) {
+                        Ok(processed) => {
+                            runtime.record_reconstruction_completion();
+                            runtime.apply_reconstruction_timings(&processed);
+                            reconstruction_completed = Some(processed);
+                        }
+                        Err(err) => {
+                            enqueue_error = Some(err.to_string());
+                        }
+                    }
+                }
                 if let Some(err) = enqueue_error.as_ref() {
-                    runtime.set_error("AnyUp enqueue", err.clone());
+                    runtime.set_error("pipeline sidecar", err.clone());
                 } else {
                     runtime.clear_error();
                 }
@@ -2026,6 +2210,9 @@ fn apply_jepa_completion_to_world(
                 runtime.apply_runtime_counts(&mut metrics);
             }
             apply_stage_panels_to_world(world, processed.panels, transfer);
+            if let Some(processed) = reconstruction_completed {
+                apply_reconstruction_panel_to_world(world, processed.panels, transfer);
+            }
             *world.resource_mut::<BevyJepaMetrics>() = metrics;
             if let Some(completed) = high_res_completed {
                 apply_high_res_completion_to_world(world, transfer, completed);
@@ -2587,6 +2774,32 @@ fn process_runtime_frame(
             source.camera_frame_received,
             request,
         ),
+        BevyJepaStepMode::ReconstructionPanels(request) => {
+            let mut processed = run_stage_pipeline_step(
+                config,
+                pipeline,
+                image.clone(),
+                &masks.write_mask,
+                &masks.encode_mask,
+                id,
+                grid,
+                model_config.patch_size,
+                source.source,
+                source.camera_frame_received,
+                request,
+            )?;
+            if let Some(input) = processed.reconstruction_input.take() {
+                let reconstruction =
+                    runtime.run_reconstruction_frame_inline(config, input, device)?;
+                runtime.record_completion(false, processed.metrics.pca_update_applied);
+                runtime.record_reconstruction_completion();
+                runtime.apply_reconstruction_timings(&reconstruction);
+                runtime.apply_runtime_counts(&mut processed.metrics);
+            }
+            Ok(ProcessedFrame {
+                metrics: processed.metrics,
+            })
+        }
     };
     runtime.prev_image = Some(image);
     runtime.prev_rgba = source.rgba;
@@ -2631,6 +2844,22 @@ struct StageProcessedFrame {
     panels: StagePanelData,
     high_res_updated: bool,
     high_res_input: Option<HighResFrameInput>,
+    reconstruction_input: Option<ReconstructionFrameInput>,
+}
+
+struct ReconstructionFrameInput {
+    image: Tensor<JepaBevyBackend, 4>,
+    low_res_features: Tensor<JepaBevyBackend, 4>,
+    image_size: [usize; 2],
+    display_transfer: BevyJepaDisplayTransfer,
+    sync_measurements: bool,
+}
+
+struct ReconstructionProcessedFrame {
+    panels: ReconstructionPanelData,
+    decode_us: u64,
+    display_tensor_us: u64,
+    psnr_db: Option<f64>,
 }
 
 fn stage_request_for_frame(config: &BevyJepaConfig, frame_index: u64) -> FeatureFrameRequest {
@@ -2640,6 +2869,10 @@ fn stage_request_for_frame(config: &BevyJepaConfig, frame_index: u64) -> Feature
 
 fn high_res_scheduled_for_frame(config: &BevyJepaConfig, frame_index: u64) -> bool {
     config.high_res_pca_every > 0 && frame_index.is_multiple_of(config.high_res_pca_every)
+}
+
+fn reconstruction_scheduled_for_frame(config: &BevyJepaConfig, frame_index: u64) -> bool {
+    config.reconstruction_every > 0 && frame_index.is_multiple_of(config.reconstruction_every)
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -3070,6 +3303,14 @@ fn run_stage_pipeline_step(
             display_transfer: config.display_transfer,
             sync_measurements: sync_measurements_enabled(config),
         });
+    let reconstruction_input =
+        reconstruction_scheduled_for_frame(config, id.sequence).then(|| ReconstructionFrameInput {
+            image: image.clone(),
+            low_res_features: output.low_res.features.clone(),
+            image_size,
+            display_transfer: config.display_transfer,
+            sync_measurements: sync_measurements_enabled(config),
+        });
     let low_res_pca = low_res_pca_or_features(output.low_res)?;
     let high_res_pca = output.high_res.and_then(|high_res| high_res.pca_display);
     let mask_rgba = sparse_mask_to_rgba_tensor::<JepaBevyBackend>(
@@ -3108,6 +3349,7 @@ fn run_stage_pipeline_step(
             mask_rgba,
             low_res_rgba,
             high_res_rgba,
+            reconstruction_rgba: None,
         },
         BevyJepaDisplayTransfer::Cpu => StagePanelData::Host {
             width: image_size[1] as u32,
@@ -3115,6 +3357,7 @@ fn run_stage_pipeline_step(
             mask_rgba: tensor_rgba_to_host(mask_rgba)?,
             low_res_rgba: tensor_rgba_to_host(low_res_rgba)?,
             high_res_rgba: high_res_rgba.map(tensor_rgba_to_host).transpose()?,
+            reconstruction_rgba: None,
         },
     };
     Ok(StageProcessedFrame {
@@ -3122,6 +3365,7 @@ fn run_stage_pipeline_step(
         panels,
         high_res_updated,
         high_res_input,
+        reconstruction_input,
     })
 }
 
@@ -3198,6 +3442,62 @@ fn run_high_res_anyup_step(
         high_res_pca_us,
         display_tensor_us,
         total_us: viewer_elapsed_us(total_start),
+    })
+}
+
+fn run_reconstruction_step(
+    decoder: &JepaReconstructionDecoder<JepaBevyBackend>,
+    input: ReconstructionFrameInput,
+) -> Result<ReconstructionProcessedFrame> {
+    let device = input.image.device();
+
+    let decode_start = viewer_now();
+    let reconstruction = decoder.forward_to_size(input.low_res_features, input.image_size);
+    if input.sync_measurements {
+        sync_bevy_backend(&device)?;
+    }
+    let decode_us = viewer_elapsed_us(decode_start);
+
+    let psnr_db = if input.sync_measurements {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            reconstruction_psnr_scalar(
+                reconstruction.clone(),
+                denormalize_model_image(input.image),
+                1.0,
+            )
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    } else {
+        None
+    };
+    let display_start = viewer_now();
+    let reconstruction_rgba = nchw_to_rgba_tensor(reconstruction)?;
+    let panels = match input.display_transfer {
+        BevyJepaDisplayTransfer::Gpu => ReconstructionPanelData::Tensor {
+            width: input.image_size[1] as u32,
+            height: input.image_size[0] as u32,
+            reconstruction_rgba,
+        },
+        BevyJepaDisplayTransfer::Cpu => ReconstructionPanelData::Host {
+            width: input.image_size[1] as u32,
+            height: input.image_size[0] as u32,
+            reconstruction_rgba: tensor_rgba_to_host(reconstruction_rgba)?,
+        },
+    };
+    if input.sync_measurements {
+        sync_bevy_backend(&device)?;
+    }
+    let display_tensor_us = viewer_elapsed_us(display_start);
+
+    Ok(ReconstructionProcessedFrame {
+        panels,
+        decode_us,
+        display_tensor_us,
+        psnr_db,
     })
 }
 
@@ -3547,6 +3847,14 @@ fn normalize_model_rgb_channel(value: f32, channel: usize) -> f32 {
     (value - VJEPA_IMAGE_MEAN[channel]) / VJEPA_IMAGE_STD[channel]
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn denormalize_model_image(tensor: Tensor<JepaBevyBackend, 4>) -> Tensor<JepaBevyBackend, 4> {
+    let red = tensor.clone().slice_dim(1, 0..1) * VJEPA_IMAGE_STD[0] + VJEPA_IMAGE_MEAN[0];
+    let green = tensor.clone().slice_dim(1, 1..2) * VJEPA_IMAGE_STD[1] + VJEPA_IMAGE_MEAN[1];
+    let blue = tensor.slice_dim(1, 2..3) * VJEPA_IMAGE_STD[2] + VJEPA_IMAGE_MEAN[2];
+    Tensor::cat(vec![red, green, blue], 1)
+}
+
 fn nchw_to_rgba_tensor(tensor: Tensor<JepaBevyBackend, 4>) -> Result<Tensor<JepaBevyBackend, 3>> {
     let [batch, channels, height, width] = tensor.shape().dims::<4>();
     anyhow::ensure!(batch == 1, "display tensor must have batch size 1");
@@ -3739,6 +4047,9 @@ fn metric_value_text(
             .unwrap_or_else(|| "Health   ok".to_string()),
         MetricValueKind::FpsInput => format!("Input    {}", format_metric_fps(metrics.input_fps)),
         MetricValueKind::FpsLow => format!("Low-res  {}", format_metric_fps(metrics.low_res_fps)),
+        MetricValueKind::FpsRecon => {
+            format!("Recon    {}", format_metric_fps(metrics.reconstruction_fps))
+        }
         MetricValueKind::FpsHigh => format!("AnyUp    {}", format_metric_fps(metrics.high_res_fps)),
         MetricValueKind::FpsRolling => format!(
             "Rolling  {}  {}",
@@ -3792,6 +4103,22 @@ fn metric_value_text(
         MetricValueKind::StageLowResPcaLatency => {
             format!("Project  {}", format_metric_ms(metrics.low_res_pca_us))
         }
+        MetricValueKind::StageReconstructionLatency => format!(
+            "Decode   {}  every {}",
+            format_metric_ms(metrics.reconstruction_decode_us),
+            if config.reconstruction_every == 0 {
+                "off".to_string()
+            } else {
+                format!("{}f", config.reconstruction_every)
+            }
+        ),
+        MetricValueKind::StageReconstructionQuality => format!(
+            "PSNR     {}",
+            metrics
+                .reconstruction_psnr_db
+                .map(|value| format!("{value:>5.2} dB"))
+                .unwrap_or_else(|| "--".to_string())
+        ),
         MetricValueKind::StagePcaBasis => format_pca_basis_line(config, metrics),
         MetricValueKind::StagePcaUpdates => format!(
             "Updates  {}  {} total",
@@ -4262,6 +4589,7 @@ fn update_panel_layout(
     mut nodes: ParamSet<(
         Query<&mut Node>,
         Query<&mut Node, With<HighResPanelElement>>,
+        Query<&mut Node, With<ReconstructionPanelElement>>,
         Query<&mut Node, With<MetricsStageGrid>>,
     )>,
 ) {
@@ -4271,7 +4599,7 @@ fn update_panel_layout(
     {
         node.grid_template_columns = RepeatedGridTrack::flex(visible_count as u16, 1.0);
     }
-    let mut stage_grids = nodes.p2();
+    let mut stage_grids = nodes.p3();
     for mut node in &mut stage_grids {
         node.grid_template_columns = RepeatedGridTrack::flex(visible_count as u16, 1.0);
     }
@@ -4283,6 +4611,15 @@ fn update_panel_layout(
     let mut high_res_nodes = nodes.p1();
     for mut node in &mut high_res_nodes {
         node.display = high_res_display;
+    }
+    let reconstruction_display = if reconstruction_panel_enabled(&config) {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    let mut reconstruction_nodes = nodes.p2();
+    for mut node in &mut reconstruction_nodes {
+        node.display = reconstruction_display;
     }
 }
 
@@ -4296,6 +4633,7 @@ fn apply_control_action(
         | JepaControlAction::TabPipeline
         | JepaControlAction::TabMask
         | JepaControlAction::TabPca
+        | JepaControlAction::TabReconstruction
         | JepaControlAction::TabAnyUp => JepaControlReset::None,
         JepaControlAction::ModelTtt => {
             set_model_profile(config, BevyJepaModelPackageProfile::Vjepa21Ttt);
@@ -4321,6 +4659,10 @@ fn apply_control_action(
             config.image_size = 512;
             JepaControlReset::Rebuild
         }
+        JepaControlAction::Resolution1024 => {
+            config.image_size = 1024;
+            JepaControlReset::Rebuild
+        }
         JepaControlAction::AnyUpOff => {
             config.high_res_pca_every = 0;
             JepaControlReset::Rebuild
@@ -4339,6 +4681,18 @@ fn apply_control_action(
         }
         JepaControlAction::AnyUpUpstreamMasked => {
             config.anyup_attention_mode = burn_jepa::AnyUpAttentionMode::UpstreamMasked;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::ReconstructionOff => {
+            config.reconstruction_every = 0;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::ReconstructionEvery8 => {
+            config.reconstruction_every = 8;
+            JepaControlReset::Rebuild
+        }
+        JepaControlAction::ReconstructionEvery1 => {
+            config.reconstruction_every = 1;
             JepaControlReset::Rebuild
         }
         JepaControlAction::PcaTrain => {
@@ -4624,7 +4978,7 @@ fn slider_value_label(config: &BevyJepaConfig, kind: JepaControlSliderKind) -> S
 
 fn controls_summary(config: &BevyJepaConfig) -> String {
     format!(
-        "{} | {} {}px | patch thr {:.3} ({:>4.1}% quality) | expand {} | refresh {} / sub {} / age {} / blue {} | PCA {} | AnyUp {} {}",
+        "{} | {} {}px | patch thr {:.3} ({:>4.1}% quality) | expand {} | refresh {} / sub {} / age {} / blue {} | PCA {} | recon {} | AnyUp {} {}",
         config.model_profile,
         if dense_pipeline_enabled(config) {
             "dense"
@@ -4648,6 +5002,11 @@ fn controls_summary(config: &BevyJepaConfig) -> String {
         } else {
             format!("fit/{}f", config.pca_update_every)
         },
+        if config.reconstruction_every == 0 {
+            "off".to_string()
+        } else {
+            format!("1/{}", config.reconstruction_every)
+        },
         if config.high_res_pca_every == 0 {
             "off".to_string()
         } else {
@@ -4658,14 +5017,15 @@ fn controls_summary(config: &BevyJepaConfig) -> String {
 }
 
 fn default_controls_help() -> &'static str {
-    "Use tabs to switch between pipeline, mask, PCA, and AnyUp settings. Hover a control for details."
+    "Use tabs to switch between pipeline, mask, PCA, reconstruction, and AnyUp settings. Hover a control for details."
 }
 
-fn controls_tab_actions() -> [(JepaControlAction, &'static str); 4] {
+fn controls_tab_actions() -> [(JepaControlAction, &'static str); 5] {
     [
         (JepaControlAction::TabPipeline, "Pipeline"),
         (JepaControlAction::TabMask, "Mask"),
         (JepaControlAction::TabPca, "PCA"),
+        (JepaControlAction::TabReconstruction, "Recon"),
         (JepaControlAction::TabAnyUp, "AnyUp"),
     ]
 }
@@ -4675,6 +5035,7 @@ fn control_tab_for_action(action: JepaControlAction) -> Option<JepaControlsTab> 
         JepaControlAction::TabPipeline => Some(JepaControlsTab::Pipeline),
         JepaControlAction::TabMask => Some(JepaControlsTab::Mask),
         JepaControlAction::TabPca => Some(JepaControlsTab::Pca),
+        JepaControlAction::TabReconstruction => Some(JepaControlsTab::Reconstruction),
         JepaControlAction::TabAnyUp => Some(JepaControlsTab::AnyUp),
         _ => None,
     }
@@ -4698,6 +5059,9 @@ fn control_help_text(action: JepaControlAction) -> &'static str {
             "Show patch-diff threshold, dilation, density, and legacy refresh settings."
         }
         JepaControlAction::TabPca => "Show PCA basis fitting and projection stability settings.",
+        JepaControlAction::TabReconstruction => {
+            "Show low-res token-to-image reconstruction decoder settings."
+        }
         JepaControlAction::TabAnyUp => {
             "Show high-resolution AnyUp decode cadence and attention settings."
         }
@@ -4717,6 +5081,9 @@ fn control_help_text(action: JepaControlAction) -> &'static str {
         JepaControlAction::Resolution512 => {
             "Run the JEPA pipeline at 512x512. Better spatial detail, substantially more latency."
         }
+        JepaControlAction::Resolution1024 => {
+            "Run the JEPA pipeline at 1024x1024. Diagnostic quality path; expect high latency and memory use."
+        }
         JepaControlAction::AnyUpOff => {
             "Disable high-resolution AnyUp decode. Low-res token PCA remains active."
         }
@@ -4731,6 +5098,15 @@ fn control_help_text(action: JepaControlAction) -> &'static str {
         }
         JepaControlAction::AnyUpUpstreamMasked => {
             "Use the upstream-style masked attention variant for comparison."
+        }
+        JepaControlAction::ReconstructionOff => {
+            "Hide and disable the low-res token reconstruction decoder."
+        }
+        JepaControlAction::ReconstructionEvery8 => {
+            "Decode the low-res token cache back to RGB every eighth processed frame."
+        }
+        JepaControlAction::ReconstructionEvery1 => {
+            "Decode the low-res token cache back to RGB every processed frame."
         }
         JepaControlAction::PcaTrain => {
             "Resume rolling PCA basis fitting for the low/high-res feature color projection."
@@ -4800,6 +5176,7 @@ fn control_button_label(config: &BevyJepaConfig, action: JepaControlAction) -> S
         JepaControlAction::TabPipeline => "pipeline".to_string(),
         JepaControlAction::TabMask => "mask".to_string(),
         JepaControlAction::TabPca => "PCA".to_string(),
+        JepaControlAction::TabReconstruction => "recon".to_string(),
         JepaControlAction::TabAnyUp => "AnyUp".to_string(),
         JepaControlAction::PatchRefresh => {
             format!("refresh {}", on_off(config.patch_diff_refresh.enabled))
@@ -4828,11 +5205,15 @@ fn control_button_label(config: &BevyJepaConfig, action: JepaControlAction) -> S
         JepaControlAction::PipelineDense => "dense".to_string(),
         JepaControlAction::Resolution256 => "256".to_string(),
         JepaControlAction::Resolution512 => "512".to_string(),
+        JepaControlAction::Resolution1024 => "1024".to_string(),
         JepaControlAction::AnyUpOff => "off".to_string(),
         JepaControlAction::AnyUpEvery8 => "1/8".to_string(),
         JepaControlAction::AnyUpEvery1 => "1/1".to_string(),
         JepaControlAction::AnyUpEfficientLocal => "local".to_string(),
         JepaControlAction::AnyUpUpstreamMasked => "masked".to_string(),
+        JepaControlAction::ReconstructionOff => "off".to_string(),
+        JepaControlAction::ReconstructionEvery8 => "1/8".to_string(),
+        JepaControlAction::ReconstructionEvery1 => "1/1".to_string(),
         JepaControlAction::PcaTrain => "train".to_string(),
         JepaControlAction::PcaLock => "lock".to_string(),
     }
@@ -4848,6 +5229,7 @@ fn control_button_active(
         JepaControlAction::TabPipeline
         | JepaControlAction::TabMask
         | JepaControlAction::TabPca
+        | JepaControlAction::TabReconstruction
         | JepaControlAction::TabAnyUp => control_tab_for_action(action) == Some(controls.tab),
         JepaControlAction::ModelTtt => {
             config.model_profile == BevyJepaModelPackageProfile::Vjepa21Ttt
@@ -4861,6 +5243,7 @@ fn control_button_active(
         JepaControlAction::PipelineDense => dense_pipeline_enabled(config),
         JepaControlAction::Resolution256 => config.pipeline_image_size() == 256,
         JepaControlAction::Resolution512 => config.pipeline_image_size() == 512,
+        JepaControlAction::Resolution1024 => config.pipeline_image_size() == 1024,
         JepaControlAction::AnyUpOff => config.high_res_pca_every == 0,
         JepaControlAction::AnyUpEvery8 => config.high_res_pca_every == 8,
         JepaControlAction::AnyUpEvery1 => config.high_res_pca_every == 1,
@@ -4870,6 +5253,9 @@ fn control_button_active(
         JepaControlAction::AnyUpUpstreamMasked => {
             config.anyup_attention_mode == burn_jepa::AnyUpAttentionMode::UpstreamMasked
         }
+        JepaControlAction::ReconstructionOff => config.reconstruction_every == 0,
+        JepaControlAction::ReconstructionEvery8 => config.reconstruction_every == 8,
+        JepaControlAction::ReconstructionEvery1 => config.reconstruction_every == 1,
         JepaControlAction::PcaTrain => config.pca_update_every > 0,
         JepaControlAction::PcaLock => config.pca_update_every == 0,
         JepaControlAction::PatchRefresh => config.patch_diff_refresh.enabled,
@@ -4976,6 +5362,31 @@ fn spawn_panel_image(builder: &mut ChildSpawnerCommands<'_>, image: Handle<Image
         .id()
 }
 
+fn spawn_optional_panel_image(
+    builder: &mut ChildSpawnerCommands<'_>,
+    image: Handle<Image>,
+    visible: bool,
+) -> Entity {
+    let display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    builder
+        .spawn((
+            ReconstructionPanelElement,
+            ImageNode::new(image).with_mode(NodeImageMode::Stretch),
+            Node {
+                display,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                grid_row: GridPlacement::start(2),
+                ..default()
+            },
+        ))
+        .id()
+}
+
 fn spawn_high_res_panel_image(
     builder: &mut ChildSpawnerCommands<'_>,
     image: Handle<Image>,
@@ -5031,6 +5442,31 @@ fn spawn_panel_label(
     if high_res {
         entity.insert(HighResPanelElement);
     }
+}
+
+fn spawn_reconstruction_panel_label(builder: &mut ChildSpawnerCommands<'_>, visible: bool) {
+    let display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    builder.spawn((
+        ReconstructionPanelElement,
+        Text("Recon".to_string()),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(20.0),
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Node {
+            display,
+            grid_row: GridPlacement::start(1),
+            align_self: AlignSelf::Center,
+            justify_self: JustifySelf::Center,
+            padding: UiRect::horizontal(Val::Px(8.0)),
+            ..default()
+        },
+    ));
 }
 
 fn empty_panel_image(width: u32, height: u32) -> Image {

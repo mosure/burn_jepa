@@ -10,18 +10,22 @@ use burn::{
 };
 use burn_jepa::{
     AnyUp, AnyUpConfig, AnyUpLoadOptions, BurnAnyUpPackageManifest, FeatureFrameJepaEncoder,
-    VJepa2_1Model, VJepaConfig, load_anyup_burnpack_parts,
+    JepaReconstructionDecoder, VJepa2_1Model, VJepaConfig, load_anyup_burnpack_parts,
+    load_jepa_reconstruction_burnpack_parts,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_jepa::{
-    BurnAnyUpModelBootstrapConfig, BurnJepaModelBootstrapConfig, TttBackpropMode, TttEncoderConfig,
+    BurnAnyUpModelBootstrapConfig, BurnJepaModelBootstrapConfig,
+    BurnJepaReconstructionModelBootstrapConfig, TttBackpropMode, TttEncoderConfig,
     TttLayerPlacement, TttMemoryUpdateSource, TttSupervisionMode, VJepaLoadOptions, VJepaTttModel,
     load_config_from_hf_dir,
     resolve_or_bootstrap_burn_anyup_model_package_with_config_and_progress,
     resolve_or_bootstrap_burn_jepa_model_package_with_config_and_progress,
+    resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config_and_progress,
 };
 use burn_jepa::{
-    BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest, load_ttt_burnpack_parts,
+    BurnJepaPackageModelKind, BurnJepaPipelinePackageManifest,
+    BurnJepaReconstructionPackageManifest, JepaReconstructionConfig, load_ttt_burnpack_parts,
     load_vjepa_burnpack_parts,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +37,21 @@ use crate::{
     BevyJepaConfig, BevyJepaEncoderSource, DEFAULT_ANYUP_CHECKPOINT_PATH, JepaBevyBackend,
     JepaBevyDevice, log,
 };
+
+fn reconstruction_decoder_config(
+    viewer_config: &BevyJepaConfig,
+    model_config: &VJepaConfig,
+) -> JepaReconstructionConfig {
+    JepaReconstructionConfig {
+        input_dim: model_config.encoder.embed_dim,
+        patch_size: model_config.patch_size,
+        ..if viewer_config.encoder_source == BevyJepaEncoderSource::TinyTest {
+            JepaReconstructionConfig::tiny_for_tests()
+        } else {
+            JepaReconstructionConfig::default()
+        }
+    }
+}
 
 pub(super) fn load_viewer_encoder(
     config: &BevyJepaConfig,
@@ -470,6 +489,89 @@ fn env_anyup_model_download_enabled() -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn effective_reconstruction_manifest_path(
+    config: &BevyJepaConfig,
+) -> Result<Option<PathBuf>> {
+    if config.reconstruction_every == 0 {
+        return Ok(None);
+    }
+
+    for (label, path) in [
+        (
+            "BURN_JEPA_RECONSTRUCTION_MODEL_MANIFEST",
+            env::var_os("BURN_JEPA_RECONSTRUCTION_MODEL_MANIFEST").map(PathBuf::from),
+        ),
+        (
+            "BURN_JEPA_RECONSTRUCTION_MODEL_PACKAGE_MANIFEST",
+            env::var_os("BURN_JEPA_RECONSTRUCTION_MODEL_PACKAGE_MANIFEST").map(PathBuf::from),
+        ),
+        (
+            "--reconstruction-model-manifest",
+            config.reconstruction_model_manifest_path.clone(),
+        ),
+    ] {
+        if let Some(path) = path {
+            let path = resolve_repo_relative_path(path);
+            if path.exists() {
+                return Ok(Some(path));
+            }
+            bail!(
+                "burn_jepa_reconstruction package manifest `{}` from {label} does not exist",
+                path.display()
+            );
+        }
+    }
+
+    let mut local_manifest_paths = vec![
+        crate::default_reconstruction_model_manifest_path_for_profile(
+            config.reconstruction_model_profile,
+        ),
+    ];
+    if config.reconstruction_model_profile
+        == burn_jepa::BurnJepaReconstructionModelProfile::default()
+    {
+        local_manifest_paths.push(PathBuf::from(
+            "target/burn_jepa_reconstruction/manifest.json",
+        ));
+    }
+    for path in local_manifest_paths {
+        let path = resolve_repo_relative_path(path);
+        if path.exists() {
+            return Ok(Some(path));
+        }
+    }
+
+    if config.reconstruction_model_auto_download && env_reconstruction_model_download_enabled() {
+        let bootstrap = BurnJepaReconstructionModelBootstrapConfig {
+            cache_root: config
+                .reconstruction_model_cache_dir
+                .clone()
+                .map(resolve_repo_relative_path),
+            model_profile: config.reconstruction_model_profile,
+            model_base_url: config.reconstruction_model_base_url.clone(),
+            manifest_url: env::var("BURN_JEPA_RECONSTRUCTION_MODEL_MANIFEST_URL").ok(),
+        }
+        .with_env_overrides();
+        let package =
+            resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config_and_progress(
+                &bootstrap,
+                |message| log(&format!("bevy_jepa: {message}")),
+            )?;
+        return Ok(Some(package.manifest_path));
+    }
+
+    Ok(None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn env_reconstruction_model_download_enabled() -> bool {
+    env::var("BURN_JEPA_RECONSTRUCTION_MODEL_DOWNLOAD")
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(true)
+}
+
 fn ensure_anyup_load_report_has_critical_weights(
     report: &burn_jepa::AnyUpLoadReport,
     path: &std::path::Path,
@@ -648,6 +750,143 @@ fn load_anyup_from_manifest_and_parts(
         report.applied.len()
     ));
     Ok(anyup)
+}
+
+pub(super) fn load_viewer_reconstruction(
+    config: &BevyJepaConfig,
+    model_config: &VJepaConfig,
+    device: &JepaBevyDevice,
+) -> Result<JepaReconstructionDecoder<JepaBevyBackend>> {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(package) = crate::platform::camera::reconstruction_model_package() {
+        return load_wasm_reconstruction_package(package, model_config, device);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(package_manifest_path) = effective_reconstruction_manifest_path(config)? {
+        return load_native_reconstruction_package(&package_manifest_path, model_config, device);
+    }
+
+    let decoder_config = reconstruction_decoder_config(config, model_config);
+    log(
+        "bevy_jepa: no reconstruction decoder package configured or found; reconstruction panel uses an untrained diagnostic decoder",
+    );
+    JepaReconstructionDecoder::<JepaBevyBackend>::new(decoder_config, device)
+        .context("initialize JEPA reconstruction decoder")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_wasm_reconstruction_package(
+    package: crate::platform::camera::WasmModelPackage,
+    model_config: &VJepaConfig,
+    device: &JepaBevyDevice,
+) -> Result<JepaReconstructionDecoder<JepaBevyBackend>> {
+    let manifest = BurnJepaReconstructionPackageManifest::from_json_str(&package.manifest_json)?;
+    load_reconstruction_from_manifest_and_parts(
+        manifest,
+        &package.parts,
+        model_config,
+        "wasm package",
+        device,
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_native_reconstruction_package(
+    manifest_path: &Path,
+    model_config: &VJepaConfig,
+    device: &JepaBevyDevice,
+) -> Result<JepaReconstructionDecoder<JepaBevyBackend>> {
+    let manifest_json = fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "read burn_jepa_reconstruction package manifest `{}`",
+            manifest_path.display()
+        )
+    })?;
+    let manifest = BurnJepaReconstructionPackageManifest::from_json_str(&manifest_json)
+        .with_context(|| {
+            format!(
+                "parse burn_jepa_reconstruction package manifest `{}`",
+                manifest_path.display()
+            )
+        })?;
+    let parts_manifest_path =
+        resolve_package_manifest_entry_path(manifest_path, &manifest.parts_manifest)?;
+    let parts_manifest = read_parts_manifest(&parts_manifest_path)?;
+    let parts = parts_manifest
+        .parts
+        .iter()
+        .map(|entry| {
+            let path = resolve_part_entry_path(&parts_manifest_path, &entry.path)?;
+            fs::read(&path).with_context(|| {
+                format!(
+                    "read JEPA reconstruction burnpack shard `{}`",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    log(&format!(
+        "bevy_jepa: loading burn_jepa_reconstruction package `{}` from {} shard(s)",
+        manifest_path.display(),
+        parts.len()
+    ));
+    load_reconstruction_from_manifest_and_parts(
+        manifest,
+        &parts,
+        model_config,
+        &manifest_path.display().to_string(),
+        device,
+    )
+}
+
+fn load_reconstruction_from_manifest_and_parts(
+    manifest: BurnJepaReconstructionPackageManifest,
+    parts: &[Vec<u8>],
+    model_config: &VJepaConfig,
+    label: &str,
+    device: &JepaBevyDevice,
+) -> Result<JepaReconstructionDecoder<JepaBevyBackend>> {
+    let config = manifest.reconstruction_config;
+    if config.input_dim != model_config.encoder.embed_dim {
+        bail!(
+            "JEPA reconstruction package `{label}` input_dim {} does not match active encoder dim {}",
+            config.input_dim,
+            model_config.encoder.embed_dim
+        );
+    }
+    if config.patch_size != model_config.patch_size {
+        bail!(
+            "JEPA reconstruction package `{label}` patch_size {} does not match active encoder patch_size {}",
+            config.patch_size,
+            model_config.patch_size
+        );
+    }
+    let (decoder, report) =
+        load_jepa_reconstruction_burnpack_parts::<JepaBevyBackend>(&config, parts, device)
+            .context("load JEPA reconstruction burnpack parts")?;
+    ensure_reconstruction_apply_report_has_critical_weights(&report, label)?;
+    log(&format!(
+        "bevy_jepa: loaded JEPA reconstruction bpk package `{label}` ({} tensors applied)",
+        report.applied.len()
+    ));
+    Ok(decoder)
+}
+
+fn ensure_reconstruction_apply_report_has_critical_weights(
+    report: &burn_jepa::BurnStoreApplyResult,
+    label: &str,
+) -> Result<()> {
+    ensure_apply_report_ok(report)?;
+    let loaded = |needle: &str| report.applied.iter().any(|path| path == needle);
+    for critical in ["input_proj.weight", "output_proj.weight"] {
+        if !loaded(critical) {
+            bail!(
+                "JEPA reconstruction bpk package `{label}` did not load critical tensor `{critical}`"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

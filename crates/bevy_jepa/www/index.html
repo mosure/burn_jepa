@@ -47,6 +47,7 @@
         anyup_model_package_input,
         frame_input,
         jepa_model_package_input,
+        reconstruction_model_package_input,
       } from "./out/bevy_jepa.js";
 
       const status = document.querySelector("#status");
@@ -58,6 +59,9 @@
       const defaultAnyupRoot =
         "https://aberration.technology/model/burn_anyup";
       const defaultAnyupProfile = "anyup_multi_backbone";
+      const defaultReconstructionRoot =
+        "https://aberration.technology/model/burn_jepa_reconstruction";
+      const defaultReconstructionProfile = "low_res_v1";
       window.__jepaFrameStats = {
         count: 0,
         firstFrameMs: null,
@@ -79,6 +83,9 @@
             if (anyupPackageShouldPreload()) {
               await preloadAnyupModelPackage();
             }
+            if (reconstructionPackageShouldPreload()) {
+              await preloadReconstructionModelPackage();
+            }
             window.__jepaWasmSkipped = "WebGPU unavailable";
             setStatus("bevy_jepa WebGPU unavailable; source preview running without inference");
             await startFrameSource();
@@ -88,6 +95,9 @@
             await preloadModelPackage();
             if (anyupPackageShouldPreload()) {
               await preloadAnyupModelPackage();
+            }
+            if (reconstructionPackageShouldPreload()) {
+              await preloadReconstructionModelPackage();
             }
           } else {
             setStatus("bevy_jepa model load disabled");
@@ -244,6 +254,80 @@
         }
       }
 
+      function reconstructionPackageRequired() {
+        return hasExplicitReconstructionPackage() || reconstructionLoadingExplicitlyEnabled() || reconstructionRequested();
+      }
+
+      function reconstructionPackageShouldPreload() {
+        if (reconstructionLoadingExplicitlyDisabled()) {
+          return false;
+        }
+        return modelLoadingEnabled() || reconstructionPackageRequired();
+      }
+
+      function reconstructionLoadingExplicitlyEnabled() {
+        const value = params.get("load-reconstruction");
+        return value != null && !["0", "false", "no", "off"].includes(value.toLowerCase());
+      }
+
+      function reconstructionLoadingExplicitlyDisabled() {
+        const value = params.get("load-reconstruction");
+        return value != null && ["0", "false", "no", "off"].includes(value.toLowerCase());
+      }
+
+      function reconstructionRequested() {
+        const every = Number(params.get("reconstruction-every") ?? "0");
+        return Number.isFinite(every) && every > 0;
+      }
+
+      function hasExplicitReconstructionPackage() {
+        return (
+          params.has("reconstruction-model-manifest") ||
+          params.has("reconstruction-model-manifest-url") ||
+          params.has("reconstruction-model-base") ||
+          params.has("reconstruction-model-base-url") ||
+          params.has("reconstruction-model-profile") ||
+          params.has("reconstruction-model-name")
+        );
+      }
+
+      async function preloadReconstructionModelPackage() {
+        const manifestUrl = reconstructionManifestUrl();
+        logStatus(`loading reconstruction package ${manifestUrl}`);
+        try {
+          const manifest = await fetchJson(manifestUrl);
+          const partsManifestUrl = resolvePartsManifestUrl(
+            manifestUrl,
+            manifest,
+            "jepa_reconstruction.bpk",
+          );
+          const partsManifest = await fetchJson(partsManifestUrl);
+          const parts = [];
+          const partEntries = partsManifest.parts ?? [];
+          for (const [index, part] of partEntries.entries()) {
+            const partUrl = joinUrl(parentUrl(partsManifestUrl), part.path);
+            parts.push(await fetchBytes(partDownloadUrl(partUrl, part), `reconstruction shard ${index + 1}/${partEntries.length}`));
+          }
+          window.__burnJepaReconstructionModelPackage = {
+            manifestJson: JSON.stringify(manifest),
+            parts,
+          };
+          window.__jepaReconstructionModelPackageStats = {
+            manifestUrl,
+            partsManifestUrl,
+            parts: parts.length,
+            bytes: parts.reduce((sum, bytes) => sum + bytes.byteLength, 0),
+          };
+          logStatus(`reconstruction package loaded (${parts.length} shard${parts.length === 1 ? "" : "s"})`);
+        } catch (error) {
+          window.__burnJepaReconstructionModelPackageError = error?.message ?? String(error);
+          warnStatus("bevy_jepa reconstruction package unavailable", error);
+          if (reconstructionPackageRequired()) {
+            throw error;
+          }
+        }
+      }
+
       function modelManifestUrl() {
         const explicit = params.get("model-manifest") || params.get("model-manifest-url");
         if (explicit) {
@@ -270,6 +354,38 @@
           return joinUrl(base, "manifest.json");
         }
         return joinUrl(joinUrl(defaultAnyupRoot, anyupProfile()), "manifest.json");
+      }
+
+      function reconstructionManifestUrl() {
+        const explicit =
+          params.get("reconstruction-model-manifest") ||
+          params.get("reconstruction-model-manifest-url");
+        if (explicit) {
+          return explicit;
+        }
+        const base =
+          params.get("reconstruction-model-base") ||
+          params.get("reconstruction-model-base-url");
+        if (base) {
+          return joinUrl(base, "manifest.json");
+        }
+        return joinUrl(joinUrl(defaultReconstructionRoot, reconstructionProfile()), "manifest.json");
+      }
+
+      function reconstructionProfile() {
+        const raw =
+          params.get("reconstruction-model-profile") ||
+          params.get("reconstruction-model-name") ||
+          defaultReconstructionProfile;
+        switch (raw.trim().toLowerCase()) {
+          case "low_res_v1":
+          case "low-res-v1":
+          case "lowres":
+          case "default":
+            return "low_res_v1";
+          default:
+            throw new Error(`unsupported reconstruction-model-profile ${raw}`);
+        }
       }
 
       function anyupProfile() {

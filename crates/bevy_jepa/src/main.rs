@@ -1,7 +1,7 @@
 use bevy::app::AppExit;
 use bevy_jepa::{
     BevyJepaAnyUpModelPackageProfile, BevyJepaConfig, BevyJepaEncoderSource, BevyJepaFrameSource,
-    BevyJepaModelPackageProfile, run_app,
+    BevyJepaModelPackageProfile, BevyJepaReconstructionModelPackageProfile, run_app,
 };
 use burn_jepa::AnyUpAttentionMode;
 
@@ -18,15 +18,18 @@ use bevy_jepa::{
     DEFAULT_PATCH_DIFF_SUBTHRESHOLD_MAX_DENSITY, DEFAULT_PATCH_DIFF_SUBTHRESHOLD_TRIGGER,
     DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_PCA_MIN_SAMPLE_FRAMES, DEFAULT_PCA_SAMPLE_WINDOW_FRAMES,
     DEFAULT_PCA_UPDATE_EVERY, DEFAULT_PCA_UPDATE_ITERATIONS, DEFAULT_PREWARM_SHAPE_BUCKETS,
-    DEFAULT_SPARSE_MASK_BUCKET_DENSITIES, DEFAULT_SPARSE_MASK_BUCKET_TOKENS,
-    DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH, DEFAULT_VJEPA21_WEIGHTS_NAME,
+    DEFAULT_RECONSTRUCTION_EVERY, DEFAULT_SPARSE_MASK_BUCKET_DENSITIES,
+    DEFAULT_SPARSE_MASK_BUCKET_TOKENS, DEFAULT_VJEPA21_CHECKPOINT_DIR, DEFAULT_VJEPA21_CONFIG_PATH,
+    DEFAULT_VJEPA21_WEIGHTS_NAME,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use burn_jepa::DEFAULT_BURN_JEPA_MODEL_BASE_URL;
 #[cfg(not(target_arch = "wasm32"))]
 use burn_jepa::{
     DEFAULT_BURN_ANYUP_MODEL_BASE_URL, FeatureFrameViewerConfig, PatchDiffRefreshConfig,
     TttRuntimeCollapseGuardAction, TttRuntimeStateConfig, patch_diff_threshold_from_quality,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use burn_jepa::{
+    DEFAULT_BURN_JEPA_MODEL_BASE_URL, DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -93,6 +96,28 @@ struct Cli {
     no_anyup_model_download: bool,
     #[arg(long, default_value_t = AnyUpAttentionMode::EfficientLocal)]
     anyup_attention_mode: AnyUpAttentionMode,
+    #[arg(
+        long,
+        help = "Local burn_jepa_reconstruction package manifest.json. If omitted, the viewer checks BURN_JEPA_RECONSTRUCTION_MODEL_MANIFEST, target/burn_jepa_reconstruction/{profile}/manifest.json, then the auto-downloaded cache."
+    )]
+    reconstruction_model_manifest: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Exact local cache directory for auto-downloaded burn_jepa_reconstruction shards."
+    )]
+    reconstruction_model_cache_dir: Option<PathBuf>,
+    #[arg(long, visible_alias = "reconstruction-model-name", default_value_t = BevyJepaReconstructionModelPackageProfile::default())]
+    reconstruction_model_profile: BevyJepaReconstructionModelPackageProfile,
+    #[arg(long, default_value = DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL)]
+    reconstruction_model_base_url: String,
+    #[arg(long, action = ArgAction::SetTrue, help = "Disable native reconstruction package auto-download/cache lookup.")]
+    no_reconstruction_model_download: bool,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_RECONSTRUCTION_EVERY,
+        help = "Decode low-res JEPA token cache back to RGB every N processed frames. Use 0 to hide/disable the reconstruction panel."
+    )]
+    reconstruction_every: u64,
     #[arg(long, default_value_t = BevyJepaMaskSource::PatchDiff)]
     mask_source: BevyJepaMaskSource,
     #[arg(long, default_value_t = BevyJepaDisplayTransfer::Gpu)]
@@ -286,6 +311,10 @@ impl From<Cli> for BevyJepaConfig {
         let model_base_url = resolve_model_profile_base_url(cli.model_profile, cli.model_base_url);
         let anyup_model_base_url =
             resolve_anyup_model_profile_base_url(cli.anyup_model_profile, cli.anyup_model_base_url);
+        let reconstruction_model_base_url = resolve_reconstruction_model_profile_base_url(
+            cli.reconstruction_model_profile,
+            cli.reconstruction_model_base_url,
+        );
         let any_legacy_refresh_mode = cli.patch_diff_subthreshold_refresh
             || cli.patch_diff_age_refresh
             || cli.patch_diff_blue_noise_refresh;
@@ -315,6 +344,12 @@ impl From<Cli> for BevyJepaConfig {
             anyup_model_base_url,
             anyup_model_auto_download: !cli.no_anyup_model_download,
             anyup_attention_mode: cli.anyup_attention_mode,
+            reconstruction_model_manifest_path: cli.reconstruction_model_manifest,
+            reconstruction_model_cache_dir: cli.reconstruction_model_cache_dir,
+            reconstruction_model_profile: cli.reconstruction_model_profile,
+            reconstruction_model_base_url,
+            reconstruction_model_auto_download: !cli.no_reconstruction_model_download,
+            reconstruction_every: cli.reconstruction_every,
             mask_source: cli.mask_source,
             display_transfer: cli.display_transfer,
             pipeline: FeatureFrameViewerConfig {
@@ -414,6 +449,18 @@ fn resolve_anyup_model_profile_base_url(
 ) -> String {
     if model_base_url == DEFAULT_BURN_ANYUP_MODEL_BASE_URL {
         burn_jepa::burn_anyup_model_profile_base_url(model_profile)
+    } else {
+        model_base_url
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_reconstruction_model_profile_base_url(
+    model_profile: BevyJepaReconstructionModelPackageProfile,
+    model_base_url: String,
+) -> String {
+    if model_base_url == DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL {
+        burn_jepa::burn_jepa_reconstruction_model_profile_base_url(model_profile)
     } else {
         model_base_url
     }
@@ -551,6 +598,12 @@ mod tests {
         assert!(default_config.model_auto_download);
         assert!(default_config.anyup_model_manifest_path.is_none());
         assert!(default_config.anyup_model_auto_download);
+        assert!(default_config.reconstruction_model_manifest_path.is_none());
+        assert!(default_config.reconstruction_model_auto_download);
+        assert_eq!(
+            default_config.reconstruction_every,
+            DEFAULT_RECONSTRUCTION_EVERY
+        );
         assert_eq!(
             default_config.anyup_model_profile,
             BevyJepaAnyUpModelPackageProfile::AnyupMultiBackbone
@@ -585,6 +638,15 @@ mod tests {
             "--no-anyup-model-download",
             "--anyup-attention-mode",
             "upstream-masked",
+            "--reconstruction-model-manifest",
+            "target/burn_jepa_reconstruction/low_res_v1/manifest.json",
+            "--reconstruction-model-cache-dir",
+            "target/burn-jepa-reconstruction-cache",
+            "--reconstruction-model-base-url",
+            "http://127.0.0.1:8093",
+            "--no-reconstruction-model-download",
+            "--reconstruction-every",
+            "8",
         ]));
         assert_eq!(
             config.model_manifest_path.as_deref(),
@@ -618,6 +680,24 @@ mod tests {
             config.anyup_attention_mode,
             burn_jepa::AnyUpAttentionMode::UpstreamMasked
         );
+        assert_eq!(
+            config.reconstruction_model_manifest_path.as_deref(),
+            Some(std::path::Path::new(
+                "target/burn_jepa_reconstruction/low_res_v1/manifest.json"
+            ))
+        );
+        assert_eq!(
+            config.reconstruction_model_cache_dir.as_deref(),
+            Some(std::path::Path::new(
+                "target/burn-jepa-reconstruction-cache"
+            ))
+        );
+        assert_eq!(
+            config.reconstruction_model_base_url,
+            "http://127.0.0.1:8093"
+        );
+        assert!(!config.reconstruction_model_auto_download);
+        assert_eq!(config.reconstruction_every, 8);
 
         let base_config =
             BevyJepaConfig::from(Cli::parse_from(["bevy_jepa", "--model-profile", "base"]));
@@ -726,10 +806,23 @@ fn wasm_config_from_url() -> BevyJepaConfig {
         config.anyup_model_profile = profile;
         config.anyup_model_base_url = burn_jepa::burn_anyup_model_profile_base_url(profile);
     }
+    if let Some(value) = query_param("reconstruction-model-profile")
+        .or_else(|| query_param("reconstruction-model-name"))
+        && let Ok(profile) = value.parse::<BevyJepaReconstructionModelPackageProfile>()
+    {
+        config.reconstruction_model_profile = profile;
+        config.reconstruction_model_base_url =
+            burn_jepa::burn_jepa_reconstruction_model_profile_base_url(profile);
+    }
     if let Some(value) =
         query_param("anyup-model-base").or_else(|| query_param("anyup-model-base-url"))
     {
         config.anyup_model_base_url = value;
+    }
+    if let Some(value) = query_param("reconstruction-model-base")
+        .or_else(|| query_param("reconstruction-model-base-url"))
+    {
+        config.reconstruction_model_base_url = value;
     }
     if let Some(value) = query_param("anyup-attention-mode").or_else(|| query_param("anyup-mode"))
         && let Ok(mode) = value.parse::<AnyUpAttentionMode>()
@@ -808,6 +901,9 @@ fn wasm_config_from_url() -> BevyJepaConfig {
     }
     if let Some(every) = param_u64("high-res-pca-every") {
         config.high_res_pca_every = every;
+    }
+    if let Some(every) = param_u64("reconstruction-every") {
+        config.reconstruction_every = every;
     }
     config
 }

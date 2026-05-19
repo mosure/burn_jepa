@@ -43,6 +43,58 @@ struct E2ePipelineCase {
     measurement: SparseJepaAnyUpPcaMeasurementConfig,
 }
 
+fn bench_1024_enabled() -> bool {
+    std::env::var("BURN_JEPA_BENCH_1024").ok().as_deref() == Some("1")
+}
+
+fn viewer_e2e_pipeline_cases() -> Vec<E2ePipelineCase> {
+    let mut cases = vec![
+        E2ePipelineCase {
+            label: "tiny32_sparse50",
+            image_hw: 32,
+            density: 0.50,
+            q_chunk_size: Some(1),
+            pca_update_every: None,
+            measurement: SparseJepaAnyUpPcaMeasurementConfig::disabled(),
+        },
+        E2ePipelineCase {
+            label: "viewer256_sparse100",
+            image_hw: 256,
+            density: 1.0,
+            q_chunk_size: Some(16),
+            pca_update_every: Some(16),
+            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
+        },
+        E2ePipelineCase {
+            label: "viewer512_sparse100",
+            image_hw: 512,
+            density: 1.0,
+            q_chunk_size: Some(16),
+            pca_update_every: Some(16),
+            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
+        },
+    ];
+    if bench_1024_enabled() {
+        cases.push(E2ePipelineCase {
+            label: "viewer1024_sparse100",
+            image_hw: 1024,
+            density: 1.0,
+            q_chunk_size: Some(16),
+            pca_update_every: Some(16),
+            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
+        });
+    }
+    cases
+}
+
+fn viewer_cache_sweep_image_sizes() -> Vec<usize> {
+    let mut sizes = vec![256, 512];
+    if bench_1024_enabled() {
+        sizes.push(1024);
+    }
+    sizes
+}
+
 const CASES: [HighResCase; 4] = [
     HighResCase {
         label: "tiny32_grid2_c32",
@@ -473,32 +525,7 @@ fn bench_tiny_e2e_pipeline_step<B, MakeDevice>(
     MakeDevice: Fn() -> B::Device + Copy,
 {
     let mut group = c.benchmark_group(format!("highres_sparse_jepa_anyup_pca_e2e_{backend_name}"));
-    for case in [
-        E2ePipelineCase {
-            label: "tiny32_sparse50",
-            image_hw: 32,
-            density: 0.50,
-            q_chunk_size: Some(1),
-            pca_update_every: None,
-            measurement: SparseJepaAnyUpPcaMeasurementConfig::disabled(),
-        },
-        E2ePipelineCase {
-            label: "viewer256_sparse100",
-            image_hw: 256,
-            density: 1.0,
-            q_chunk_size: Some(16),
-            pca_update_every: Some(16),
-            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
-        },
-        E2ePipelineCase {
-            label: "viewer512_sparse100",
-            image_hw: 512,
-            density: 1.0,
-            q_chunk_size: Some(16),
-            pca_update_every: Some(16),
-            measurement: SparseJepaAnyUpPcaMeasurementConfig::enabled(),
-        },
-    ] {
+    for case in viewer_e2e_pipeline_cases() {
         group.throughput(Throughput::Elements((case.image_hw * case.image_hw) as u64));
         group.bench_function(case.label, |bench| {
             bench.iter_batched(
@@ -560,7 +587,7 @@ fn bench_tiny_jepa_cache_density_sweep<B, MakeDevice>(
     MakeDevice: Fn() -> B::Device + Copy,
 {
     let mut group = c.benchmark_group(format!("highres_jepa_cache_density_sweep_{backend_name}"));
-    for image_hw in [256usize, 512] {
+    for image_hw in viewer_cache_sweep_image_sizes() {
         for density in [0.50f32, 0.75, 0.85, 0.90, 0.95, 0.98, 1.0] {
             group.throughput(Throughput::Elements((image_hw * image_hw) as u64));
             group.bench_function(format!("tiny{image_hw}_density_{density:.2}"), |bench| {

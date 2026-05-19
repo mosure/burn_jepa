@@ -20,7 +20,10 @@ use ciborium::Value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{AnyUp, AnyUpConfig, TttEncoderConfig, VJepa2_1Model, VJepaConfig, VJepaTttModel};
+use crate::{
+    AnyUp, AnyUpConfig, JepaReconstructionConfig, JepaReconstructionDecoder, TttEncoderConfig,
+    VJepa2_1Model, VJepaConfig, VJepaTttModel,
+};
 
 pub const DEFAULT_BURN_JEPA_MODEL_ROOT_URL: &str = "https://aberration.technology/model/burn_jepa";
 pub const DEFAULT_BURN_JEPA_MODEL_BASE_URL: &str =
@@ -29,12 +32,18 @@ pub const DEFAULT_BURN_ANYUP_MODEL_ROOT_URL: &str =
     "https://aberration.technology/model/burn_anyup";
 pub const DEFAULT_BURN_ANYUP_MODEL_BASE_URL: &str =
     "https://aberration.technology/model/burn_anyup/anyup_multi_backbone";
+pub const DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_ROOT_URL: &str =
+    "https://aberration.technology/model/burn_jepa_reconstruction";
+pub const DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL: &str =
+    "https://aberration.technology/model/burn_jepa_reconstruction/low_res_v1";
 pub const DEFAULT_BURN_ANYUP_CHECKPOINT_PATH: &str =
     "target/burn-anyup-checkpoints/anyup_multi_backbone.pth";
 pub const DEFAULT_BURNPACK_SHARD_MAX_BYTES: u64 = 20 * 1024 * 1024;
 pub const DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR: &str = ".burn_jepa";
 pub const DEFAULT_BURN_JEPA_MODEL_CACHE_SUBDIR: &str = "models/burn_jepa";
 pub const DEFAULT_BURN_ANYUP_MODEL_CACHE_SUBDIR: &str = "models/burn_anyup";
+pub const DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_CACHE_SUBDIR: &str =
+    "models/burn_jepa_reconstruction";
 const BURNPACK_HEADER_SIZE: usize = 10;
 const BURNPACK_MAGIC_NUMBER: u32 = 0x4255_524E;
 const BURNPACK_TENSOR_ALIGNMENT: u64 = 256;
@@ -206,6 +215,63 @@ pub fn burn_anyup_model_profile_base_url(profile: BurnAnyUpModelProfile) -> Stri
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BurnJepaReconstructionModelProfile {
+    #[default]
+    #[serde(
+        rename = "low_res_v1",
+        alias = "low-res-v1",
+        alias = "low_res",
+        alias = "lowres",
+        alias = "default"
+    )]
+    LowResV1,
+}
+
+impl BurnJepaReconstructionModelProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LowResV1 => "low_res_v1",
+        }
+    }
+
+    pub const fn valid_values() -> &'static [&'static str] {
+        &["low_res_v1", "low-res-v1", "low_res", "lowres", "default"]
+    }
+}
+
+impl fmt::Display for BurnJepaReconstructionModelProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BurnJepaReconstructionModelProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low_res_v1" | "low-res-v1" | "low_res" | "low-res" | "lowres" | "default" => {
+                Ok(Self::LowResV1)
+            }
+            other => Err(format!(
+                "unsupported burn_jepa_reconstruction model profile `{other}`; expected one of {}",
+                Self::valid_values().join(", ")
+            )),
+        }
+    }
+}
+
+pub fn burn_jepa_reconstruction_model_profile_base_url(
+    profile: BurnJepaReconstructionModelProfile,
+) -> String {
+    format!(
+        "{}/{}",
+        DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_ROOT_URL.trim_end_matches('/'),
+        profile.as_str()
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BurnJepaPipelinePackageManifest {
@@ -230,6 +296,17 @@ pub struct BurnAnyUpPackageManifest {
     pub anyup_config: AnyUpConfig,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BurnJepaReconstructionPackageManifest {
+    pub version: u32,
+    pub record_dtype: Option<String>,
+    pub burnpack: String,
+    pub parts_manifest: String,
+    pub model_base_url: String,
+    pub reconstruction_config: JepaReconstructionConfig,
+}
+
 impl Default for BurnAnyUpPackageManifest {
     fn default() -> Self {
         Self {
@@ -239,6 +316,19 @@ impl Default for BurnAnyUpPackageManifest {
             parts_manifest: "anyup.bpk.parts.json".to_string(),
             model_base_url: DEFAULT_BURN_ANYUP_MODEL_BASE_URL.to_string(),
             anyup_config: AnyUpConfig::default(),
+        }
+    }
+}
+
+impl Default for BurnJepaReconstructionPackageManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            record_dtype: None,
+            burnpack: "jepa_reconstruction.bpk".to_string(),
+            parts_manifest: "jepa_reconstruction.bpk.parts.json".to_string(),
+            model_base_url: DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL.to_string(),
+            reconstruction_config: JepaReconstructionConfig::default(),
         }
     }
 }
@@ -262,6 +352,31 @@ impl BurnAnyUpPackageManifest {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("anyup.bpk.parts.json")
+            .to_string();
+        self
+    }
+}
+
+impl BurnJepaReconstructionPackageManifest {
+    pub fn from_json_str(json: &str) -> Result<Self> {
+        serde_json::from_str(json).context("parse burn_jepa_reconstruction package manifest")
+    }
+
+    pub fn to_json_string(&self) -> Result<String> {
+        serde_json::to_string_pretty(self)
+            .context("serialize burn_jepa_reconstruction package manifest")
+    }
+
+    pub fn with_burnpack_paths(mut self, burnpack_path: &Path) -> Self {
+        self.burnpack = burnpack_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("jepa_reconstruction.bpk")
+            .to_string();
+        self.parts_manifest = burnpack_parts_manifest_path(burnpack_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("jepa_reconstruction.bpk.parts.json")
             .to_string();
         self
     }
@@ -362,6 +477,14 @@ pub struct BurnAnyUpModelBootstrapConfig {
     pub manifest_url: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BurnJepaReconstructionModelBootstrapConfig {
+    pub cache_root: Option<PathBuf>,
+    pub model_profile: BurnJepaReconstructionModelProfile,
+    pub model_base_url: String,
+    pub manifest_url: Option<String>,
+}
+
 impl Default for BurnAnyUpModelBootstrapConfig {
     fn default() -> Self {
         let model_profile = BurnAnyUpModelProfile::default();
@@ -371,6 +494,33 @@ impl Default for BurnAnyUpModelBootstrapConfig {
             model_base_url: burn_anyup_model_profile_base_url(model_profile),
             manifest_url: None,
         }
+    }
+}
+
+impl Default for BurnJepaReconstructionModelBootstrapConfig {
+    fn default() -> Self {
+        let model_profile = BurnJepaReconstructionModelProfile::default();
+        Self {
+            cache_root: None,
+            model_profile,
+            model_base_url: burn_jepa_reconstruction_model_profile_base_url(model_profile),
+            manifest_url: None,
+        }
+    }
+}
+
+impl BurnJepaReconstructionModelBootstrapConfig {
+    pub fn for_profile(model_profile: BurnJepaReconstructionModelProfile) -> Self {
+        Self {
+            model_profile,
+            model_base_url: burn_jepa_reconstruction_model_profile_base_url(model_profile),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_env_overrides(self) -> Self {
+        apply_reconstruction_bootstrap_env_overrides(self)
     }
 }
 
@@ -437,6 +587,16 @@ pub struct BurnAnyUpModelPackageFiles {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BurnJepaReconstructionModelPackageFiles {
+    pub cache_root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub parts_manifest_path: PathBuf,
+    pub part_paths: Vec<PathBuf>,
+    pub total_bytes: u64,
+    pub model_base_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BurnJepaModelDeployBundleReport {
     pub output_dir: PathBuf,
     pub manifest_path: PathBuf,
@@ -447,6 +607,15 @@ pub struct BurnJepaModelDeployBundleReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BurnAnyUpModelDeployBundleReport {
+    pub output_dir: PathBuf,
+    pub manifest_path: PathBuf,
+    pub parts_manifest_path: PathBuf,
+    pub part_paths: Vec<PathBuf>,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BurnJepaReconstructionModelDeployBundleReport {
     pub output_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub parts_manifest_path: PathBuf,
@@ -587,6 +756,13 @@ pub fn save_anyup_burnpack<B: Backend>(
     save_module_burnpack::<B, _>(model, output)
 }
 
+pub fn save_jepa_reconstruction_burnpack<B: Backend>(
+    model: &JepaReconstructionDecoder<B>,
+    output: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    save_module_burnpack::<B, _>(model, output)
+}
+
 pub fn load_vjepa_burnpack<B: Backend>(
     config: &VJepaConfig,
     path: impl AsRef<Path>,
@@ -661,6 +837,17 @@ pub fn load_anyup_burnpack_parts<B: Backend>(
     Ok((model, result))
 }
 
+pub fn load_jepa_reconstruction_burnpack_parts<B: Backend>(
+    config: &JepaReconstructionConfig,
+    parts: &[Vec<u8>],
+    device: &B::Device,
+) -> Result<(JepaReconstructionDecoder<B>, ApplyResult)> {
+    let mut model = JepaReconstructionDecoder::new(config.clone(), device)?;
+    let result = apply_burnpack_parts::<B, _>(&mut model, parts)?;
+    let model = force_module_float32::<B, _>(model);
+    Ok((model, result))
+}
+
 pub fn apply_burnpack_parts<B, M>(model: &mut M, parts: &[Vec<u8>]) -> Result<ApplyResult>
 where
     B: Backend,
@@ -728,6 +915,21 @@ pub fn write_anyup_package_manifest(
     Ok(manifest_path.to_path_buf())
 }
 
+pub fn write_jepa_reconstruction_package_manifest(
+    manifest_path: impl AsRef<Path>,
+    manifest: &BurnJepaReconstructionPackageManifest,
+) -> Result<PathBuf> {
+    let manifest_path = manifest_path.as_ref();
+    ensure_parent_dir(manifest_path)?;
+    fs::write(manifest_path, manifest.to_json_string()?).with_context(|| {
+        format!(
+            "write JEPA reconstruction package manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(manifest_path.to_path_buf())
+}
+
 pub fn resolve_package_manifest_entry_path(
     manifest_path: &Path,
     entry_path: &str,
@@ -771,6 +973,15 @@ pub fn default_burn_anyup_model_cache_root() -> Result<PathBuf> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn default_burn_jepa_reconstruction_model_cache_root() -> Result<PathBuf> {
+    default_burn_jepa_reconstruction_model_cache_root_with_config(
+        &apply_reconstruction_bootstrap_env_overrides(
+            BurnJepaReconstructionModelBootstrapConfig::default(),
+        ),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn default_burn_anyup_model_cache_root_with_config(
     config: &BurnAnyUpModelBootstrapConfig,
 ) -> Result<PathBuf> {
@@ -781,6 +992,20 @@ pub fn default_burn_anyup_model_cache_root_with_config(
     Ok(home
         .join(DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR)
         .join(DEFAULT_BURN_ANYUP_MODEL_CACHE_SUBDIR)
+        .join(config.model_profile.as_str()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_burn_jepa_reconstruction_model_cache_root_with_config(
+    config: &BurnJepaReconstructionModelBootstrapConfig,
+) -> Result<PathBuf> {
+    if let Some(cache_root) = &config.cache_root {
+        return Ok(expand_home_path(cache_root.clone()));
+    }
+    let home = user_home_dir().context("failed to resolve user home directory for model cache")?;
+    Ok(home
+        .join(DEFAULT_BURN_JEPA_MODEL_CACHE_ROOT_DIR)
+        .join(DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_CACHE_SUBDIR)
         .join(config.model_profile.as_str()))
 }
 
@@ -902,10 +1127,30 @@ pub fn resolve_or_bootstrap_burn_anyup_model_package() -> Result<BurnAnyUpModelP
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_or_bootstrap_burn_jepa_reconstruction_model_package()
+-> Result<BurnJepaReconstructionModelPackageFiles> {
+    resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config(
+        &apply_reconstruction_bootstrap_env_overrides(
+            BurnJepaReconstructionModelBootstrapConfig::default(),
+        ),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn resolve_or_bootstrap_burn_anyup_model_package_with_config(
     config: &BurnAnyUpModelBootstrapConfig,
 ) -> Result<BurnAnyUpModelPackageFiles> {
     resolve_or_bootstrap_burn_anyup_model_package_with_config_and_progress(config, |_| {})
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config(
+    config: &BurnJepaReconstructionModelBootstrapConfig,
+) -> Result<BurnJepaReconstructionModelPackageFiles> {
+    resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config_and_progress(
+        config,
+        |_| {},
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1009,6 +1254,114 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_or_bootstrap_burn_jepa_reconstruction_model_package_with_config_and_progress<F>(
+    config: &BurnJepaReconstructionModelBootstrapConfig,
+    progress: F,
+) -> Result<BurnJepaReconstructionModelPackageFiles>
+where
+    F: Fn(String),
+{
+    let config = normalized_reconstruction_bootstrap_config(config);
+    let cache_root = default_burn_jepa_reconstruction_model_cache_root_with_config(&config)?;
+    progress(format!(
+        "resolving burn_jepa_reconstruction model cache under {}",
+        cache_root.display()
+    ));
+    fs::create_dir_all(&cache_root).with_context(|| {
+        format!(
+            "create JEPA reconstruction model cache directory {}",
+            cache_root.display()
+        )
+    })?;
+    let manifest_path = cache_root.join("manifest.json");
+    if let Some(files) = cached_reconstruction_package_files(&cache_root, &manifest_path)? {
+        progress("using cached burn_jepa_reconstruction package manifest".to_string());
+        return Ok(files);
+    }
+
+    let manifest_url = config
+        .manifest_url
+        .clone()
+        .unwrap_or_else(|| join_url(&config.model_base_url, "manifest.json"));
+    let manifest = read_or_download_burn_jepa_reconstruction_manifest(
+        &manifest_path,
+        &manifest_url,
+        &progress,
+    )?;
+    let parts_manifest_url = resolve_manifest_entry_url(&manifest_url, &manifest.parts_manifest);
+    let parts_manifest_path = safe_cache_entry_path(&cache_root, &manifest.parts_manifest)?;
+
+    let parts_manifest = read_or_download_parts_manifest(
+        &parts_manifest_path,
+        &parts_manifest_url,
+        "burn_jepa_reconstruction",
+        &progress,
+    )?;
+    if parts_manifest.parts.is_empty() {
+        bail!(
+            "burn_jepa_reconstruction parts manifest {} contains no parts",
+            parts_manifest_path.display()
+        );
+    }
+
+    let total_parts = parts_manifest.parts.len();
+    let mut cached_parts = 0usize;
+    let mut cached_bytes = 0u64;
+    let mut missing_parts = Vec::new();
+    for (index, part) in parts_manifest.parts.iter().enumerate() {
+        let part_path = safe_cache_entry_path(&cache_root, &part.path)?;
+        if part_matches_cache(&part_path, part)? {
+            cached_parts += 1;
+            cached_bytes = cached_bytes.saturating_add(part.bytes);
+        } else {
+            missing_parts.push((index, part, part_path));
+        }
+    }
+    if cached_parts > 0 {
+        progress(format!(
+            "using cached burn_jepa_reconstruction shards {cached_parts}/{total_parts} ({})",
+            format_bytes(cached_bytes)
+        ));
+    }
+    for (index, part, part_path) in missing_parts {
+        let part_url = part_download_url(
+            &resolve_manifest_entry_url(&parts_manifest_url, &part.path),
+            part,
+        );
+        progress(format!(
+            "downloading burn_jepa_reconstruction shard {}/{} ({})",
+            index + 1,
+            total_parts,
+            format_bytes(part.bytes)
+        ));
+        ensure_file_cached_with_progress(
+            &part_path,
+            &part_url,
+            true,
+            &format!(
+                "burn_jepa_reconstruction shard {}/{}",
+                index + 1,
+                total_parts
+            ),
+            &progress,
+        )?;
+        if !part_matches_cache(&part_path, part)? {
+            bail!(
+                "downloaded burn_jepa_reconstruction shard `{}` does not match manifest entry",
+                part_path.display()
+            );
+        }
+    }
+
+    cached_reconstruction_package_files(&cache_root, &manifest_path)?.ok_or_else(|| {
+        anyhow!(
+            "burn_jepa_reconstruction package cache remained incomplete after download: {}",
+            cache_root.display()
+        )
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn normalized_model_bootstrap_config(
     config: &BurnJepaModelBootstrapConfig,
 ) -> BurnJepaModelBootstrapConfig {
@@ -1035,6 +1388,20 @@ fn normalized_anyup_bootstrap_config(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn normalized_reconstruction_bootstrap_config(
+    config: &BurnJepaReconstructionModelBootstrapConfig,
+) -> BurnJepaReconstructionModelBootstrapConfig {
+    let mut config = config.clone();
+    if config.model_base_url == DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL
+        && config.model_profile != BurnJepaReconstructionModelProfile::default()
+    {
+        config.model_base_url =
+            burn_jepa_reconstruction_model_profile_base_url(config.model_profile);
+    }
+    config
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn burn_jepa_model_package_cache_complete(manifest_path: &Path) -> Result<bool> {
     let cache_root = manifest_path
         .parent()
@@ -1051,6 +1418,17 @@ pub fn burn_anyup_model_package_cache_complete(manifest_path: &Path) -> Result<b
         )
     })?;
     Ok(cached_anyup_package_files(cache_root, manifest_path)?.is_some())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn burn_jepa_reconstruction_model_package_cache_complete(manifest_path: &Path) -> Result<bool> {
+    let cache_root = manifest_path.parent().ok_or_else(|| {
+        anyhow!(
+            "invalid JEPA reconstruction package manifest path {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(cached_reconstruction_package_files(cache_root, manifest_path)?.is_some())
 }
 
 pub fn write_burn_jepa_model_deploy_bundle(
@@ -1200,6 +1578,96 @@ pub fn write_burn_anyup_model_deploy_bundle(
     let deploy_manifest_path = output_dir.join("manifest.json");
     write_anyup_package_manifest(&deploy_manifest_path, &manifest)?;
     Ok(BurnAnyUpModelDeployBundleReport {
+        output_dir: output_dir.to_path_buf(),
+        manifest_path: deploy_manifest_path,
+        parts_manifest_path: deploy_parts_manifest_path,
+        part_paths: deploy_part_paths,
+        total_bytes: parts_manifest.total_bytes,
+    })
+}
+
+pub fn write_burn_jepa_reconstruction_model_deploy_bundle(
+    manifest_path: impl AsRef<Path>,
+    output_dir: impl AsRef<Path>,
+    overwrite: bool,
+) -> Result<BurnJepaReconstructionModelDeployBundleReport> {
+    let manifest_path = manifest_path.as_ref();
+    let output_dir = output_dir.as_ref();
+    if output_dir.exists() {
+        if !overwrite {
+            let mut entries = fs::read_dir(output_dir)
+                .with_context(|| format!("read output directory {}", output_dir.display()))?;
+            if entries.next().transpose()?.is_some() {
+                bail!(
+                    "JEPA reconstruction deploy bundle output directory `{}` is not empty; pass --overwrite",
+                    output_dir.display()
+                );
+            }
+        } else {
+            fs::remove_dir_all(output_dir).with_context(|| {
+                format!(
+                    "remove old JEPA reconstruction deploy bundle {}",
+                    output_dir.display()
+                )
+            })?;
+        }
+    }
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create deploy bundle directory {}", output_dir.display()))?;
+
+    let manifest_json = fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "read JEPA reconstruction package manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let mut manifest = BurnJepaReconstructionPackageManifest::from_json_str(&manifest_json)
+        .with_context(|| {
+            format!(
+                "parse JEPA reconstruction package manifest {}",
+                manifest_path.display()
+            )
+        })?;
+    let source_parts_manifest_path =
+        resolve_package_manifest_entry_path(manifest_path, &manifest.parts_manifest)?;
+    let mut parts_manifest = read_parts_manifest(&source_parts_manifest_path)?;
+
+    let parts_manifest_name = file_name_string(&source_parts_manifest_path)?;
+    let deploy_parts_manifest_path = output_dir.join(&parts_manifest_name);
+    let mut deploy_part_paths = Vec::with_capacity(parts_manifest.parts.len());
+    for part in &mut parts_manifest.parts {
+        let source_part_path = resolve_part_entry_path(&source_parts_manifest_path, &part.path)?;
+        let part_name = file_name_string(&source_part_path)?;
+        let deploy_part_path = output_dir.join(&part_name);
+        fs::copy(&source_part_path, &deploy_part_path).with_context(|| {
+            format!(
+                "copy JEPA reconstruction burnpack shard {} -> {}",
+                source_part_path.display(),
+                deploy_part_path.display()
+            )
+        })?;
+        part.path = part_name;
+        deploy_part_paths.push(deploy_part_path);
+    }
+    manifest.parts_manifest = parts_manifest_name;
+    manifest.burnpack = Path::new(&manifest.burnpack)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("jepa_reconstruction.bpk")
+        .to_string();
+    fs::write(
+        &deploy_parts_manifest_path,
+        serde_json::to_string_pretty(&parts_manifest)?,
+    )
+    .with_context(|| {
+        format!(
+            "write JEPA reconstruction deploy parts manifest {}",
+            deploy_parts_manifest_path.display()
+        )
+    })?;
+    let deploy_manifest_path = output_dir.join("manifest.json");
+    write_jepa_reconstruction_package_manifest(&deploy_manifest_path, &manifest)?;
+    Ok(BurnJepaReconstructionModelDeployBundleReport {
         output_dir: output_dir.to_path_buf(),
         manifest_path: deploy_manifest_path,
         parts_manifest_path: deploy_parts_manifest_path,
@@ -1730,6 +2198,41 @@ fn apply_anyup_bootstrap_env_overrides(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn apply_reconstruction_bootstrap_env_overrides(
+    mut config: BurnJepaReconstructionModelBootstrapConfig,
+) -> BurnJepaReconstructionModelBootstrapConfig {
+    let had_profile_default_url = config.model_base_url
+        == burn_jepa_reconstruction_model_profile_base_url(config.model_profile);
+    if let Ok(value) = std::env::var("BURN_JEPA_RECONSTRUCTION_MODEL_PROFILE")
+        .or_else(|_| std::env::var("BURN_JEPA_RECONSTRUCTION_MODEL_NAME"))
+        && let Ok(profile) = BurnJepaReconstructionModelProfile::from_str(&value)
+    {
+        config.model_profile = profile;
+        if had_profile_default_url {
+            config.model_base_url = burn_jepa_reconstruction_model_profile_base_url(profile);
+        }
+    }
+    if let Some(root) = std::env::var_os("BURN_JEPA_RECONSTRUCTION_CACHE_DIR") {
+        config.cache_root = Some(
+            PathBuf::from(root)
+                .join(DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_CACHE_SUBDIR)
+                .join(config.model_profile.as_str())
+                .to_path_buf(),
+        );
+    }
+    if let Some(root) = std::env::var_os("BURN_JEPA_RECONSTRUCTION_MODEL_CACHE_DIR") {
+        config.cache_root = Some(PathBuf::from(root));
+    }
+    if let Ok(value) = std::env::var("BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL") {
+        config.model_base_url = value;
+    }
+    if let Ok(value) = std::env::var("BURN_JEPA_RECONSTRUCTION_MODEL_MANIFEST_URL") {
+        config.manifest_url = Some(value);
+    }
+    config
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn cached_model_package_files(
     cache_root: &Path,
     manifest_path: &Path,
@@ -1826,6 +2329,54 @@ fn cached_anyup_package_files(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn cached_reconstruction_package_files(
+    cache_root: &Path,
+    manifest_path: &Path,
+) -> Result<Option<BurnJepaReconstructionModelPackageFiles>> {
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest_json = match fs::read_to_string(manifest_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let manifest = match BurnJepaReconstructionPackageManifest::from_json_str(&manifest_json) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let parts_manifest_path = match safe_cache_entry_path(cache_root, &manifest.parts_manifest) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let parts_manifest = match read_parts_manifest(&parts_manifest_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if parts_manifest.parts.is_empty() {
+        return Ok(None);
+    }
+    let mut part_paths = Vec::with_capacity(parts_manifest.parts.len());
+    for part in &parts_manifest.parts {
+        let path = match safe_cache_entry_path(cache_root, &part.path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !part_matches_cache(&path, part)? {
+            return Ok(None);
+        }
+        part_paths.push(path);
+    }
+    Ok(Some(BurnJepaReconstructionModelPackageFiles {
+        cache_root: cache_root.to_path_buf(),
+        manifest_path: manifest_path.to_path_buf(),
+        parts_manifest_path,
+        part_paths,
+        total_bytes: parts_manifest.total_bytes,
+        model_base_url: manifest.model_base_url,
+    }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn read_or_download_burn_jepa_manifest<F>(
     manifest_path: &Path,
     manifest_url: &str,
@@ -1909,6 +2460,59 @@ fn read_burn_anyup_package_manifest(path: &Path) -> Result<BurnAnyUpPackageManif
         .with_context(|| format!("read AnyUp package manifest {}", path.display()))?;
     BurnAnyUpPackageManifest::from_json_str(&manifest_json)
         .with_context(|| format!("parse AnyUp package manifest {}", path.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_or_download_burn_jepa_reconstruction_manifest<F>(
+    manifest_path: &Path,
+    manifest_url: &str,
+    progress: &F,
+) -> Result<BurnJepaReconstructionPackageManifest>
+where
+    F: Fn(String),
+{
+    if manifest_path.exists() {
+        match read_burn_jepa_reconstruction_package_manifest(manifest_path) {
+            Ok(manifest) => {
+                progress("using cached burn_jepa_reconstruction package manifest".to_string());
+                return Ok(manifest);
+            }
+            Err(err) => {
+                progress(format!(
+                    "refreshing invalid cached burn_jepa_reconstruction package manifest: {err:#}"
+                ));
+            }
+        }
+    }
+    progress(format!(
+        "downloading burn_jepa_reconstruction package manifest {manifest_url}"
+    ));
+    ensure_file_cached_with_progress(
+        manifest_path,
+        manifest_url,
+        true,
+        "burn_jepa_reconstruction package manifest",
+        progress,
+    )?;
+    read_burn_jepa_reconstruction_package_manifest(manifest_path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_burn_jepa_reconstruction_package_manifest(
+    path: &Path,
+) -> Result<BurnJepaReconstructionPackageManifest> {
+    let manifest_json = fs::read_to_string(path).with_context(|| {
+        format!(
+            "read JEPA reconstruction package manifest {}",
+            path.display()
+        )
+    })?;
+    BurnJepaReconstructionPackageManifest::from_json_str(&manifest_json).with_context(|| {
+        format!(
+            "parse JEPA reconstruction package manifest {}",
+            path.display()
+        )
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2286,6 +2890,31 @@ mod tests {
         (manifest_path, parts)
     }
 
+    fn write_tiny_reconstruction_package(
+        root: &Path,
+        shard_bytes: u64,
+    ) -> (PathBuf, BurnpackPartsReport) {
+        let device = Default::default();
+        let config = JepaReconstructionConfig::tiny_for_tests();
+        let model =
+            JepaReconstructionDecoder::<B>::new(config.clone(), &device).expect("tiny decoder");
+        let burnpack = root.join("jepa_reconstruction.bpk");
+        save_jepa_reconstruction_burnpack(&model, &burnpack).expect("save reconstruction bpk");
+        let parts =
+            write_burnpack_parts_for_browser(&burnpack, shard_bytes, true).expect("write parts");
+        let manifest = BurnJepaReconstructionPackageManifest {
+            record_dtype: Some("f16".to_string()),
+            reconstruction_config: config,
+            model_base_url: "http://127.0.0.1/reconstruction".to_string(),
+            ..BurnJepaReconstructionPackageManifest::default()
+        }
+        .with_burnpack_paths(&burnpack);
+        let manifest_path = root.join("manifest.json");
+        write_jepa_reconstruction_package_manifest(&manifest_path, &manifest)
+            .expect("write manifest");
+        (manifest_path, parts)
+    }
+
     #[test]
     fn model_profiles_resolve_distinct_cdn_routes() {
         assert_eq!(
@@ -2342,6 +2971,31 @@ mod tests {
     }
 
     #[test]
+    fn reconstruction_model_profile_resolves_cdn_route() {
+        assert_eq!(
+            BurnJepaReconstructionModelProfile::from_str("low-res-v1")
+                .expect("reconstruction profile"),
+            BurnJepaReconstructionModelProfile::LowResV1
+        );
+        assert_eq!(
+            burn_jepa_reconstruction_model_profile_base_url(
+                BurnJepaReconstructionModelProfile::LowResV1
+            ),
+            DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL
+        );
+        assert_eq!(
+            serde_json::to_string(&BurnJepaReconstructionModelProfile::LowResV1)
+                .expect("serialize reconstruction"),
+            "\"low_res_v1\""
+        );
+        assert_eq!(
+            serde_json::from_str::<BurnJepaReconstructionModelProfile>("\"lowres\"")
+                .expect("deserialize reconstruction alias"),
+            BurnJepaReconstructionModelProfile::LowResV1
+        );
+    }
+
+    #[test]
     fn tiny_anyup_burnpack_parts_roundtrip() {
         let device = Default::default();
         let config = AnyUpConfig::tiny_for_tests();
@@ -2380,6 +3034,45 @@ mod tests {
     }
 
     #[test]
+    fn tiny_reconstruction_burnpack_parts_roundtrip() {
+        let device = Default::default();
+        let config = JepaReconstructionConfig::tiny_for_tests();
+        let model =
+            JepaReconstructionDecoder::<B>::new(config.clone(), &device).expect("tiny decoder");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let burnpack = temp.path().join("tiny-reconstruction.bpk");
+        save_jepa_reconstruction_burnpack(&model, &burnpack).expect("save reconstruction bpk");
+        let dtype_counts = burnpack_dtype_counts(&burnpack).expect("dtype counts");
+        assert!(dtype_counts.get("F16").copied().unwrap_or(0) > 0);
+        assert_eq!(dtype_counts.get("F32").copied().unwrap_or(0), 0);
+        let report = write_burnpack_parts_for_browser(&burnpack, 1024, true).expect("write parts");
+        let parts_dtype_counts =
+            burnpack_parts_dtype_counts(&report.manifest_path).expect("parts dtype counts");
+        assert_eq!(parts_dtype_counts, dtype_counts);
+        let parts = report
+            .part_paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read parts");
+        let (loaded, result) =
+            load_jepa_reconstruction_burnpack_parts::<B>(&config, &parts, &device)
+                .expect("load parts");
+        assert!(!result.applied.is_empty());
+        assert!(result.missing.is_empty());
+        assert!(result.errors.is_empty());
+        let features = Tensor::<B, 4>::zeros([1, config.input_dim, 2, 2], &device);
+        let output = loaded.forward(features);
+        assert_eq!(output.shape().dims::<4>(), [1, 3, 8, 8]);
+        let values = output
+            .slice([0..1, 0..1, 0..2, 0..2])
+            .to_data()
+            .to_vec::<f32>()
+            .expect("output sample");
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn anyup_deploy_bundle_contains_clean_cdn_assets() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source");
@@ -2399,6 +3092,39 @@ mod tests {
         )
         .expect("manifest");
         assert_eq!(manifest.parts_manifest, "anyup.bpk.parts.json");
+        let parts_manifest = read_parts_manifest(&report.parts_manifest_path).expect("parts");
+        assert!(
+            parts_manifest
+                .parts
+                .iter()
+                .all(|part| !part.path.contains('/'))
+        );
+    }
+
+    #[test]
+    fn reconstruction_deploy_bundle_contains_clean_cdn_assets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source dir");
+        let (manifest_path, parts) = write_tiny_reconstruction_package(&source, 1024);
+        let output = temp.path().join("deploy");
+        let report =
+            write_burn_jepa_reconstruction_model_deploy_bundle(&manifest_path, &output, false)
+                .expect("bundle");
+
+        assert_eq!(report.manifest_path, output.join("manifest.json"));
+        assert!(report.manifest_path.exists());
+        assert!(report.parts_manifest_path.exists());
+        assert_eq!(report.part_paths.len(), parts.part_paths.len());
+        assert!(!output.join("jepa_reconstruction.bpk").exists());
+        let manifest = BurnJepaReconstructionPackageManifest::from_json_str(
+            &fs::read_to_string(&report.manifest_path).unwrap(),
+        )
+        .expect("manifest");
+        assert_eq!(
+            manifest.parts_manifest,
+            "jepa_reconstruction.bpk.parts.json"
+        );
         let parts_manifest = read_parts_manifest(&report.parts_manifest_path).expect("parts");
         assert!(
             parts_manifest
