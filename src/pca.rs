@@ -485,8 +485,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .sum_dim(1)
             .sum_dim(0)
             .add_scalar(self.config.epsilon);
-        let mean_denom = denom.clone().repeat_dim(2, self.feature_dim);
-        let mean_update = (tokens.clone() * weights.clone()).sum_dim(1).sum_dim(0) / mean_denom;
+        let mean_update = (tokens.clone() * weights.clone()).sum_dim(1).sum_dim(0) / denom.clone();
         self.mean = self
             .mean
             .clone()
@@ -495,14 +494,11 @@ impl<B: Backend> FeaturePcaProjector<B> {
 
         let centered = tokens.clone() - self.mean.clone();
         let projected = centered.clone().matmul(self.components.clone());
-        let update_denom = denom
-            .repeat_dim(1, self.feature_dim)
-            .repeat_dim(2, self.config.output_channels);
         let update = (centered * weights)
             .swap_dims(1, 2)
             .matmul(projected)
             .sum_dim(0)
-            / update_denom;
+            / denom;
         let components = self
             .components
             .clone()
@@ -591,8 +587,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .greater_equal_elem(0.0)
             .float()
             .mul_scalar(2.0)
-            .sub_scalar(1.0)
-            .repeat_dim(1, self.feature_dim);
+            .sub_scalar(1.0);
         component * sign
     }
 
@@ -602,8 +597,7 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .powf_scalar(2.0)
             .sum_dim(1)
             .add_scalar(self.config.epsilon)
-            .sqrt()
-            .repeat_dim(1, self.feature_dim);
+            .sqrt();
         component / denom
     }
 
@@ -654,10 +648,9 @@ impl<B: Backend> FeaturePcaProjector<B> {
             .clone()
             .sum_dim(1)
             .sum_dim(0)
-            .add_scalar(self.config.epsilon)
-            .repeat_dim(2, channels);
+            .add_scalar(self.config.epsilon);
         let center = (projected.clone() * weights.clone()).sum_dim(1).sum_dim(0) / denom.clone();
-        let centered = projected - center.clone().repeat_dim(1, token_count);
+        let centered = projected - center.clone();
         let spread = ((centered.powf_scalar(2.0) * weights).sum_dim(1).sum_dim(0) / denom)
             .add_scalar(self.config.epsilon)
             .sqrt()
@@ -683,12 +676,10 @@ impl<B: Backend> FeaturePcaProjector<B> {
     }
 
     fn semantic_tokens_display(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let [_, token_count, _] = x.shape().dims::<3>();
-        let centered = x - self.display_center.clone().repeat_dim(1, token_count);
+        let centered = x - self.display_center.clone();
         let spread = self
             .display_spread
             .clone()
-            .repeat_dim(1, token_count)
             .add_scalar(self.config.display_std_floor);
         self.signed_unit_display(
             (centered / spread)
@@ -698,21 +689,12 @@ impl<B: Backend> FeaturePcaProjector<B> {
     }
 
     fn semantic_nchw_display(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let [batch, channels, height, width] = x.shape().dims::<4>();
-        let center = self
-            .display_center
-            .clone()
-            .reshape([1, channels, 1, 1])
-            .repeat_dim(0, batch)
-            .repeat_dim(2, height)
-            .repeat_dim(3, width);
+        let [_, channels, _, _] = x.shape().dims::<4>();
+        let center = self.display_center.clone().reshape([1, channels, 1, 1]);
         let spread = self
             .display_spread
             .clone()
             .reshape([1, channels, 1, 1])
-            .repeat_dim(0, batch)
-            .repeat_dim(2, height)
-            .repeat_dim(3, width)
             .add_scalar(self.config.display_std_floor);
         self.signed_unit_display(
             ((x - center) / spread)

@@ -188,13 +188,15 @@ impl Args {
 
     fn case_label(&self) -> String {
         format!(
-            "{}_{}_{}_{}",
+            "{}_{}_{}_{}_d{:03}_t{:03}",
             self.model.as_str(),
             self.mode.as_str(),
             self.encode_route
                 .map(|route| route.as_str())
                 .unwrap_or("auto"),
-            self.resolution
+            self.resolution,
+            (self.sparse_density * 100.0).round() as usize,
+            (self.threshold * 1000.0).round() as usize,
         )
     }
 }
@@ -640,11 +642,13 @@ impl CaseSummary {
 
     fn to_csv(&self) -> String {
         format!(
-            "model,mode,encode_route,resolution,display_panels,frames,fps,mean_outer_ms,p95_outer_ms,mean_encode_ms,mean_cache_ms,mean_low_res_pca_ms,mean_pca_update_ms,mean_write_density,mean_encode_density,mean_write_tokens,mean_encode_tokens,dense_tokens,gpu_samples,gpu_mean_util_percent,gpu_p95_util_percent,gpu_mean_memory_util_percent,gpu_peak_memory_mib,gpu_peak_memory_delta_mib,gpu_mean_power_w,gpu_peak_power_w\n{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.1},{:.1},{},{},{:.2},{:.2},{:.2},{:.1},{:.1},{:.2},{:.2}\n",
+            "model,mode,encode_route,resolution,sparse_density_requested,threshold,display_panels,frames,fps,mean_outer_ms,p95_outer_ms,mean_encode_ms,mean_cache_ms,mean_low_res_pca_ms,mean_pca_update_ms,mean_display_ms,mean_write_density,mean_encode_density,mean_write_tokens,mean_encode_tokens,dense_tokens,gpu_samples,gpu_mean_util_percent,gpu_p95_util_percent,gpu_mean_memory_util_percent,gpu_peak_memory_mib,gpu_peak_memory_delta_mib,gpu_mean_power_w,gpu_peak_power_w\n{},{},{},{},{:.4},{:.4},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.4},{:.1},{:.1},{},{},{:.2},{:.2},{:.2},{:.1},{:.1},{:.2},{:.2}\n",
             self.model.as_str(),
             self.mode.as_str(),
             self.encode_route,
             self.resolution,
+            self.sparse_density_requested,
+            self.threshold,
             self.display_panels,
             self.frames,
             self.fps,
@@ -654,6 +658,7 @@ impl CaseSummary {
             self.mean_cache_ms,
             self.mean_low_res_pca_ms,
             self.mean_pca_update_ms,
+            self.mean_display_ms,
             self.mean_write_density,
             self.mean_encode_density,
             self.mean_write_tokens,

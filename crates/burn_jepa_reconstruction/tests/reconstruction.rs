@@ -1,8 +1,8 @@
 use burn::tensor::{Tensor, TensorData};
 use burn_jepa_reconstruction::{
-    JepaReconstructionConfig, JepaReconstructionDecoder, JepaReconstructionTrainConfig,
-    fit_reconstruction_decoder, reconstruction_color_moment_loss, reconstruction_gradient_mse,
-    reconstruction_psnr_scalar,
+    JepaReconstructionArchitecture, JepaReconstructionConfig, JepaReconstructionDecoder,
+    JepaReconstructionTrainConfig, fit_reconstruction_decoder, reconstruction_color_moment_loss,
+    reconstruction_gradient_mse, reconstruction_psnr_scalar,
 };
 
 type B = burn::backend::NdArray<f32>;
@@ -34,6 +34,37 @@ fn residual_blocks_per_scale_do_not_change_output_scale() {
 
     assert_eq!(config.output_scale(), 4);
     assert_eq!(output.shape().dims::<4>(), [1, 3, 12, 20]);
+}
+
+#[test]
+fn patch_linear_decoder_preserves_patch_grid_layout() {
+    let device = Default::default();
+    let mut config = JepaReconstructionConfig::tiny_for_tests();
+    config.architecture = JepaReconstructionArchitecture::PatchLinear;
+    let decoder = JepaReconstructionDecoder::<B>::new(config.clone(), &device)
+        .expect("reconstruction decoder");
+    let features = Tensor::<B, 4>::ones([1, config.input_dim, 3, 5], &device);
+
+    let output = decoder.forward(features);
+
+    assert_eq!(output.shape().dims::<4>(), [1, 3, 12, 20]);
+    assert!(values(output).iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn patch_conv_decoder_uses_token_grid_context_without_changing_scale() {
+    let device = Default::default();
+    let mut config = JepaReconstructionConfig::tiny_for_tests();
+    config.architecture = JepaReconstructionArchitecture::PatchConv;
+    config.residual_blocks_per_scale = 2;
+    let decoder = JepaReconstructionDecoder::<B>::new(config.clone(), &device)
+        .expect("reconstruction decoder");
+    let features = Tensor::<B, 4>::ones([1, config.input_dim, 3, 5], &device);
+
+    let output = decoder.forward(features);
+
+    assert_eq!(output.shape().dims::<4>(), [1, 3, 12, 20]);
+    assert!(values(output).iter().all(|value| value.is_finite()));
 }
 
 #[test]

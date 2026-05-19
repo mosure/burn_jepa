@@ -1190,6 +1190,30 @@ fn low_res_display_resize_preserves_patch_grid_colors() {
 }
 
 #[test]
+fn sparse_mask_display_uses_token_grid_then_device_resize() {
+    let device = JepaBevyDevice::default();
+    let grid = TokenGridShape::new(1, 2, 2);
+    let mask = SparseTokenMask::new(vec![1, 2], grid.len()).expect("mask");
+    let rgba = sparse_mask_to_rgba_tensor::<JepaBevyBackend>(&mask, grid, [32, 32], &device)
+        .expect("mask rgba");
+    let host = tensor_rgba_to_host(rgba).expect("host rgba");
+    let sample = |x: usize, y: usize| {
+        let offset = (y * 32 + x) * 4;
+        [
+            host[offset],
+            host[offset + 1],
+            host[offset + 2],
+            host[offset + 3],
+        ]
+    };
+
+    assert_eq!(sample(4, 4), [15, 15, 15, 255]);
+    assert_eq!(sample(28, 4), [41, 219, 148, 255]);
+    assert_eq!(sample(4, 28), [41, 219, 148, 255]);
+    assert_eq!(sample(28, 28), [15, 15, 15, 255]);
+}
+
+#[test]
 fn low_res_pca_panel_uses_multiple_rgb_colors_after_default_warmup() {
     let device = JepaBevyDevice::default();
     let image_size = 32;

@@ -1098,8 +1098,23 @@ pub fn patch_diff_sampled_dense_fast_path_from_rgba(
             }
         }
     }
-    let required = (sampled as f32 * fallback_density).ceil() as usize;
+    let required_density =
+        sampled_dense_fast_path_trigger_density(fallback_density, config.dilation);
+    let required = (sampled as f32 * required_density).ceil() as usize;
     sampled > 0 && active >= required.max(1)
+}
+
+fn sampled_dense_fast_path_trigger_density(fallback_density: f32, dilation: usize) -> f32 {
+    let fallback_density = fallback_density.clamp(0.0, 1.0);
+    if dilation == 0 || fallback_density >= 1.0 {
+        return fallback_density;
+    }
+    // Dilation turns a moderate number of raw patch hits into a dense write mask.
+    // Lower the sampled trigger only enough to catch those cases before full-grid scoring.
+    let radius = dilation.saturating_mul(2).saturating_add(1);
+    let neighborhood = radius.saturating_mul(radius).max(1) as f32;
+    let conservative_target = (fallback_density + 0.15).min(0.95);
+    (1.0 - (1.0 - conservative_target).powf(1.0 / neighborhood)).clamp(0.0, fallback_density)
 }
 
 fn rgba_patch_diff_score(
@@ -1358,6 +1373,48 @@ mod tests {
     }
 
     #[test]
+    fn sampled_dense_fast_path_accounts_for_dilation() {
+        let grid = TokenGridShape::new(1, 8, 8);
+        let patch_size = 16;
+        let width = grid.width * patch_size;
+        let mut prev = vec![0u8; width * grid.height * patch_size * 4];
+        for pixel in prev.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        let mut current = prev.clone();
+        for row in 0..4 {
+            for col in 0..4 {
+                fill_rgba_patch(
+                    &mut current,
+                    width,
+                    patch_size,
+                    row,
+                    col,
+                    [255, 255, 255, 255],
+                );
+            }
+        }
+        let config =
+            SparseJepaPatchDiffSparsityConfig::adaptive_threshold(0.10, 1, grid.len(), grid.len())
+                .with_dilation(1);
+
+        assert!(patch_diff_sampled_dense_fast_path_from_rgba(
+            &prev, &current, width, patch_size, grid, &config, 0.60,
+        ));
+
+        let exact_config = config.with_dilation(0);
+        assert!(!patch_diff_sampled_dense_fast_path_from_rgba(
+            &prev,
+            &current,
+            width,
+            patch_size,
+            grid,
+            &exact_config,
+            0.60,
+        ));
+    }
+
+    #[test]
     fn subthreshold_patch_diff_accumulates_slow_motion() {
         let grid = TokenGridShape::new(1, 4, 4);
         let slow_index = coords_to_token_index(0, 2, 1, grid);
@@ -1406,6 +1463,22 @@ mod tests {
         );
         assert_eq!(state.subthreshold_residual(slow_index), Some(0.0));
         assert_eq!(state.age_frames(slow_index), Some(0));
+    }
+
+    fn fill_rgba_patch(
+        frame: &mut [u8],
+        width: usize,
+        patch_size: usize,
+        row: usize,
+        col: usize,
+        rgba: [u8; 4],
+    ) {
+        for y in row * patch_size..(row + 1) * patch_size {
+            for x in col * patch_size..(col + 1) * patch_size {
+                let offset = (y * width + x) * 4;
+                frame[offset..offset + 4].copy_from_slice(&rgba);
+            }
+        }
     }
 
     #[test]

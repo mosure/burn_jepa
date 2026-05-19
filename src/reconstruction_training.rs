@@ -2,8 +2,9 @@ use crate::{
     BurnJepaModelBootstrapConfig, BurnJepaModelProfile, BurnJepaPackageModelKind,
     BurnJepaPipelinePackageManifest, BurnJepaReconstructionModelProfile,
     BurnJepaReconstructionPackageManifest, DEFAULT_BURN_JEPA_MODEL_BASE_URL,
-    DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL, JepaReconstructionConfig,
-    JepaReconstructionDecoder, VJepa2_1Model, VJepaRgbaVideoShape, jepa_feature_tokens_to_nchw,
+    DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL, JepaReconstructionArchitecture,
+    JepaReconstructionConfig, JepaReconstructionDecoder, JepaReconstructionOutputActivation,
+    VJepa2_1Model, VJepaRgbaVideoShape, jepa_feature_tokens_to_nchw,
     reconstruction_color_moment_loss, reconstruction_gradient_mse, reconstruction_l1,
     reconstruction_mse, reconstruction_psnr_scalar,
 };
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png"];
-const DEVICE_CACHE_MAX_TENSOR_BYTES: usize = 224 * 1024 * 1024;
+pub const DEFAULT_RECONSTRUCTION_DEVICE_CACHE_MAX_MIB: usize = 4096;
 const TRAIN_EVAL_MAX_SAMPLES: usize = 16;
 
 #[derive(Clone, Debug)]
@@ -43,7 +44,13 @@ pub struct ReconstructionTrainingOptions {
     pub gradient_loss_weight: f64,
     pub color_loss_weight: f64,
     pub hidden_dim: usize,
+    pub reconstruction_architecture: JepaReconstructionArchitecture,
+    pub min_channels: usize,
     pub residual_blocks_per_scale: usize,
+    pub convnext_expansion: usize,
+    pub residual_scale: f64,
+    pub output_activation: JepaReconstructionOutputActivation,
+    pub device_cache_max_mib: usize,
     pub log_interval: usize,
     pub seed: u64,
     pub output: PathBuf,
@@ -67,11 +74,17 @@ pub struct ReconstructionTrainingReport {
     pub frames: usize,
     pub grid: [usize; 2],
     pub input_dim: usize,
+    pub reconstruction_architecture: JepaReconstructionArchitecture,
     pub hidden_dim: usize,
+    pub min_channels: usize,
     pub residual_blocks_per_scale: usize,
+    pub convnext_expansion: usize,
+    pub residual_scale: f64,
+    pub output_activation: JepaReconstructionOutputActivation,
     pub steps: usize,
     pub batch_size: usize,
     pub data_cache_mode: String,
+    pub device_cache_max_mib: usize,
     pub learning_rate: f64,
     pub weight_decay: f64,
     pub l1_loss_weight: f64,
@@ -247,10 +260,15 @@ fn train_reconstruction_bpk_backend<B: AutodiffBackend>(
     let val_eval = eval_indices(&split.val, TRAIN_EVAL_MAX_SAMPLES);
     let sample_count = samples.len();
     let reconstruction_config = JepaReconstructionConfig {
+        architecture: options.reconstruction_architecture,
         input_dim,
         hidden_dim: options.hidden_dim,
+        min_channels: options.min_channels,
         patch_size,
         residual_blocks_per_scale: options.residual_blocks_per_scale,
+        convnext_expansion: options.convnext_expansion,
+        residual_scale: options.residual_scale,
+        output_activation: options.output_activation,
         ..JepaReconstructionConfig::default()
     };
     let data = build_training_data::<B>(
@@ -258,6 +276,7 @@ fn train_reconstruction_bpk_backend<B: AutodiffBackend>(
         &reconstruction_config,
         grid,
         options.image_size,
+        options.device_cache_max_mib,
         device,
     );
     let loss_weights = ReconstructionLossWeights {
@@ -462,11 +481,17 @@ fn write_reconstruction_package<B: Backend>(
         frames: options.frames,
         grid,
         input_dim: manifest.reconstruction_config.input_dim,
+        reconstruction_architecture: manifest.reconstruction_config.architecture,
         hidden_dim: manifest.reconstruction_config.hidden_dim,
+        min_channels: manifest.reconstruction_config.min_channels,
         residual_blocks_per_scale: manifest.reconstruction_config.residual_blocks_per_scale,
+        convnext_expansion: manifest.reconstruction_config.convnext_expansion,
+        residual_scale: manifest.reconstruction_config.residual_scale,
+        output_activation: manifest.reconstruction_config.output_activation,
         steps: options.steps,
         batch_size: options.batch_size,
         data_cache_mode: data_cache_mode.to_string(),
+        device_cache_max_mib: options.device_cache_max_mib,
         learning_rate: options.learning_rate,
         weight_decay: options.weight_decay,
         l1_loss_weight: options.l1_loss_weight,
@@ -533,6 +558,11 @@ fn validate_options(options: &ReconstructionTrainingOptions) -> Result<()> {
     ensure!(options.steps > 0, "--steps must be nonzero");
     ensure!(options.batch_size > 0, "--batch-size must be nonzero");
     ensure!(options.hidden_dim > 0, "--hidden-dim must be nonzero");
+    ensure!(options.min_channels > 0, "--min-channels must be nonzero");
+    ensure!(
+        options.convnext_expansion > 0,
+        "--convnext-expansion must be nonzero"
+    );
     ensure!(
         options.val_split.is_finite() && (0.0..1.0).contains(&options.val_split),
         "--val-split must be in [0, 1)"
@@ -556,6 +586,10 @@ fn validate_options(options: &ReconstructionTrainingOptions) -> Result<()> {
     ensure!(
         options.color_loss_weight.is_finite() && options.color_loss_weight >= 0.0,
         "--lambda-color must be finite and non-negative"
+    );
+    ensure!(
+        options.residual_scale.is_finite(),
+        "--residual-scale must be finite"
     );
     Ok(())
 }
@@ -809,12 +843,13 @@ fn build_training_data<B: AutodiffBackend>(
     config: &JepaReconstructionConfig,
     grid: [usize; 2],
     image_size: usize,
+    device_cache_max_mib: usize,
     device: &B::Device,
 ) -> ReconstructionTrainingData<B> {
     let feature_bytes = samples.len() * config.input_dim * grid[0] * grid[1] * size_of::<f32>();
     let target_bytes = samples.len() * 3 * image_size * image_size * size_of::<f32>();
-    if feature_bytes > DEVICE_CACHE_MAX_TENSOR_BYTES || target_bytes > DEVICE_CACHE_MAX_TENSOR_BYTES
-    {
+    let max_tensor_bytes = device_cache_max_mib.max(1) * 1024 * 1024;
+    if feature_bytes > max_tensor_bytes || target_bytes > max_tensor_bytes {
         return ReconstructionTrainingData::Host(samples);
     }
     let per_sample = config.input_dim * grid[0] * grid[1];

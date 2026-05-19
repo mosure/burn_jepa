@@ -293,24 +293,36 @@ pub enum BurnJepaCommand {
         max_samples: usize,
         #[arg(long, default_value_t = 0.10)]
         val_split: f32,
-        #[arg(long, default_value_t = 2000)]
+        #[arg(long, default_value_t = 12000)]
         steps: usize,
         #[arg(long, default_value_t = 4)]
         batch_size: usize,
-        #[arg(long, default_value_t = 1.0e-3)]
+        #[arg(long, default_value_t = 4.0e-4)]
         lr: f64,
         #[arg(long, default_value_t = 1.0e-4)]
         weight_decay: f64,
-        #[arg(long, default_value_t = 0.05)]
+        #[arg(long, default_value_t = 0.0)]
         lambda_l1: f64,
-        #[arg(long, default_value_t = 0.15)]
+        #[arg(long, default_value_t = 0.0)]
         lambda_gradient: f64,
-        #[arg(long, default_value_t = 0.05)]
+        #[arg(long, default_value_t = 0.0)]
         lambda_color: f64,
-        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().hidden_dim)]
+        #[arg(long, default_value_t = 512)]
         hidden_dim: usize,
-        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().residual_blocks_per_scale)]
+        #[arg(long, default_value = "patch-conv")]
+        reconstruction_architecture: String,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().min_channels)]
+        min_channels: usize,
+        #[arg(long, default_value_t = 2)]
         residual_blocks_per_scale: usize,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().convnext_expansion)]
+        convnext_expansion: usize,
+        #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().residual_scale)]
+        residual_scale: f64,
+        #[arg(long, default_value = "sigmoid")]
+        output_activation: String,
+        #[arg(long, default_value_t = crate::reconstruction_training::DEFAULT_RECONSTRUCTION_DEVICE_CACHE_MAX_MIB)]
+        device_cache_max_mib: usize,
         #[arg(long, default_value_t = 50)]
         log_interval: usize,
         #[arg(long, default_value_t = 0x5EED)]
@@ -658,7 +670,13 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             lambda_gradient,
             lambda_color,
             hidden_dim,
+            reconstruction_architecture,
+            min_channels,
             residual_blocks_per_scale,
+            convnext_expansion,
+            residual_scale,
+            output_activation,
+            device_cache_max_mib,
             log_interval,
             seed,
             output,
@@ -670,6 +688,9 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             overwrite_deploy,
         } => {
             let backend = parse_reconstruction_backend(&backend)?;
+            let reconstruction_architecture =
+                parse_reconstruction_architecture(&reconstruction_architecture)?;
+            let output_activation = parse_reconstruction_output_activation(&output_activation)?;
             let report = crate::reconstruction_training::train_reconstruction_bpk(
                 crate::reconstruction_training::ReconstructionTrainingOptions {
                     backend,
@@ -692,7 +713,13 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
                     gradient_loss_weight: lambda_gradient,
                     color_loss_weight: lambda_color,
                     hidden_dim,
+                    reconstruction_architecture,
+                    min_channels,
                     residual_blocks_per_scale,
+                    convnext_expansion,
+                    residual_scale,
+                    output_activation,
+                    device_cache_max_mib,
                     log_interval,
                     seed,
                     output,
@@ -806,6 +833,39 @@ fn parse_reconstruction_backend(value: &str) -> Result<JepaTrainBackend> {
         "ndarray" | "cpu" => Ok(JepaTrainBackend::NdArray),
         other => bail!(
             "unsupported reconstruction backend `{other}`; expected cuda, wgpu, webgpu, or ndarray"
+        ),
+    }
+}
+
+fn parse_reconstruction_architecture(value: &str) -> Result<crate::JepaReconstructionArchitecture> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "residual-uniform" | "uniform" | "legacy" => {
+            Ok(crate::JepaReconstructionArchitecture::ResidualUniform)
+        }
+        "pyramid-convnext" | "convnext-pyramid" | "pyramid" | "convnext" => {
+            Ok(crate::JepaReconstructionArchitecture::PyramidConvnext)
+        }
+        "patch-linear" | "patchlinear" | "patch" => {
+            Ok(crate::JepaReconstructionArchitecture::PatchLinear)
+        }
+        "patch-conv" | "patchconv" | "token-conv" => {
+            Ok(crate::JepaReconstructionArchitecture::PatchConv)
+        }
+        other => bail!(
+            "unsupported reconstruction architecture `{other}`; expected residual-uniform, pyramid-convnext, patch-linear, or patch-conv"
+        ),
+    }
+}
+
+fn parse_reconstruction_output_activation(
+    value: &str,
+) -> Result<crate::JepaReconstructionOutputActivation> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "sigmoid" => Ok(crate::JepaReconstructionOutputActivation::Sigmoid),
+        "tanh01" | "tanh-01" | "tanh" => Ok(crate::JepaReconstructionOutputActivation::Tanh01),
+        "none" | "linear" | "raw" => Ok(crate::JepaReconstructionOutputActivation::None),
+        other => bail!(
+            "unsupported reconstruction output activation `{other}`; expected sigmoid, tanh01, or none"
         ),
     }
 }

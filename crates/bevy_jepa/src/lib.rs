@@ -3887,28 +3887,34 @@ fn sparse_mask_to_rgba_tensor<B: Backend>(
 ) -> Result<Tensor<B, 3>> {
     let height = image_size[0].max(1);
     let width = image_size[1].max(1);
-    let patch_h = (height / grid.height.max(1)).max(1);
-    let patch_w = (width / grid.width.max(1)).max(1);
-    let mut rgba = vec![0.06_f32; height * width * 4];
+    let grid_height = grid.height.max(1);
+    let grid_width = grid.width.max(1);
+    let tokens_per_frame = grid.tokens_per_frame().max(1);
+    let mut rgba = vec![0.06_f32; grid_height * grid_width * 4];
     for pixel in rgba.chunks_exact_mut(4) {
         pixel[3] = 1.0;
     }
     for &token in mask.indices() {
-        let row = (token % grid.tokens_per_frame()) / grid.width;
-        let col = token % grid.width;
-        for y in row * patch_h..((row + 1) * patch_h).min(height) {
-            for x in col * patch_w..((col + 1) * patch_w).min(width) {
-                let offset = (y * width + x) * 4;
-                rgba[offset] = 0.16;
-                rgba[offset + 1] = 0.86;
-                rgba[offset + 2] = 0.58;
-            }
-        }
+        let frame_token = token % tokens_per_frame;
+        let row = frame_token / grid_width;
+        let col = frame_token % grid_width;
+        let offset = (row * grid_width + col) * 4;
+        rgba[offset] = 0.16;
+        rgba[offset + 1] = 0.86;
+        rgba[offset + 2] = 0.58;
     }
-    Ok(Tensor::<B, 3>::from_data(
-        TensorData::new(rgba, [height, width, 4]),
-        device,
-    ))
+    let token_rgba =
+        Tensor::<B, 3>::from_data(TensorData::new(rgba, [grid_height, grid_width, 4]), device);
+    if [grid_height, grid_width] == [height, width] {
+        return Ok(token_rgba);
+    }
+    Ok(interpolate(
+        token_rgba.permute([2, 0, 1]).unsqueeze_dim::<4>(0),
+        [height, width],
+        InterpolateOptions::new(InterpolateMode::Nearest),
+    )
+    .permute([0, 2, 3, 1])
+    .reshape([height, width, 4]))
 }
 
 fn tensor_rgba_to_host(tensor: Tensor<JepaBevyBackend, 3>) -> Result<Vec<u8>> {

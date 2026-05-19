@@ -1,5 +1,7 @@
 use burn::tensor::{Distribution, Tensor, backend::Backend};
-use burn_jepa_reconstruction::{JepaReconstructionConfig, JepaReconstructionDecoder};
+use burn_jepa_reconstruction::{
+    JepaReconstructionArchitecture, JepaReconstructionConfig, JepaReconstructionDecoder,
+};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -10,36 +12,82 @@ struct ReconstructionBenchCase {
     grid_hw: usize,
     feature_dim: usize,
     hidden_dim: usize,
+    architecture: JepaReconstructionArchitecture,
+    residual_blocks: usize,
 }
 
-const CASES: [ReconstructionBenchCase; 5] = [
+const CASES: [ReconstructionBenchCase; 9] = [
     ReconstructionBenchCase {
-        label: "jepa256_grid16_c768_h128",
+        label: "jepa256_grid16_c768_h128_patch_conv",
         image_hw: 256,
         grid_hw: 16,
         feature_dim: 768,
         hidden_dim: 128,
+        architecture: JepaReconstructionArchitecture::PatchConv,
+        residual_blocks: 2,
     },
     ReconstructionBenchCase {
-        label: "jepa384_grid24_c768_h128",
+        label: "jepa256_grid16_c768_h512_patch_conv_r4",
+        image_hw: 256,
+        grid_hw: 16,
+        feature_dim: 768,
+        hidden_dim: 512,
+        architecture: JepaReconstructionArchitecture::PatchConv,
+        residual_blocks: 4,
+    },
+    ReconstructionBenchCase {
+        label: "jepa256_grid16_c768_h128_residual_uniform",
+        image_hw: 256,
+        grid_hw: 16,
+        feature_dim: 768,
+        hidden_dim: 128,
+        architecture: JepaReconstructionArchitecture::ResidualUniform,
+        residual_blocks: 1,
+    },
+    ReconstructionBenchCase {
+        label: "jepa384_grid24_c768_h128_patch_conv",
         image_hw: 384,
         grid_hw: 24,
         feature_dim: 768,
         hidden_dim: 128,
+        architecture: JepaReconstructionArchitecture::PatchConv,
+        residual_blocks: 2,
     },
     ReconstructionBenchCase {
-        label: "jepa512_grid32_c768_h128",
+        label: "jepa512_grid32_c768_h128_patch_conv",
         image_hw: 512,
         grid_hw: 32,
         feature_dim: 768,
         hidden_dim: 128,
+        architecture: JepaReconstructionArchitecture::PatchConv,
+        residual_blocks: 2,
     },
     ReconstructionBenchCase {
-        label: "jepa1024_grid64_c768_h128",
+        label: "jepa512_grid32_c768_h512_patch_conv_r4",
+        image_hw: 512,
+        grid_hw: 32,
+        feature_dim: 768,
+        hidden_dim: 512,
+        architecture: JepaReconstructionArchitecture::PatchConv,
+        residual_blocks: 4,
+    },
+    ReconstructionBenchCase {
+        label: "jepa512_grid32_c768_h128_residual_uniform",
+        image_hw: 512,
+        grid_hw: 32,
+        feature_dim: 768,
+        hidden_dim: 128,
+        architecture: JepaReconstructionArchitecture::ResidualUniform,
+        residual_blocks: 1,
+    },
+    ReconstructionBenchCase {
+        label: "jepa1024_grid64_c768_h128_patch_conv",
         image_hw: 1024,
         grid_hw: 64,
         feature_dim: 768,
         hidden_dim: 128,
+        architecture: JepaReconstructionArchitecture::PatchConv,
+        residual_blocks: 2,
     },
     ReconstructionBenchCase {
         label: "tiny64_grid4_c32",
@@ -47,6 +95,8 @@ const CASES: [ReconstructionBenchCase; 5] = [
         grid_hw: 4,
         feature_dim: 32,
         hidden_dim: 32,
+        architecture: JepaReconstructionArchitecture::PatchConv,
+        residual_blocks: 2,
     },
 ];
 
@@ -78,9 +128,11 @@ fn bench_reconstruction_forward<B, MakeDevice>(
         }
         let device = make_device();
         let config = JepaReconstructionConfig {
+            architecture: case.architecture,
             input_dim: case.feature_dim,
             hidden_dim: case.hidden_dim,
             patch_size: case.image_hw / case.grid_hw,
+            residual_blocks_per_scale: case.residual_blocks,
             ..JepaReconstructionConfig::default()
         };
         let decoder =

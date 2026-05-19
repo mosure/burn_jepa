@@ -22,14 +22,20 @@ pub struct JepaReconstructionTrainConfig {
 
 impl Default for JepaReconstructionTrainConfig {
     fn default() -> Self {
+        let decoder = JepaReconstructionConfig {
+            architecture: crate::JepaReconstructionArchitecture::PatchConv,
+            hidden_dim: 512,
+            residual_blocks_per_scale: 2,
+            ..JepaReconstructionConfig::default()
+        };
         Self {
-            decoder: JepaReconstructionConfig::default(),
-            steps: 500,
-            learning_rate: 1.0e-3,
+            decoder,
+            steps: 12000,
+            learning_rate: 4.0e-4,
             weight_decay: 1.0e-4,
-            l1_loss_weight: 0.02,
-            gradient_loss_weight: 0.05,
-            color_loss_weight: 0.02,
+            l1_loss_weight: 0.0,
+            gradient_loss_weight: 0.0,
+            color_loss_weight: 0.0,
             log_interval: 50,
         }
     }
