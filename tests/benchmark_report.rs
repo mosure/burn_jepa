@@ -471,11 +471,13 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     let raw_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
     let highres_docs = include_str!("../docs/highres-anyup-pca-pipeline.md");
     let preprint = include_str!("../docs/papers/vjepa21_ttt_sparse_temporal_preprint.tex");
+    let root_manifest = include_str!("../Cargo.toml");
     let manifest = include_str!("../crates/bevy_jepa/Cargo.toml");
     let pca = include_str!("../src/pca.rs");
     let pca_runtime = pca.split("#[cfg(test)]").next().unwrap_or(pca);
     let pca_bench = include_str!("../benches/highres_anyup_pca_pipeline.rs");
     let workflow = include_str!("../.github/workflows/test.yml");
+    let deploy_workflow = include_str!("../.github/workflows/deploy-pages.yml");
     let safetensors = include_str!("../src/safetensors_io.rs");
     let experiment = include_str!("../src/experiment.rs");
 
@@ -570,12 +572,26 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(fps_stability.contains("fps-stability-summary.csv"));
     assert!(fps_stability.contains("unique_encode_widths"));
     assert!(fps_stability.contains("p95_outer_ms"));
+    assert!(viewer_lib.contains("not(feature = \"wasm-fusion\")"));
+    assert!(viewer_lib.contains("CubeBackend<burn::backend::wgpu::WgpuRuntime"));
+    assert!(
+        !root_manifest.contains("wgpu = [\"burn/wgpu\", \"burn-store/wgpu\""),
+        "wasm sparse WGPU must not pull burn-store/wgpu because that enables burn-wgpu default autotune"
+    );
+    assert!(
+        root_manifest.contains("burn_flex_gmm = { version = \"0.21.2\""),
+        "burn_flex_gmm 0.21.2 keeps wasm sparse patchify off burn-wgpu fusion/default"
+    );
     assert!(manifest.contains("default = [\"sparse-patchify-wgpu\"]"));
     assert!(
+        manifest.contains("sparse-patchify-wgpu = [\"burn_jepa/sparse-patchify-wgpu\"]"),
+        "bevy_jepa sparse patchify must not enable browser Burn fusion implicitly"
+    );
+    assert!(
         manifest.contains(
-            "sparse-patchify-wgpu = [\"bevy_burn/fusion\", \"burn_jepa/sparse-patchify-wgpu\"]"
+            "bevy_burn = { path = \"../bevy_burn\", default-features = false, features = [\"fusion\"] }"
         ),
-        "bevy_jepa sparse patchify feature should keep native Bevy/Burn fusion enabled"
+        "native bevy_jepa builds should still enable Bevy/Burn fusion through target-specific dependencies"
     );
     assert!(
         viewer_bench.contains("fn viewer_image_sizes() -> Vec<usize>")
@@ -633,6 +649,11 @@ fn bevy_viewer_benchmark_aligns_with_raw_pipeline_metrics() {
     assert!(workflow.contains("cargo test --locked --test benchmark_report"));
     assert!(workflow.contains("cargo package -p burn_anyup --locked"));
     assert!(workflow.contains("cargo check -p bevy_jepa --locked --features sparse-patchify-wgpu"));
+    assert!(
+        deploy_workflow
+            .contains("cargo build -p bevy_jepa --target wasm32-unknown-unknown --release"),
+        "Pages should build the default sparse-patchify wasm viewer lane"
+    );
     for source in [viewer_config, safetensors, experiment] {
         assert!(
             !source.contains("/home/mosure"),
@@ -722,7 +743,7 @@ fn e2e_benchmark_reuses_library_projection_and_patchify_core() {
 
     let manifest = include_str!("../Cargo.toml");
     assert!(manifest.contains("burn_autogaze = { version = \"0.21.6\""));
-    assert!(manifest.contains("burn_flex_gmm = { version = \"0.21.1\""));
+    assert!(manifest.contains("burn_flex_gmm = { version = \"0.21.2\""));
     assert!(manifest.contains("sparse-patchify-cuda"));
     assert!(manifest.contains("autogaze-webgpu"));
     assert!(manifest.contains("autogaze-cuda"));

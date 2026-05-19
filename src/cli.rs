@@ -301,6 +301,12 @@ pub enum BurnJepaCommand {
         lr: f64,
         #[arg(long, default_value_t = 1.0e-4)]
         weight_decay: f64,
+        #[arg(long, default_value_t = 0.05)]
+        lambda_l1: f64,
+        #[arg(long, default_value_t = 0.15)]
+        lambda_gradient: f64,
+        #[arg(long, default_value_t = 0.05)]
+        lambda_color: f64,
         #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().hidden_dim)]
         hidden_dim: usize,
         #[arg(long, default_value_t = crate::JepaReconstructionConfig::default().residual_blocks_per_scale)]
@@ -648,6 +654,9 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
             batch_size,
             lr,
             weight_decay,
+            lambda_l1,
+            lambda_gradient,
+            lambda_color,
             hidden_dim,
             residual_blocks_per_scale,
             log_interval,
@@ -679,6 +688,9 @@ pub fn run(cli: BurnJepaCli) -> Result<()> {
                     batch_size,
                     learning_rate: lr,
                     weight_decay,
+                    l1_loss_weight: lambda_l1,
+                    gradient_loss_weight: lambda_gradient,
+                    color_loss_weight: lambda_color,
                     hidden_dim,
                     residual_blocks_per_scale,
                     log_interval,

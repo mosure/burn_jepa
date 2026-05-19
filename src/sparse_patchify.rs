@@ -10,10 +10,16 @@ type FusionCudaBackend = burn::backend::Cuda<f32, i32>;
 #[cfg(feature = "sparse-patchify-cuda")]
 type RawCudaBackend = burn_flex_gmm::cuda::DefaultCudaBackend;
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 type FusionWgpuBackend = burn::backend::Wgpu<f32, i32>;
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 type RawWgpuBackend = burn_flex_gmm::wgpu::DefaultWgpuBackend;
 
 #[derive(Clone, Debug)]
@@ -34,7 +40,10 @@ pub struct SparsePatchifyBatchPlan<B: Backend> {
     pub coords_host: Vec<[u32; 4]>,
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 pub fn sparse_patchify3d_forward_wgpu_fusion(
     config: &burn_flex_gmm::SparsePatchify3dConfig,
     input: Tensor<FusionWgpuBackend, 5>,

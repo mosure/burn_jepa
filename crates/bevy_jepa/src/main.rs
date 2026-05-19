@@ -899,6 +899,12 @@ fn wasm_config_from_url() -> BevyJepaConfig {
     if let Some(density) = param_f32("min-context-density") {
         config.min_context_density = density.clamp(0.0, 1.0);
     }
+    if let Some(enabled) = param_bool("prewarm-shape-buckets") {
+        config.prewarm_shape_buckets = enabled;
+    }
+    if param_bool("no-prewarm-shape-buckets") == Some(true) {
+        config.prewarm_shape_buckets = false;
+    }
     if let Some(every) = param_u64("high-res-pca-every") {
         config.high_res_pca_every = every;
     }

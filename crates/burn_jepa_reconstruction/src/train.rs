@@ -1,4 +1,7 @@
-use crate::{JepaReconstructionConfig, JepaReconstructionDecoder, reconstruction_mse};
+use crate::{
+    JepaReconstructionConfig, JepaReconstructionDecoder, reconstruction_color_moment_loss,
+    reconstruction_gradient_mse, reconstruction_l1, reconstruction_mse,
+};
 use anyhow::Result;
 use burn::module::AutodiffModule;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
@@ -11,6 +14,9 @@ pub struct JepaReconstructionTrainConfig {
     pub steps: usize,
     pub learning_rate: f64,
     pub weight_decay: f64,
+    pub l1_loss_weight: f64,
+    pub gradient_loss_weight: f64,
+    pub color_loss_weight: f64,
     pub log_interval: usize,
 }
 
@@ -21,6 +27,9 @@ impl Default for JepaReconstructionTrainConfig {
             steps: 500,
             learning_rate: 1.0e-3,
             weight_decay: 1.0e-4,
+            l1_loss_weight: 0.02,
+            gradient_loss_weight: 0.05,
+            color_loss_weight: 0.02,
             log_interval: 50,
         }
     }
@@ -62,7 +71,13 @@ pub fn fit_reconstruction_decoder<B: AutodiffBackend>(
     for step in 0..config.steps {
         let target_dims = target.shape().dims::<4>();
         let output = model.forward_to_size(features.clone(), [target_dims[2], target_dims[3]]);
-        let loss = reconstruction_mse(output, target.clone());
+        let loss = reconstruction_training_loss(
+            output,
+            target.clone(),
+            config.l1_loss_weight,
+            config.gradient_loss_weight,
+            config.color_loss_weight,
+        );
         let should_read = step == 0
             || step + 1 == config.steps
             || (config.log_interval > 0 && (step + 1) % config.log_interval == 0);
@@ -73,6 +88,28 @@ pub fn fit_reconstruction_decoder<B: AutodiffBackend>(
         model = optim.step(config.learning_rate, model, grads);
     }
     Ok((model.valid(), report))
+}
+
+fn reconstruction_training_loss<B: burn::tensor::backend::Backend>(
+    output: Tensor<B, 4>,
+    target: Tensor<B, 4>,
+    l1_weight: f64,
+    gradient_weight: f64,
+    color_weight: f64,
+) -> Tensor<B, 1> {
+    let mut loss = reconstruction_mse(output.clone(), target.clone());
+    if l1_weight > 0.0 {
+        loss = loss + reconstruction_l1(output.clone(), target.clone()).mul_scalar(l1_weight);
+    }
+    if gradient_weight > 0.0 {
+        loss = loss
+            + reconstruction_gradient_mse(output.clone(), target.clone())
+                .mul_scalar(gradient_weight);
+    }
+    if color_weight > 0.0 {
+        loss = loss + reconstruction_color_moment_loss(output, target).mul_scalar(color_weight);
+    }
+    loss
 }
 
 fn tensor_scalar<B: burn::tensor::backend::Backend>(tensor: Tensor<B, 1>) -> Option<f64> {

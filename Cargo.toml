@@ -28,7 +28,7 @@ ndarray = ["burn/ndarray", "burn_anyup/ndarray", "burn_jepa_reconstruction/ndarr
 flex = ["burn/flex", "burn_anyup/flex", "burn_jepa_reconstruction/flex"]
 dispatch = ["burn/dispatch", "burn_anyup/dispatch", "burn_jepa_reconstruction/dispatch"]
 webgpu = ["burn/webgpu", "burn_anyup/webgpu", "burn_jepa_reconstruction/webgpu"]
-wgpu = ["burn/wgpu", "burn-store/wgpu", "burn_anyup/wgpu", "burn_jepa_reconstruction/wgpu"]
+wgpu = ["burn/wgpu", "burn_anyup/wgpu", "burn_jepa_reconstruction/wgpu"]
 cuda = ["burn/cuda", "burn-store/cuda", "burn_anyup/cuda", "burn_jepa_reconstruction/cuda"]
 wasm-fusion = ["burn/fusion", "burn-wgpu/fusion", "burn_anyup/fusion", "burn_jepa_reconstruction/fusion"]
 autogaze = ["dep:burn_autogaze"]
@@ -90,7 +90,7 @@ burn-store = { version = "0.21.0", default-features = false, features = ["burnpa
 burn_anyup = { path = "crates/burn_anyup", version = "0.21.0", default-features = false }
 burn_jepa_reconstruction = { path = "crates/burn_jepa_reconstruction", version = "0.21.0", default-features = false }
 burn_autogaze = { version = "0.21.6", default-features = false, optional = true }
-burn_flex_gmm = { version = "0.21.1", default-features = false, optional = true }
+burn_flex_gmm = { version = "0.21.2", default-features = false, optional = true }
 ciborium = "0.2"
 clap = { version = "4.6", features = ["derive"] }
 half = "2"

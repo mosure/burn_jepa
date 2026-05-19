@@ -1719,7 +1719,10 @@ impl VJepa2_1Model<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
     }
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl VJepaEncoder<burn::backend::Wgpu<f32, i32>> {
     pub fn sparse_patchify_image_wgpu_fusion_batch(
         &self,
@@ -1796,7 +1799,10 @@ impl VJepaEncoder<burn::backend::Wgpu<f32, i32>> {
     }
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl VJepa2_1Model<burn::backend::Wgpu<f32, i32>> {
     pub fn encode_image_sparse_patchify_wgpu_fusion_batch(
         &self,

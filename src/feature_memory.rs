@@ -513,7 +513,10 @@ impl<B: Backend> InterframeJepaFeatureMemory<B> {
     }
 }
 
-#[cfg(feature = "sparse-feature-memory-wgpu")]
+#[cfg(all(
+    feature = "sparse-feature-memory-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl InterframeJepaFeatureMemory<burn::backend::Wgpu<f32, i32>> {
     pub fn update_tokens_tiled_assign_wgpu(
         &mut self,

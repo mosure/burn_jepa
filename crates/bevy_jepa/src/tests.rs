@@ -2381,6 +2381,40 @@ fn headless_reconstruction_runs_without_psnr_host_read_by_default() {
 }
 
 #[test]
+fn headless_reconstruction_requires_trained_package() {
+    let device = JepaBevyDevice::default();
+    let missing_manifest = std::env::temp_dir().join("missing-burn-jepa-reconstruction.json");
+    let mut pipeline = BevyJepaHeadlessPipeline::new(
+        BevyJepaConfig {
+            source: BevyJepaFrameSource::SyntheticLocalMotion,
+            reconstruction_every: 1,
+            reconstruction_model_manifest_path: Some(missing_manifest),
+            reconstruction_model_auto_download: false,
+            pipeline: FeatureFrameViewerConfig {
+                high_res_pca_every: 0,
+                ..FeatureFrameViewerConfig::default()
+            },
+            ..tiny_viewer_config()
+        },
+        device,
+    );
+
+    let err = pipeline
+        .step_with_reconstruction_request(FeatureFrameRequest::low_res())
+        .expect_err("reconstruction without a trained package should fail clearly");
+
+    assert!(
+        err.to_string()
+            .contains("burn_jepa_reconstruction package manifest"),
+        "{err:#}"
+    );
+    assert!(
+        !err.to_string().contains("untrained diagnostic decoder"),
+        "{err:#}"
+    );
+}
+
+#[test]
 fn headless_reconstruction_psnr_is_sync_measurement_diagnostic() {
     let (_package_dir, reconstruction_model_manifest_path) =
         write_tiny_viewer_reconstruction_package();

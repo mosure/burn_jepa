@@ -93,7 +93,11 @@ use model_loading::{
     effective_ttt_model_path, resolve_repo_relative_path, tiny_viewer_model_config,
 };
 
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-fusion"))]
 pub type JepaBevyBackend = burn::backend::WebGpu<f32, i32>;
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-fusion")))]
+pub type JepaBevyBackend =
+    burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, f32, i32, u32>;
 pub type JepaBevyDevice = burn::backend::wgpu::WgpuDevice;
 
 const UI_MARGIN_PX: f32 = 12.0;

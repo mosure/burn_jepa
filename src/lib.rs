@@ -51,8 +51,8 @@ pub use burn_anyup::{
 pub use burn_jepa_reconstruction::{
     JepaReconstructionConfig, JepaReconstructionDecoder, JepaReconstructionFitReport,
     JepaReconstructionOutputActivation, JepaReconstructionTrainConfig, JepaReconstructionUpBlock,
-    fit_reconstruction_decoder, reconstruction_mse, reconstruction_psnr,
-    reconstruction_psnr_scalar,
+    fit_reconstruction_decoder, reconstruction_color_moment_loss, reconstruction_gradient_mse,
+    reconstruction_l1, reconstruction_mse, reconstruction_psnr, reconstruction_psnr_scalar,
 };
 pub use burn_store::ApplyResult as BurnStoreApplyResult;
 pub use config::{

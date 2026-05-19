@@ -880,7 +880,10 @@ impl FeatureFrameJepaEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
     }
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl FeatureFrameJepaEncoder<burn::backend::Wgpu<f32, i32>> {
     fn encode_image_sparse_patchify_wgpu_fusion_batch_with_runtime(
         &mut self,
@@ -1796,7 +1799,10 @@ impl SparseJepaAnyUpPcaPipeline<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
     }
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl SparseJepaAnyUpPcaPipeline<burn::backend::Wgpu<f32, i32>> {
     pub fn step_image_with_sparse_patchify_plan_wgpu_nodes_measured(
         &mut self,

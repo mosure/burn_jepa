@@ -2390,7 +2390,6 @@ dependencies = [
  "burn-core",
  "burn-cuda",
  "burn-tensor",
- "burn-wgpu",
  "byteorder",
  "bytes",
  "ciborium",
@@ -2501,9 +2500,9 @@ dependencies = [
 
 [[package]]
 name = "burn_flex_gmm"
-version = "0.21.1"
+version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0b729d846fc20a73456e5aab694cb4f94edec812264331019e605e9c0e07a0e"
+checksum = "75c50eef176fc5d862ed582fc6d0ff589a2a6fe7e29885fa065b8920edc487cc"
 dependencies = [
  "burn",
  "burn-cubecl",

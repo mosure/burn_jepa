@@ -38,16 +38,7 @@ pub mod gpu_burn_to_bevy;
 use gpu_burn_to_bevy::{BurnBevyPrepare, GpuBurnToBevyPlugin};
 
 fn burn_runtime_options() -> BurnRuntimeOptions {
-    #[cfg(all(target_arch = "wasm32", feature = "fusion"))]
-    {
-        let mut options = BurnRuntimeOptions::default();
-        options.memory_config = burn_wgpu::MemoryConfiguration::ExclusivePages;
-        return options;
-    }
-    #[cfg(not(all(target_arch = "wasm32", feature = "fusion")))]
-    {
-        BurnRuntimeOptions::default()
-    }
+    BurnRuntimeOptions::default()
 }
 
 #[derive(Resource, Clone, Debug, Default)]
@@ -145,11 +136,10 @@ where
             return;
         }
 
-        let render_app = app
-            .get_sub_app_mut(RenderApp)
-            .expect("Failed to setup Burn plugin: RenderApp not found");
-
         let burn_device = {
+            let render_app = app
+                .get_sub_app_mut(RenderApp)
+                .expect("Failed to setup Burn plugin: RenderApp not found");
             let bevy_adapter = render_app.world().resource::<RenderAdapter>();
             let wgpu_adapter = unwrap_wgpu_wrapper(&bevy_adapter.0);
 
@@ -184,7 +174,12 @@ where
         };
 
         let burn_device = BurnDevice::from(burn_device);
-        render_app.insert_resource(burn_device.clone());
+        {
+            let render_app = app
+                .get_sub_app_mut(RenderApp)
+                .expect("Failed to setup Burn plugin: RenderApp not found");
+            render_app.insert_resource(burn_device.clone());
+        }
         app.insert_resource(burn_device);
 
         app.add_plugins(GpuBurnToBevyPlugin::<B>::default());

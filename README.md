@@ -42,7 +42,7 @@ token-cache PCA, and high-res AnyUp PCA.
 | `flex` | no | native/web | Burn dispatch/flex experiments |
 | `dispatch` | no | native/web | Burn dispatch backend experiments |
 | `wasm` | no | wasm32 | wasm-bindgen API over Burn WebGPU |
-| `wasm-fusion` | no | wasm32 | experimental Burn fusion path; browser WebGPU validation still prefers the default non-fused build |
+| `wasm-fusion` | no | wasm32 | experimental Burn fusion path; browser WebGPU validation still prefers the default raw WebGPU build |
 | `sparse-patchify-wgpu` | no | native/web | flex-gmm sparse patchify + sparse feature memory on WGPU; enabled by default in `bevy_jepa` |
 | `sparse-patchify-cuda` | no | native | flex-gmm sparse patchify + sparse feature memory on CUDA |
 | `autogaze-*` | no | native/web | optional `burn_autogaze` mask projection adapters |

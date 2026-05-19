@@ -10,6 +10,9 @@ const knownWasmPanicNeedles = [
   "used in submit while mapped",
   "usage (Storage(read-write)|Storage(read-only))",
   "CubeCL Tasks Encoder",
+  "DeviceLost",
+  "Failed to map buffer",
+  "BufferAsyncError",
   "std::time::Instant",
 ];
 

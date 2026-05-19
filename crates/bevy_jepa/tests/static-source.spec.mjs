@@ -5,6 +5,7 @@ import { strict as assert } from "node:assert";
 const root = new URL("..", import.meta.url).pathname;
 const index = readFileSync(join(root, "www", "index.html"), "utf8");
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const wasmMain = readFileSync(join(root, "src", "main.rs"), "utf8");
 
 assert(index.includes("#bevy"), "index.html should mount the Bevy canvas");
 assert(index.includes("frame_input"), "index.html should forward camera/static frames to wasm");
@@ -25,6 +26,7 @@ assert(index.includes("window.__burnJepaReconstructionModelPackage"), "wasm page
 assert(index.includes("anyup_model_package_input"), "wasm page should preload AnyUp bpk parts into wasm");
 assert(index.includes("reconstruction_model_package_input"), "wasm page should preload reconstruction bpk parts into wasm");
 assert(index.includes('params.get("load-model")'), "wasm page should support load-model=false smoke mode");
+assert(wasmMain.includes('param_bool("prewarm-shape-buckets")'), "wasm config should allow disabling shape prewarm for smoke/perf probes");
 assert(index.includes("bevy_jepa camera source running"), "index.html should expose camera runtime status");
 assert(index.includes("bevy_jepa static source running"), "index.html should expose static runtime status");
 assert(index.includes("getUserMedia"), "index.html should support browser camera capture");

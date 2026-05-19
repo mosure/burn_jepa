@@ -12,13 +12,13 @@ publish = false
 
 [features]
 default = ["sparse-patchify-wgpu"]
-sparse-patchify-wgpu = ["bevy_burn/fusion", "burn_jepa/sparse-patchify-wgpu"]
+sparse-patchify-wgpu = ["burn_jepa/sparse-patchify-wgpu"]
 wasm-fusion = ["bevy_burn/fusion", "burn/fusion", "burn_jepa/wasm-fusion"]
 
 [dependencies]
 anyhow = "1"
-# Browser WGPU fusion is opt-in through `wasm-fusion`; the default remains
-# non-fused until WebGPU validation is proven stable across browsers.
+# Browser WGPU fusion is opt-in through `wasm-fusion`; sparse patchify should not
+# pull it in implicitly through feature unification.
 burn = { version = "0.21.0", default-features = false, features = ["std", "webgpu"] }
 # Native re-enables fusion below; wasm can opt in with `--features wasm-fusion`.
 burn_jepa = { path = "../..", default-features = false, features = ["wasm", "webgpu"] }

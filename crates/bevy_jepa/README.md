@@ -186,7 +186,8 @@ Use `--reconstruction-model-base-url`,
 `--reconstruction-model-cache-dir`, `--no-reconstruction-model-download`, or
 wasm query params `?reconstruction-model-base=...`,
 `?reconstruction-model-manifest=...`, and `?reconstruction-every=8` to override
-it.
+it. If reconstruction is enabled and no trained package can be loaded, the app
+reports a load error instead of showing an untrained diagnostic decoder.
 
 ```bash
 cargo run --bin burn-jepa -- export-bpk \
@@ -213,13 +214,22 @@ cargo run --no-default-features --features ndarray --bin burn-jepa -- export-any
   --deploy-dir ../../target/burn_anyup/anyup_multi_backbone \
   --overwrite-shards \
   --overwrite-deploy
-cargo run --no-default-features --features ndarray --bin burn-jepa -- export-reconstruction-bpk \
+cargo run --release --no-default-features --features wgpu --bin burn-jepa -- train-reconstruction-bpk \
+  --backend wgpu \
+  --jepa-manifest ../../target/burn-jepa-web/model/vjepa2_1_base/manifest.json \
+  --image-dir ../../target/burn-jepa-vjepa21-ttt-ablation/data/frames \
+  --image-size 512 \
+  --frames 2 \
+  --max-samples 64 \
+  --steps 400 \
+  --batch-size 4 \
+  --lr 1e-4 \
+  --lambda-l1 0.02 \
+  --lambda-gradient 0.05 \
+  --lambda-color 0.02 \
   --output ../../target/burn_jepa_reconstruction-build/low_res_v1/jepa_reconstruction.bpk \
-  --input-dim 768 \
-  --hidden-dim 256 \
-  --patch-size 16 \
+  --hidden-dim 128 \
   --shard-mib 20 \
-  --model-profile low_res_v1 \
   --deploy-dir ../../target/burn_jepa_reconstruction/low_res_v1 \
   --overwrite-shards \
   --overwrite-deploy
@@ -294,15 +304,14 @@ the Bevy adaptive threshold path does not top-k cap tokens that pass the
 threshold.
 
 `--encode-path auto` is the default. `bevy_jepa` enables flex-gmm WGPU sparse
-patchify by default, including the matching fused Burn-to-Bevy texture bridge
-needed by the WGPU kernel stack. Auto routes non-dense masks through sparse
-patchify while dense ordered masks stay on the dense path. Bucketed-context
-sparse encode is also the default; use `--sparse-encode-mode exact` when stable
-token-width buckets are not worth the extra real context tokens. Use
-`--encode-path dense-patch` to force the portable dense-patch-embed plus
-sparse-token path, or `--encode-path sparse-patchify` when you want the app to
-force sparse patchify for diagnostics. Build with `--no-default-features` only
-when you explicitly want the portable non-flex-gmm path.
+patchify by default on native and wasm. Native target dependencies keep the
+fused Burn-to-Bevy texture bridge enabled, while wasm uses raw WebGPU unless
+`wasm-fusion` is explicitly requested. Auto routes non-dense masks through
+sparse patchify while dense ordered masks stay on the dense path.
+Bucketed-context sparse encode is also the default; use
+`--sparse-encode-mode exact` when stable token-width buckets are not worth the
+extra real context tokens. Build with `--no-default-features` only when you
+explicitly want the portable dense-patch-embed plus sparse-token path.
 
 ## Benchmarks
 

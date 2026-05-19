@@ -580,7 +580,10 @@ impl TttSparsePatchifyBackend for burn::backend::WebGpu<f32, i32> {}
 #[cfg(all(feature = "webgpu", not(feature = "wgpu")))]
 impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::WebGpu<f32, i32>> {}
 
-#[cfg(feature = "wgpu")]
+#[cfg(all(
+    feature = "wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl TttSparsePatchifyBackend for burn::backend::Wgpu<f32, i32> {
     #[cfg(feature = "sparse-patchify-wgpu")]
     fn frozen_sparse_patchify_supported() -> bool {
@@ -606,7 +609,10 @@ impl TttSparsePatchifyBackend for burn::backend::Wgpu<f32, i32> {
     }
 }
 
-#[cfg(feature = "wgpu")]
+#[cfg(all(
+    feature = "wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl TttSparsePatchifyBackend for burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>> {}
 
 #[cfg(feature = "sparse-patchify-wgpu")]

@@ -4,6 +4,7 @@ use crate::{
     BurnJepaReconstructionPackageManifest, DEFAULT_BURN_JEPA_MODEL_BASE_URL,
     DEFAULT_BURN_JEPA_RECONSTRUCTION_MODEL_BASE_URL, JepaReconstructionConfig,
     JepaReconstructionDecoder, VJepa2_1Model, VJepaRgbaVideoShape, jepa_feature_tokens_to_nchw,
+    reconstruction_color_moment_loss, reconstruction_gradient_mse, reconstruction_l1,
     reconstruction_mse, reconstruction_psnr_scalar,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -18,7 +19,7 @@ use std::time::Instant;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png"];
 const DEVICE_CACHE_MAX_TENSOR_BYTES: usize = 224 * 1024 * 1024;
-const TRAIN_EVAL_MAX_SAMPLES: usize = 128;
+const TRAIN_EVAL_MAX_SAMPLES: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct ReconstructionTrainingOptions {
@@ -38,6 +39,9 @@ pub struct ReconstructionTrainingOptions {
     pub batch_size: usize,
     pub learning_rate: f64,
     pub weight_decay: f64,
+    pub l1_loss_weight: f64,
+    pub gradient_loss_weight: f64,
+    pub color_loss_weight: f64,
     pub hidden_dim: usize,
     pub residual_blocks_per_scale: usize,
     pub log_interval: usize,
@@ -70,13 +74,20 @@ pub struct ReconstructionTrainingReport {
     pub data_cache_mode: String,
     pub learning_rate: f64,
     pub weight_decay: f64,
+    pub l1_loss_weight: f64,
+    pub gradient_loss_weight: f64,
+    pub color_loss_weight: f64,
     pub seed: u64,
     pub train_loss_initial: Option<f64>,
     pub train_loss_final: Option<f64>,
     pub train_psnr_final: Option<f64>,
+    pub train_gradient_loss_final: Option<f64>,
+    pub train_color_loss_final: Option<f64>,
     pub val_loss_initial: Option<f64>,
     pub val_loss_final: Option<f64>,
     pub val_psnr_final: Option<f64>,
+    pub val_gradient_loss_final: Option<f64>,
+    pub val_color_loss_final: Option<f64>,
     pub feature_extract_ms: u128,
     pub train_ms: u128,
     pub burnpack: PathBuf,
@@ -99,6 +110,13 @@ struct ReconstructionSample {
 struct ReconstructionTrainingTensors<B: Backend> {
     features: Tensor<B, 4>,
     targets: Tensor<B, 4>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReconstructionLossWeights {
+    l1: f64,
+    gradient: f64,
+    color: f64,
 }
 
 enum ReconstructionTrainingData<B: Backend> {
@@ -226,7 +244,7 @@ fn train_reconstruction_bpk_backend<B: AutodiffBackend>(
     let feature_extract_ms = extract_start.elapsed().as_millis();
     let split = split_indices(samples.len(), options.val_split, options.seed)?;
     let train_eval = eval_indices(&split.train, TRAIN_EVAL_MAX_SAMPLES);
-    let val_eval = split.val.clone();
+    let val_eval = eval_indices(&split.val, TRAIN_EVAL_MAX_SAMPLES);
     let sample_count = samples.len();
     let reconstruction_config = JepaReconstructionConfig {
         input_dim,
@@ -242,6 +260,11 @@ fn train_reconstruction_bpk_backend<B: AutodiffBackend>(
         options.image_size,
         device,
     );
+    let loss_weights = ReconstructionLossWeights {
+        l1: options.l1_loss_weight,
+        gradient: options.gradient_loss_weight,
+        color: options.color_loss_weight,
+    };
     eprintln!("reconstruction training data cache: {}", data.cache_mode());
 
     let mut decoder = JepaReconstructionDecoder::<B>::new(reconstruction_config.clone(), device)
@@ -288,7 +311,7 @@ fn train_reconstruction_bpk_backend<B: AutodiffBackend>(
             device,
         );
         let output = decoder.forward_to_size(features, [options.image_size, options.image_size]);
-        let loss = reconstruction_mse(output, target);
+        let loss = reconstruction_training_loss(output, target, loss_weights);
         if options.log_interval > 0
             && ((step + 1) % options.log_interval == 0 || step + 1 == options.steps)
             && let Some(loss_value) = tensor_scalar(loss.clone().detach())
@@ -446,13 +469,20 @@ fn write_reconstruction_package<B: Backend>(
         data_cache_mode: data_cache_mode.to_string(),
         learning_rate: options.learning_rate,
         weight_decay: options.weight_decay,
+        l1_loss_weight: options.l1_loss_weight,
+        gradient_loss_weight: options.gradient_loss_weight,
+        color_loss_weight: options.color_loss_weight,
         seed: options.seed,
         train_loss_initial: train_initial.loss,
         train_loss_final: train_final.loss.or(last_train_loss),
         train_psnr_final: train_final.psnr,
+        train_gradient_loss_final: train_final.gradient_loss,
+        train_color_loss_final: train_final.color_loss,
         val_loss_initial: val_initial.loss,
         val_loss_final: val_final.loss,
         val_psnr_final: val_final.psnr,
+        val_gradient_loss_final: val_final.gradient_loss,
+        val_color_loss_final: val_final.color_loss,
         feature_extract_ms,
         train_ms,
         burnpack: output.clone(),
@@ -489,6 +519,8 @@ struct SplitIndices {
 struct EvalMetrics {
     loss: Option<f64>,
     psnr: Option<f64>,
+    gradient_loss: Option<f64>,
+    color_loss: Option<f64>,
 }
 
 fn validate_options(options: &ReconstructionTrainingOptions) -> Result<()> {
@@ -512,6 +544,18 @@ fn validate_options(options: &ReconstructionTrainingOptions) -> Result<()> {
     ensure!(
         options.weight_decay.is_finite() && options.weight_decay >= 0.0,
         "--weight-decay must be finite and non-negative"
+    );
+    ensure!(
+        options.l1_loss_weight.is_finite() && options.l1_loss_weight >= 0.0,
+        "--lambda-l1 must be finite and non-negative"
+    );
+    ensure!(
+        options.gradient_loss_weight.is_finite() && options.gradient_loss_weight >= 0.0,
+        "--lambda-gradient must be finite and non-negative"
+    );
+    ensure!(
+        options.color_loss_weight.is_finite() && options.color_loss_weight >= 0.0,
+        "--lambda-color must be finite and non-negative"
     );
     Ok(())
 }
@@ -877,26 +921,59 @@ fn evaluate_decoder<B: AutodiffBackend>(
         return Ok(EvalMetrics {
             loss: None,
             psnr: None,
+            gradient_loss: None,
+            color_loss: None,
         });
     }
     let mut mse_sum = 0.0;
     let mut psnr_sum = 0.0;
+    let mut gradient_sum = 0.0;
+    let mut color_sum = 0.0;
     let mut batches = 0usize;
     for batch in indices.chunks(batch_size.max(1)) {
         let (features, target) = tensor_batch::<B>(data, batch, config, grid, image_size, device);
-        let output = decoder.forward_to_size(features, [image_size, image_size]);
-        let mse = tensor_scalar(reconstruction_mse(output.clone(), target.clone()).detach());
-        let psnr = reconstruction_psnr_scalar(output, target, 1.0);
-        if let (Some(mse), Some(psnr)) = (mse, psnr) {
+        let output = decoder
+            .forward_to_size(features, [image_size, image_size])
+            .detach();
+        let target = target.detach();
+        let mse = tensor_scalar(reconstruction_mse(output.clone(), target.clone()));
+        let psnr = reconstruction_psnr_scalar(output.clone(), target.clone(), 1.0);
+        let gradient = tensor_scalar(reconstruction_gradient_mse(output.clone(), target.clone()));
+        let color = tensor_scalar(reconstruction_color_moment_loss(output, target));
+        if let (Some(mse), Some(psnr), Some(gradient), Some(color)) = (mse, psnr, gradient, color) {
             mse_sum += mse;
             psnr_sum += psnr;
+            gradient_sum += gradient;
+            color_sum += color;
             batches += 1;
         }
     }
     Ok(EvalMetrics {
         loss: (batches > 0).then_some(mse_sum / batches as f64),
         psnr: (batches > 0).then_some(psnr_sum / batches as f64),
+        gradient_loss: (batches > 0).then_some(gradient_sum / batches as f64),
+        color_loss: (batches > 0).then_some(color_sum / batches as f64),
     })
+}
+
+fn reconstruction_training_loss<B: Backend>(
+    output: Tensor<B, 4>,
+    target: Tensor<B, 4>,
+    weights: ReconstructionLossWeights,
+) -> Tensor<B, 1> {
+    let mut loss = reconstruction_mse(output.clone(), target.clone());
+    if weights.l1 > 0.0 {
+        loss = loss + reconstruction_l1(output.clone(), target.clone()).mul_scalar(weights.l1);
+    }
+    if weights.gradient > 0.0 {
+        loss = loss
+            + reconstruction_gradient_mse(output.clone(), target.clone())
+                .mul_scalar(weights.gradient);
+    }
+    if weights.color > 0.0 {
+        loss = loss + reconstruction_color_moment_loss(output, target).mul_scalar(weights.color);
+    }
+    loss
 }
 
 fn tensor_scalar<B: Backend>(tensor: Tensor<B, 1>) -> Option<f64> {

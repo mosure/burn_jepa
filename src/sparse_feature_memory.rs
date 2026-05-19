@@ -312,7 +312,10 @@ pub(crate) fn sparse_feature_memory_assign_latest_cuda_raw(
     )
 }
 
-#[cfg(feature = "sparse-feature-memory-wgpu")]
+#[cfg(all(
+    feature = "sparse-feature-memory-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 pub(crate) fn sparse_feature_memory_assign_latest_wgpu_fusion(
     features: Tensor<burn::backend::Wgpu<f32, i32>, 3>,
     observed: Tensor<burn::backend::Wgpu<f32, i32>, 2>,

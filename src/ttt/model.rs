@@ -367,6 +367,7 @@ impl VJepaTttModel<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
 }
 
 #[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-fusion"))]
 impl VJepaTttModel<burn::backend::Wgpu<f32, i32>> {
     pub fn forward_image_sparse_patchify_wgpu_fusion_batch_state(
         &self,

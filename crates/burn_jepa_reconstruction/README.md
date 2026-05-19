@@ -31,17 +31,27 @@ let rgb = decoder.forward(features);
 Training is exposed through `fit_reconstruction_decoder` for modular/offline
 experiments. The expected dataset item is `(low_res_jepa_features, target_rgb)`
 where `target_rgb` is the denormalized square image crop in `[0, 1]`. The
-parent `burn-jepa` CLI can export/import sharded f16 `.bpk` bundles for native
-and wasm deployment:
+parent `burn-jepa` CLI can train and shard f16 `.bpk` bundles for native and
+wasm deployment. Use `train-reconstruction-bpk` for viewer-quality weights;
+`export-reconstruction-bpk` only creates an untrained loader-smoke package.
 
 ```bash
-cargo run --no-default-features --features ndarray --bin burn-jepa -- export-reconstruction-bpk \
+cargo run --release --no-default-features --features wgpu --bin burn-jepa -- train-reconstruction-bpk \
+  --backend wgpu \
+  --jepa-manifest target/burn-jepa-web/model/vjepa2_1_base/manifest.json \
+  --image-dir target/burn-jepa-vjepa21-ttt-ablation/data/frames \
+  --image-size 512 \
+  --frames 2 \
+  --max-samples 64 \
+  --steps 400 \
+  --batch-size 4 \
+  --lr 1e-4 \
+  --lambda-l1 0.02 \
+  --lambda-gradient 0.05 \
+  --lambda-color 0.02 \
   --output target/burn_jepa_reconstruction-build/low_res_v1/jepa_reconstruction.bpk \
-  --input-dim 768 \
   --hidden-dim 128 \
-  --patch-size 16 \
   --shard-mib 20 \
-  --model-profile low_res_v1 \
   --deploy-dir target/burn_jepa_reconstruction/low_res_v1 \
   --overwrite-shards \
   --overwrite-deploy

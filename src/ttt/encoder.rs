@@ -2317,7 +2317,10 @@ impl VJepaTttEncoder<burn_flex_gmm::wgpu::DefaultWgpuBackend> {
     }
 }
 
-#[cfg(feature = "sparse-patchify-wgpu")]
+#[cfg(all(
+    feature = "sparse-patchify-wgpu",
+    any(not(target_arch = "wasm32"), feature = "wasm-fusion")
+))]
 impl VJepaTttEncoder<burn::backend::Wgpu<f32, i32>> {
     fn sparse_patchify_image_wgpu_fusion_batch(
         &self,

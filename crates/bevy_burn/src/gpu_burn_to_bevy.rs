@@ -19,8 +19,8 @@ use burn::tensor::TensorPrimitive;
 use burn::tensor::{backend::Backend as BurnBackend, Tensor};
 use burn_cubecl::kernel::into_contiguous;
 #[cfg(feature = "fusion")]
-use burn_wgpu::{CubeBackend, WgpuRuntime};
-use burn_wgpu::{FloatElement, IntElement, Wgpu as BurnWgpu, WgpuDevice as BurnWgpuDevice};
+use burn_wgpu::Wgpu as BurnWgpu;
+use burn_wgpu::{CubeBackend, FloatElement, IntElement, WgpuDevice as BurnWgpuDevice, WgpuRuntime};
 
 // from your bridge
 use crate::{BindingDirection, BurnDevice, ExtractedGpuHandle};
@@ -47,6 +47,142 @@ pub trait BurnBevyPrepare<B: BurnBackend> {
     ) -> Option<CopyBindGroup>;
 }
 
+type RawBurnWgpu<F, I> = CubeBackend<WgpuRuntime, F, I, u32>;
+
+fn prepare_raw_bind_group<F, I>(
+    tensor: Tensor<RawBurnWgpu<F, I>, 3>,
+    burn_device: &BurnWgpuDevice,
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+    layout: &BindGroupLayout,
+    texture: &wgpu::Texture,
+    extent: Extent3d,
+) -> Option<CopyBindGroup>
+where
+    F: FloatElement,
+    I: IntElement,
+{
+    let [h, w, c] = tensor.dims();
+    if c != 4 {
+        warn!(target: LOG, "expected f32 c==4 (rgba32f), got c={c}");
+        return None;
+    }
+
+    // Avoid round-tripping through the CPU when the tensor already lives on the render GPU.
+    let target_device = burn_device.clone();
+    let tensor = if tensor.device() == target_device {
+        tensor
+    } else {
+        tensor.to_device(&target_device)
+    };
+
+    let prim2 = tensor.into_primitive().tensor();
+
+    // Shader indexes rows as y * width + x; keep rows tightly packed.
+    let prim2 = into_contiguous(prim2);
+    let client = &prim2.client;
+    let res = client
+        .get_resource(prim2.handle.clone())
+        .expect("get tensor GPU resource");
+    let _ = client.flush();
+
+    let resource = res.resource();
+    let mut scratch: Option<Buffer> = None;
+    let (src_buffer, src_off): (&wgpu::Buffer, wgpu::BufferAddress) = if resource.offset & 0xFFu64
+        != 0
+    {
+        let aligned: Buffer = render_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bevy_burn.aligned_tensor"),
+            size: resource.size,
+            usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bevy_burn.align_buffer"),
+        });
+        encoder.copy_buffer_to_buffer(
+            &resource.buffer,
+            resource.offset,
+            &aligned,
+            0,
+            resource.size,
+        );
+        render_queue
+            .0
+            .as_ref()
+            .submit(std::iter::once(encoder.finish()));
+
+        scratch = Some(aligned);
+        let buffer_ref = scratch.as_ref().unwrap();
+        (&**buffer_ref, 0)
+    } else {
+        (&resource.buffer, resource.offset as wgpu::BufferAddress)
+    };
+
+    let src_binding = wgpu::BufferBinding {
+        buffer: src_buffer,
+        offset: src_off,
+        size: NonZeroU64::new(resource.size),
+    };
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bg = render_device
+        .wgpu_device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("buffer-rgba32f bg"),
+            layout: layout.value(),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(src_binding),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+            ],
+        });
+
+    let copy_w = Ord::min(w as u32, extent.width);
+    let copy_h = Ord::min(h as u32, extent.height);
+    let gx = copy_w.div_ceil(16);
+    let gy = copy_h.div_ceil(16);
+
+    Some(CopyBindGroup {
+        bg,
+        workgroups: [gx, gy, 1],
+        scratch,
+    })
+}
+
+impl<F, I> BurnBevyPrepare<RawBurnWgpu<F, I>> for ()
+where
+    F: FloatElement,
+    I: IntElement,
+{
+    fn prepare_bind_group(
+        tensor: &Tensor<RawBurnWgpu<F, I>, 3>,
+        burn_device: &BurnWgpuDevice,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+        layout: &BindGroupLayout,
+        texture: &wgpu::Texture,
+        extent: Extent3d,
+    ) -> Option<CopyBindGroup> {
+        prepare_raw_bind_group(
+            tensor.clone(),
+            burn_device,
+            render_device,
+            render_queue,
+            layout,
+            texture,
+            extent,
+        )
+    }
+}
+
+#[cfg(feature = "fusion")]
 impl<F, I> BurnBevyPrepare<BurnWgpu<F, I>> for ()
 where
     F: FloatElement,
@@ -61,110 +197,26 @@ where
         texture: &wgpu::Texture,
         extent: Extent3d,
     ) -> Option<CopyBindGroup> {
-        let [h, w, c] = tensor.dims();
-        if c != 4 {
-            warn!(target: LOG, "expected f32 c==4 (rgba32f), got c={c}");
-            return None;
-        }
-
-        // Avoid round-tripping through the CPU when the tensor already lives on the render GPU.
         let target_device = burn_device.clone();
         let tensor = if tensor.device() == target_device {
             tensor.clone()
         } else {
             tensor.clone().to_device(&target_device)
         };
-
-        #[cfg(feature = "fusion")]
-        let prim2 = {
-            let prim_fusion = tensor.into_primitive().tensor();
-            let fusion_client = prim_fusion.client.clone();
-            let base = fusion_client
-                .resolve_tensor_float::<CubeBackend<WgpuRuntime, F, I, u32>>(prim_fusion);
-            let base_img: Tensor<CubeBackend<WgpuRuntime, F, I, u32>, 3> =
-                Tensor::from_primitive(TensorPrimitive::Float(base));
-            base_img.into_primitive().tensor()
-        };
-
-        #[cfg(not(feature = "fusion"))]
-        let prim2 = tensor.into_primitive().tensor();
-
-        // Shader indexes rows as y * width + x; keep rows tightly packed.
-        let prim2 = into_contiguous(prim2);
-        let client = &prim2.client;
-        let res = client
-            .get_resource(prim2.handle.clone())
-            .expect("get tensor GPU resource");
-        let _ = client.flush();
-
-        let resource = res.resource();
-        let mut scratch: Option<Buffer> = None;
-        let (src_buffer, src_off): (&wgpu::Buffer, wgpu::BufferAddress) =
-            if resource.offset & 0xFFu64 != 0 {
-                let aligned: Buffer = render_device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("bevy_burn.aligned_tensor"),
-                    size: resource.size,
-                    usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
-                    mapped_at_creation: false,
-                });
-
-                let mut encoder =
-                    render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("bevy_burn.align_buffer"),
-                    });
-                encoder.copy_buffer_to_buffer(
-                    &resource.buffer,
-                    resource.offset,
-                    &aligned,
-                    0,
-                    resource.size,
-                );
-                render_queue
-                    .0
-                    .as_ref()
-                    .submit(std::iter::once(encoder.finish()));
-
-                scratch = Some(aligned);
-                let buffer_ref = scratch.as_ref().unwrap();
-                (&**buffer_ref, 0)
-            } else {
-                (&resource.buffer, resource.offset as wgpu::BufferAddress)
-            };
-
-        let src_binding = wgpu::BufferBinding {
-            buffer: src_buffer,
-            offset: src_off,
-            size: NonZeroU64::new(resource.size),
-        };
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bg = render_device
-            .wgpu_device()
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("buffer-rgba32f bg"),
-                layout: layout.value(),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(src_binding),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                ],
-            });
-
-        let copy_w = Ord::min(w as u32, extent.width);
-        let copy_h = Ord::min(h as u32, extent.height);
-        let gx = copy_w.div_ceil(16);
-        let gy = copy_h.div_ceil(16);
-
-        Some(CopyBindGroup {
-            bg,
-            workgroups: [gx, gy, 1],
-            scratch,
-        })
+        let prim_fusion = tensor.into_primitive().tensor();
+        let fusion_client = prim_fusion.client.clone();
+        let base = fusion_client.resolve_tensor_float::<RawBurnWgpu<F, I>>(prim_fusion);
+        let base_img: Tensor<RawBurnWgpu<F, I>, 3> =
+            Tensor::from_primitive(TensorPrimitive::Float(base));
+        prepare_raw_bind_group(
+            base_img,
+            burn_device,
+            render_device,
+            render_queue,
+            layout,
+            texture,
+            extent,
+        )
     }
 }
 

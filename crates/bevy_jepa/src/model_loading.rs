@@ -38,21 +38,6 @@ use crate::{
     JepaBevyDevice, log,
 };
 
-fn reconstruction_decoder_config(
-    viewer_config: &BevyJepaConfig,
-    model_config: &VJepaConfig,
-) -> JepaReconstructionConfig {
-    JepaReconstructionConfig {
-        input_dim: model_config.encoder.embed_dim,
-        patch_size: model_config.patch_size,
-        ..if viewer_config.encoder_source == BevyJepaEncoderSource::TinyTest {
-            JepaReconstructionConfig::tiny_for_tests()
-        } else {
-            JepaReconstructionConfig::default()
-        }
-    }
-}
-
 pub(super) fn load_viewer_encoder(
     config: &BevyJepaConfig,
     image_size: usize,
@@ -767,12 +752,14 @@ pub(super) fn load_viewer_reconstruction(
         return load_native_reconstruction_package(&package_manifest_path, model_config, device);
     }
 
-    let decoder_config = reconstruction_decoder_config(config, model_config);
-    log(
-        "bevy_jepa: no reconstruction decoder package configured or found; reconstruction panel uses an untrained diagnostic decoder",
+    let expected = burn_jepa::burn_jepa_reconstruction_model_profile_base_url(
+        config.reconstruction_model_profile,
     );
-    JepaReconstructionDecoder::<JepaBevyBackend>::new(decoder_config, device)
-        .context("initialize JEPA reconstruction decoder")
+    bail!(
+        "reconstruction panel is enabled but no trained burn_jepa_reconstruction package was loaded; \
+         pass --reconstruction-model-manifest, set BURN_JEPA_RECONSTRUCTION_MODEL_MANIFEST, \
+         or cache/upload {expected}/manifest.json"
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
