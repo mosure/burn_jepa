@@ -5,7 +5,7 @@ use crate::{
     TttPretrainedTrainScope, TttSupervisionMode, VJepaConfig, VJepaTttLayerProbeRecord,
     VJepaTttModel,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use burn::optim::GradientsParams;
 use burn::tensor::Tensor;
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -356,14 +356,35 @@ pub(super) fn ttt_utilization_metrics<B: Backend>(
         .into_iter()
         .map(|acc| {
             let divisor = acc.samples.max(1) as f64 / samples.max(1) as f64;
-            let layer = &model.encoder.ttt_layers[acc.ttt_layer];
-            let target_proj_param_rms = layer
-                .target_proj
-                .as_ref()
-                .map(|proj| tensor_rms(proj.weight.val()))
-                .transpose()?;
-            let temporal_conv_param_rms = tensor_rms(layer.temporal_conv.weight.val())?;
-            let out_proj_param_rms = tensor_rms(layer.out_proj.weight.val())?;
+            let (target_proj_param_rms, temporal_conv_param_rms, out_proj_param_rms) =
+                if config.ttt.insertion.is_in_place() {
+                    let layer = model
+                        .encoder
+                        .inplace_ttt_layers
+                        .as_ref()
+                        .and_then(|layers| layers.get(acc.ttt_layer))
+                        .context("in-place utilization layer should exist")?;
+                    (
+                        layer
+                            .target_proj
+                            .as_ref()
+                            .map(|proj| tensor_rms(proj.weight.val()))
+                            .transpose()?,
+                        tensor_rms(layer.temporal_conv.weight.val())?,
+                        0.0,
+                    )
+                } else {
+                    let layer = &model.encoder.ttt_layers[acc.ttt_layer];
+                    (
+                        layer
+                            .target_proj
+                            .as_ref()
+                            .map(|proj| tensor_rms(proj.weight.val()))
+                            .transpose()?,
+                        tensor_rms(layer.temporal_conv.weight.val())?,
+                        tensor_rms(layer.out_proj.weight.val())?,
+                    )
+                };
             let hidden_rms = acc.hidden_rms / divisor.max(1.0);
             let adapter_delta_rms = acc.adapter_delta_rms / divisor.max(1.0);
             Ok(TttLayerUtilizationMetric {
@@ -402,21 +423,46 @@ pub(super) fn ttt_gradient_metrics<B: AutodiffBackend>(
         .iter()
         .enumerate()
         .map(|(ttt_layer, _)| {
-            let layer = &model.encoder.ttt_layers[ttt_layer];
-            let target_proj_grad_rms = layer
-                .target_proj
-                .as_ref()
-                .and_then(|proj| grads.get::<B::InnerBackend, 2>(proj.weight.id))
-                .map(tensor_rms)
-                .transpose()?;
-            let temporal_conv_grad_rms = grads
-                .get::<B::InnerBackend, 3>(layer.temporal_conv.weight.id)
-                .map(tensor_rms)
-                .transpose()?;
-            let out_proj_grad_rms = grads
-                .get::<B::InnerBackend, 2>(layer.out_proj.weight.id)
-                .map(tensor_rms)
-                .transpose()?;
+            let (target_proj_grad_rms, temporal_conv_grad_rms, out_proj_grad_rms) =
+                if config.ttt.insertion.is_in_place() {
+                    let layer = model
+                        .encoder
+                        .inplace_ttt_layers
+                        .as_ref()
+                        .and_then(|layers| layers.get(ttt_layer))
+                        .context("in-place gradient layer should exist")?;
+                    (
+                        layer
+                            .target_proj
+                            .as_ref()
+                            .and_then(|proj| grads.get::<B::InnerBackend, 2>(proj.weight.id))
+                            .map(tensor_rms)
+                            .transpose()?,
+                        grads
+                            .get::<B::InnerBackend, 3>(layer.temporal_conv.weight.id)
+                            .map(tensor_rms)
+                            .transpose()?,
+                        None,
+                    )
+                } else {
+                    let layer = &model.encoder.ttt_layers[ttt_layer];
+                    (
+                        layer
+                            .target_proj
+                            .as_ref()
+                            .and_then(|proj| grads.get::<B::InnerBackend, 2>(proj.weight.id))
+                            .map(tensor_rms)
+                            .transpose()?,
+                        grads
+                            .get::<B::InnerBackend, 3>(layer.temporal_conv.weight.id)
+                            .map(tensor_rms)
+                            .transpose()?,
+                        grads
+                            .get::<B::InnerBackend, 2>(layer.out_proj.weight.id)
+                            .map(tensor_rms)
+                            .transpose()?,
+                    )
+                };
             Ok(TttLayerGradientRms {
                 ttt_layer,
                 target_proj_grad_rms,

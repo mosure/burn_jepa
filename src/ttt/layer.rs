@@ -87,16 +87,12 @@ impl<B: Backend> VJepaInPlaceTttMlp<B> {
         } else {
             PaddingConfig1d::Same
         };
-        let mut temporal_conv = Conv1dConfig::new(embed_dim, embed_dim, kernel)
+        let temporal_conv = Conv1dConfig::new(embed_dim, embed_dim, kernel)
             .with_groups(embed_dim)
             .with_padding(conv_padding)
             .with_bias(false)
             .with_initializer(Initializer::Zeros)
             .init(device);
-        if strict_in_place {
-            temporal_conv.weight =
-                Param::from_tensor(depthwise_current_token_kernel(embed_dim, kernel, device));
-        }
         Self {
             target_proj,
             temporal_conv,
@@ -720,19 +716,6 @@ fn depthwise_identity_kernel<B: Backend>(
     Tensor::<B, 3>::from_data(TensorData::new(values, [dim, 1, kernel]), device)
 }
 
-fn depthwise_current_token_kernel<B: Backend>(
-    dim: usize,
-    kernel: usize,
-    device: &B::Device,
-) -> Tensor<B, 3> {
-    let mut values = vec![0.0f32; dim * kernel];
-    let current = kernel.saturating_sub(1);
-    for channel in 0..dim {
-        values[channel * kernel + current] = 1.0;
-    }
-    Tensor::<B, 3>::from_data(TensorData::new(values, [dim, 1, kernel]), device)
-}
-
 #[cfg(all(test, feature = "ndarray"))]
 mod tests {
     use super::*;
@@ -798,6 +781,29 @@ mod tests {
     }
 
     #[test]
+    fn strict_in_place_target_generator_starts_noop() {
+        let device = Default::default();
+        let config = TttEncoderConfig {
+            insertion: TttInsertionMode::InPlaceMlpStrict,
+            conv_kernel: 3,
+            use_projection: false,
+            ..TttEncoderConfig::default()
+        };
+        let layer = VJepaInPlaceTttMlp::<TestBackend>::new(2, 4, &config, &device);
+        let target = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0], [1, 3, 2]),
+            &device,
+        );
+
+        assert_close(
+            "strict target generator should initially be a no-op update signal",
+            &values(layer.target_update_signal(target)),
+            &[0.0; 6],
+            1.0e-6,
+        );
+    }
+
+    #[test]
     fn strict_in_place_mlp_applies_then_updates_only_full_chunks() {
         let device = Default::default();
         let config = TttEncoderConfig {
@@ -808,7 +814,11 @@ mod tests {
             ttt_lr: 0.5,
             ..TttEncoderConfig::default()
         };
-        let layer = VJepaInPlaceTttMlp::<TestBackend>::new(2, 2, &config, &device);
+        let mut layer = VJepaInPlaceTttMlp::<TestBackend>::new(2, 2, &config, &device);
+        layer.temporal_conv.weight = Param::from_tensor(Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(vec![1.0, 1.0], [2, 1, 1]),
+            &device,
+        ));
         let mut mlp = VJepaMlp::<TestBackend>::new(2, 1.0, &device);
         mlp.fc1.weight = Param::from_tensor(Tensor::<TestBackend, 2>::from_data(
             TensorData::new(vec![1.0, 0.0, 0.0, 1.0], [2, 2]),

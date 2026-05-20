@@ -39,10 +39,11 @@ $0.2794/0.8851$ over a 1088-window same-stream repeat with late--early loss
 $-0.0009$, and $0.2573/0.8924$ over a 512-window adversarial stitch with
 late--early loss $-0.0193$.  We separately implement an
 In-Place-TTT-inspired MLP path and a stricter conformance lane, but the shipped
-result remains the SC-TTT adapter/Memory-ALiBi model because the strict lane is
-currently only smoke-validated and not quality-promoted.  The main remaining
-gates are larger open-set video, repeated measurements, downstream baselines,
-and lower-cost backward/optimizer kernels.
+result remains the SC-TTT adapter/Memory-ALiBi model because matched free-run
+strict in-place eval is stable but substantially lower quality.  The main
+remaining gates are larger open-set video, repeated measurements, downstream
+baselines, exact in-place reference parity, and lower-cost backward/optimizer
+kernels.
 \end{abstract}
 
 \section{Introduction}
@@ -212,9 +213,10 @@ rather than the single fast-weight cache used by the In-Place TTT formulation.
 
 The paper's empirical claims therefore stay separated.  Tables and deployment
 results labeled SC-TTT use the residual adapter/Memory-ALiBi path.  The strict
-in-place lane is currently a conformance and performance ablation pending a
-long matched training run and reference-step parity fixture; it is not the
-promoted checkpoint.
+in-place lane is currently a conformance and performance ablation.  A matched
+free-run run with rolling 16-frame teacher windows has now been completed, but
+the lane remains far below the adapter baseline and still lacks exact
+reference-step parity; it is not the promoted checkpoint.
 
 \subsection{Latent Stability Regularizer}
 
@@ -406,17 +408,21 @@ TTT + norms, from Memory-ALiBi best & 192 & 66 / 126 & 3.59M & 0.3557 / 0.8477 &
 \centering
 \scriptsize
 \setlength{\tabcolsep}{3pt}
-\caption{Bounded real-checkpoint CUDA conformance smoke for the In-Place TTT
-lanes.  Both rows use rolling 16-frame teacher windows and deployable
-self-hidden memory updates.  This is a four-step initialization and plumbing
-check, not a promotion-quality training result.}
+\caption{Matched free-run CUDA ablation for the strict In-Place TTT lane.  All
+rows use rolling 16-frame teacher windows, sparse 410/2048 context tokens, and
+deployable self-hidden updates rather than teacher-forced memory targets.}
 \label{tab:inplace-smoke}
-\begin{tabular}{lrrrr}
+\begin{tabular}{llrrrr}
 \toprule
-Lane & Insertion & Eval loss & Eval cosine & Samples/s \\
+Lane & Eval & Loss & Cosine & Samples/s & Late--early loss \\
 \midrule
-Current SC-TTT adapter baseline & adapter & 0.4136 & 0.8261 & 0.0759 \\
-Strict in-place MLP conformance & in\_place\_mlp\_strict & 0.4534 & 0.8091 & 0.0854 \\
+SC-TTT adapter stage2 & held-out 164 & 0.2734 & 0.8852 & 3.25 & +0.0076 \\
+Strict in-place best & held-out 164 & 0.4273 & 0.8187 & 3.53 & +0.0405 \\
+Strict in-place high update & held-out 164 & 0.3920 & 0.8325 & 3.82 & -0.0014 \\
+SC-TTT adapter stage2 & cactus 1088 & 0.2794 & 0.8851 & 5.80 & -0.0009 \\
+Strict in-place best & cactus 1088 & 0.4799 & 0.7989 & 6.32 & 0.0000 \\
+SC-TTT adapter stage2 & stitched 512 & 0.2573 & 0.8924 & 5.20 & -0.0193 \\
+Strict in-place best & stitched 512 & 0.4284 & 0.8183 & 5.77 & -0.0212 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -662,9 +668,12 @@ currently hit a CubeCL CUDA allocator panic; dense primary eval works, but
 dense diagnostic probes need chunking or streaming.  Fifth, the 164-window
 held-out manifest check improves with persistent state on average but has only
 33 contiguous windows in one stream, so it was insufficient by itself.  Sixth,
-the strict in-place MLP lane is not promoted: it passes causal/update smoke
-tests and a real-checkpoint CUDA smoke, but it has not yet beaten the adapter
-baseline or passed reference-step parity against the upstream implementation.
+the strict in-place MLP lane is not promoted: it now passes causal/update smoke
+tests and a longer matched free-run CUDA ablation, but it trails the SC-TTT
+adapter by a large margin.  The best strict held-out manifest result in this
+pass is $0.3920/0.8325$ loss/cosine, versus $0.2734/0.8852$ for the adapter;
+the same-stream and adversarial gates likewise stay near sparse-base quality.
+It also still lacks reference-step parity against the upstream implementation.
 Seventh, patch-diff masks can miss slow semantic changes; refresh policies such
 as age-priority, blue-noise refresh, or keyframes are required for persistent
 feature caches.
@@ -897,8 +906,10 @@ The stress gates make the long-run claim more precise: simple unbounded carry
 was unstable, while Memory-ALiBi plus the norm-only continuation is stable on
 the measured 1088-window same-stream and 512-window adversarial-stitch gates.
 The strict In-Place TTT lane now has causal/update conformance checks and a
-real-checkpoint smoke run, but it remains an ablation rather than the shipped
-model.  The evidence is not yet sufficient for theoretical originality,
+matched free-run ablation, but it remains an ablation rather than the shipped
+model because its memory update is not yet useful under this V-JEPA
+image-student to video-teacher objective.  The evidence is not yet sufficient
+for theoretical originality,
 state-of-the-art claims, broad robustness claims, or unlimited-memory
 arbitrary-length rollout claims.  The next step is larger real-mask held-out
 video, repeated statistics, external and downstream baselines, exact In-Place

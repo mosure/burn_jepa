@@ -612,12 +612,23 @@ ViT-B checkpoint, 256px real manifest windows, manifest AutoGaze masks, and a
 | in_place_mlp | 3/7/11 | 16 | 0.3981 | 0.8293 | 0.0901 | 162.0 MiB | 6.8 MiB |
 | in_place_mlp | 1/3/5/7/9/11 | 4 | 0.4248 | 0.8197 | 0.0885 | 324.0 MiB | 13.6 MiB |
 
-This is not a promotion-quality training run, but it is enough to avoid a bad
-assumption: in-place MLP is architecturally sane and uses fewer trainable helper
-parameters at matched layer count, but its per-context fast state is larger and
-current Burn autodiff backward is slower. Keep `adapter` as the production
-default until a longer in-place run beats it on held-out free-run quality at
-matched wall-clock or an analytical/fused backward path changes the cost curve.
+The 2026-05-19 matched strict-lane pass replaced the old smoke-only conclusion
+with a stronger negative result. `in_place_mlp_strict` now starts with a no-op
+target generator, uses causal target generation, and passes apply-then-update
+tests. A 512-step strict training run and 128-step update-scale sweep were then
+evaluated with rolling 16-frame teacher windows and deployable self-hidden
+free-run updates. The strict best checkpoint scored `0.4273 / 0.8187` on the
+164-window manifest, `0.4799 / 0.7989` on the 1088-window cactus repeat, and
+`0.4284 / 0.8183` on the 512-window adversarial stitch. Raising the strict
+update scale to `0.003` improved the 164-window manifest to `0.3920 / 0.8325`,
+but still trailed the SC-TTT adapter at `0.2734 / 0.8852`.
+
+Keep `adapter` as the production default. The strict in-place lane remains a
+conformance/research ablation until it has reference-step parity against the
+upstream In-Place TTT update/cache behavior and beats the adapter in matched
+free-run quality. In the current objective, utilization metrics show zero
+effective strict fast updates on the promoted strict checkpoint, so spending on
+more strict layers is not justified yet.
 
 Production training should keep `ttt.predictor_layers = []`. The predictor
 remains available as the normal JEPA prediction head for parity and auxiliary

@@ -22,11 +22,70 @@ In-Place TTT support is implemented as an ablation, but the active candidate is
 still the SC-TTT adapter/Memory-ALiBi model above. A bounded real-checkpoint
 CUDA smoke found `in_place_mlp` thirds had similar initial quality but about 4x
 fast state memory and slower backward/optimizer throughput than adapter thirds,
-so it is not promoted without a longer positive quality result or a
-lower-overhead backward path. The stricter paper-conformance lane is
+so it is not promoted without a positive quality result or a lower-overhead
+backward path. The stricter paper-conformance lane is
 `in_place_mlp_strict`; it uses causal target generation, single `fc2`
-fast-weight state, and apply-then-update full-chunk updates. Memory-ALiBi
-remains labeled as a local SC-TTT extension, not an In-Place TTT claim.
+fast-weight state, and apply-then-update full-chunk updates. A longer matched
+free-run ablation is now complete; the strict lane is still not promoted.
+Memory-ALiBi remains labeled as a local SC-TTT extension, not an In-Place TTT
+claim.
+
+## 2026-05-19 Strict In-Place Matched Ablation
+
+The strict in-place lane was rechecked after fixing its initialization to be a
+true no-op update signal. This preserves the paper-conformance invariant that
+the pretrained MLP path is unchanged before training. A previous current-token
+initialization caused immediate loss growth and was archived under
+`target/burn-jepa-production-final-256/stage1-stream-tbptt-inplace-mlp-strict-thirds-bad-current-token-init-128`.
+
+The matched gate used rolling 16-frame teacher windows, sparse 410 / 2048
+context tokens, deployable self-hidden free-run updates, no teacher-forced
+adapter targets, and the same CUDA sparse-patchify eval path as the SC-TTT
+adapter.
+
+| Lane | Eval | Windows | Update scale | Loss | Cosine | Samples/s | Late-early loss |
+|---|---|---:|---:|---:|---:|---:|---:|
+| SC-TTT adapter stage2 | held-out manifest | 164 | 0.003 | 0.2734 | 0.8852 | 3.25 | +0.0076 |
+| Strict in-place best | held-out manifest | 164 | 0.00003 | 0.4273 | 0.8187 | 3.53 | +0.0405 |
+| Strict in-place lr sweep best | held-out manifest | 164 | 0.003 | 0.3920 | 0.8325 | 3.82 | -0.0014 |
+| SC-TTT adapter stage2 | same-stream cactus repeat | 1088 | 0.003 | 0.2794 | 0.8851 | 5.80 | -0.0009 |
+| Strict in-place best | same-stream cactus repeat | 1088 | 0.00003 | 0.4799 | 0.7989 | 6.32 | 0.0000 |
+| SC-TTT adapter stage2 | adversarial stitched stream | 512 | 0.003 | 0.2573 | 0.8924 | 5.20 | -0.0193 |
+| Strict in-place best | adversarial stitched stream | 512 | 0.00003 | 0.4284 | 0.8183 | 5.77 | -0.0212 |
+
+The strict in-place path is stable in the narrow sense that it does not explode
+on the long free-run streams, but it is not useful yet. Utilization diagnostics
+on the strict best checkpoint report zero `adapter_delta_rms` and zero
+`fast_update_rms` at all three selected layers on the long cactus and
+adversarial gates. Raising the fast-update scale to `0.003` improves the
+164-window manifest result but remains far behind the adapter and did not earn
+a longer promotion run.
+
+Strict in-place training sweep:
+
+| Config | Steps | Update scale | Initial loss | Final loss | Best checkpoint loss | Samples/s |
+|---|---:|---:|---:|---:|---:|---:|
+| strict-lr3e-4-128 | 128 | 0.0003 | 0.2483 | 0.4374 | 0.3869 | 2.51 |
+| strict-lr1e-3-128 | 128 | 0.001 | 0.2481 | 0.4374 | 0.3869 | 2.51 |
+| strict-lr3e-3-128 | 128 | 0.003 | 0.2475 | 0.4374 | 0.3869 | 2.51 |
+
+Interpretation: strict in-place is now safer and better instrumented, but the
+V-JEPA image-student to video-teacher objective is not yet making the selected
+MLP down-projections behave as useful carried memory. The production checkpoint
+therefore remains the SC-TTT adapter/Memory-ALiBi model. The next strict-lane
+work should be reference-step parity against the In-Place TTT implementation
+and a different update-target/training objective before spending on larger
+training.
+
+Artifacts:
+
+- `target/burn-jepa-ttt-matched-ablation/adapter-full164/ttt-eval-report.json`
+- `target/burn-jepa-ttt-matched-ablation/adapter-cactus64/ttt-eval-report.json`
+- `target/burn-jepa-ttt-matched-ablation/adapter-adversarial8/ttt-eval-report.json`
+- `target/burn-jepa-ttt-matched-ablation/strict-best-full164/ttt-eval-report.json`
+- `target/burn-jepa-ttt-matched-ablation/strict-best-cactus64/ttt-eval-report.json`
+- `target/burn-jepa-ttt-matched-ablation/strict-adversarial8/ttt-eval-report.json`
+- `target/burn-jepa-ttt-matched-ablation/strict-lr3e-3-128/ttt-eval-report.json`
 
 ## 2026-05-19 Image-Student to Video-Teacher Alignment
 
